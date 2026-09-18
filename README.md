@@ -213,6 +213,59 @@ waiting for the tailscaled socket (launchd has no ordering graph, and systemd's
 reading secrets from a `0600` file (launchd has no `EnvironmentFile`, and a
 plist is world-readable), and log rotation (launchd does none).
 
+## Webhooks from the outside world
+
+A tailnet-only box cannot receive a GitHub webhook — the sender has no tailnet
+identity. **Tailscale Funnel is per-port, not per-path**: the serve config keys
+`AllowFunnel` on `SNI:port` with no path dimension, and whichever of `serve` or
+`funnel` ran last flips the *whole* port. So Bothy runs **two listeners**:
+
+```json
+"port":        18795,     // tailnet door — a port Funnel is not allowed to touch
+"public_port": 8788,      // where Bothy listens for third parties
+"funnel_port": 443,       // where tailscaled listens for the public
+"routes": [
+  { "path": "/ops",         "secret_env": "OPS_SECRET" },
+  { "path": "/hook/github", "secret_env": "GH_SECRET", "public": true }
+]
+```
+
+```bash
+bin/bothy funnel            # the exact tailscale commands this implies
+bin/bothy funnel --apply    # run them
+```
+
+`public_port` and `funnel_port` are different on purpose: tailscaled binds the
+privileged one, Bothy never does. The daemon **refuses to start** if they are
+confused, if a public route has no public port, or if the two doors share one.
+
+Proven — same daemon, four requests:
+
+```
+tailnet :18795  /ops          202     operational route
+tailnet :18795  /hook/github  404     the public route is not here
+public  :8788   /hook/github  202     the third-party door
+public  :8788   /ops          404     operational route is not exposed
+```
+
+Defence in depth on top: tailscaled sets `Tailscale-Funnel-Request: ?1` on
+public traffic and **it cannot be forged either way** — it deletes any
+client-supplied copy before setting it from connection context. A tailnet-only
+route refuses any request carrying it. Note this is the right signal to gate on:
+identity headers are *also* absent for **tagged** devices, so "no identity
+header" would wrongly classify your own nodes as public.
+
+**Assume the URL is public knowledge.** Enabling HTTPS publishes the hostname to
+certificate transparency logs — a single crt.sh query returns thousands of
+`.ts.net` names across a thousand tailnets. The hostname is not a secret and the
+path is not a secret; the HMAC signature is the entire security boundary, which
+is what signatures are for. Funnel also gives you **no DoS protection you
+control** — every request on a mounted path reaches your process — which is why
+the rate limiter runs before signature verification.
+
+If sub-minute latency is acceptable, **polling avoids all of this** and keeps the
+box sealed. Worth weighing first.
+
 ## Talking to it
 
 Slack, over **Socket Mode** — an *outbound* WebSocket. No public URL, no inbound
@@ -364,6 +417,7 @@ so it is explicit in the code rather than implied.
 | `slack.py` | Socket Mode in, Web API out, deny by default. |
 | `tailnet.py` | Who is calling, asked of tailscaled rather than of a header. |
 | `install.py` | launchd, systemd, the wrapper, and the exit-code contract. |
+| `ratelimit.py` | Token buckets, per route and per caller, before the HMAC. |
 | `daemon.py` | Four loops: listen, drain, schedule, sweep. |
 
 `bothy/vendor/a2a_reactor/` is vendored verbatim from

@@ -54,6 +54,18 @@ class Config:
     # read is a config an agent can leak.
     routes: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     janitor_interval_seconds: float = 300.0
+    # A SECOND listener, for routes a third party must reach. Separate because
+    # Tailscale Funnel is per-PORT, not per-path: whichever of `serve` or
+    # `funnel` ran last flips the whole port, so a public route sharing a port
+    # with operational routes is one mistyped command from exposing everything.
+    #
+    # TWO DIFFERENT PORTS, and conflating them is easy. `public_port` is where
+    # BOTHY listens, on loopback, and it is an ordinary high port needing no
+    # privilege. `funnel_port` is where TAILSCALED listens for the public, and
+    # it must be 443, 8443 or 10000 because those are the only ones Funnel is
+    # permitted to use. tailscaled binds the privileged one; Bothy never does.
+    public_port: int | None = None
+    funnel_port: int = 443
     # Tailnet identity as a second gate in front of the listener. Off unless
     # switched on, because a box without tailscaled would otherwise refuse
     # everything and the failure would look like a Bothy bug.
@@ -147,6 +159,8 @@ class Config:
             "codex_credentials": "present" if (self.codex_credentials_dir / "auth.json").exists() else "MISSING",
             "codex_inherit_config": self.codex_inherit_config,
             "require_tailnet": self.require_tailnet,
+            "public_port": self.public_port,
+            "funnel_port": self.funnel_port,
             "slack_socket_mode": "configured" if (self.slack_app_token_env and self.slack_bot_token_env)
                                  else "not configured",
             "slack_allow_from": len(self.slack_allow_from),

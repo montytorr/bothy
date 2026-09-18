@@ -327,6 +327,52 @@ def cmd_checklist(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
+def cmd_funnel(args: argparse.Namespace, config: Config) -> int:
+    """Print, or run, the exact tailscale commands for this configuration.
+
+    Scripted rather than typed, because this is a one-keystroke production
+    change: on a node whose policy already grants `funnel`, a single command
+    goes live with no prompt and no approval. Mounting `/` exposes everything on
+    that port; running `serve` against the same port afterwards silently makes
+    it private again. Neither mistake announces itself.
+    """
+    import subprocess as _sub
+
+    routes = build_routes(config)
+    public = [route.path for route in routes if route.public]
+    lines: list[list[str]] = [installer.render_serve_command(config.port)]
+    if public:
+        if not config.public_port:
+            print("bothy: routes are marked public but public_port is unset.", flush=True)
+            return EX_CONFIG
+        try:
+            lines += installer.render_funnel_commands(config.funnel_port, config.public_port, public)
+        except ValueError as exc:
+            print(f"bothy: {exc}", flush=True)
+            return EX_CONFIG
+
+    print(f"tailnet door : tailscaled :{config.port} -> bothy :{config.port}   (cannot be funnelled)")
+    if public:
+        print(f"public door  : tailscaled :{config.funnel_port} -> bothy :{config.public_port}"
+              f"   ({len(public)} path(s), signature is the only gate)")
+    print()
+    for command in lines:
+        print("  " + " ".join(command))
+    if not args.apply:
+        print("\nnothing was run. Pass --apply to execute these.")
+        if public:
+            print("Remember: the hostname is already in certificate transparency logs, so the")
+            print("URL is public knowledge. Treat the signature as the whole of the security.")
+        return 0
+
+    for command in lines:
+        result = _sub.run(command, capture_output=True, text=True)
+        print(f"  {' '.join(command)}  -> {'ok' if result.returncode == 0 else (result.stderr or '').strip()[:160]}")
+        if result.returncode != 0:
+            return 1
+    return 0
+
+
 def cmd_profiles(args: argparse.Namespace, config: Config) -> int:
     """Show what each capability profile would give a worker."""
     if args.json:
@@ -554,6 +600,10 @@ def main(argv: list[str] | None = None) -> int:
     uninstall_cmd.add_argument("--user", default=None)
     uninstall_cmd.add_argument("--purge", action="store_true", help="also remove state and the secrets file")
     uninstall_cmd.set_defaults(func=cmd_uninstall)
+
+    funnel = subparsers.add_parser("funnel", help="the tailscale commands this config implies")
+    funnel.add_argument("--apply", action="store_true", help="run them instead of printing them")
+    funnel.set_defaults(func=cmd_funnel)
 
     profiles = subparsers.add_parser("profiles", help="what each capability profile grants")
     profiles.add_argument("--json", action="store_true")

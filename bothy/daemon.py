@@ -107,6 +107,7 @@ class Daemon:
         self.lease_path = config.state_dir / "drain.lock"
 
         self._server: WakeServer | None = None
+        self._public_server: WakeServer | None = None
         self.slack: "SlackBridge | None" = None
         self._stopping = threading.Event()
         self._drain_wanted = threading.Event()
@@ -381,8 +382,48 @@ class Daemon:
                               data={"allow_from": len(self.slack.allow_from),
                                     "profile": self.slack.profile})
 
+        public_routes = [route for route in self.routes if route.public]
+        private_routes = [route for route in self.routes if not route.public]
+        if public_routes and not self.config.public_port:
+            raise RuntimeError(
+                f"{len(public_routes)} route(s) are marked public but public_port is unset. "
+                "Funnel is per-port, so a public route sharing the tailnet port would put the "
+                "whole port one command away from being exposed. Set public_port to 443, 8443 or 10000."
+            )
+        if public_routes:
+            from .install import FUNNEL_PORTS
+            if self.config.funnel_port not in FUNNEL_PORTS:
+                raise RuntimeError(
+                    f"funnel_port {self.config.funnel_port} is not one of {FUNNEL_PORTS}; "
+                    "tailscaled would refuse to funnel it."
+                )
+            if self.config.public_port in FUNNEL_PORTS:
+                raise RuntimeError(
+                    f"public_port {self.config.public_port} is a funnel port. tailscaled binds "
+                    "those; Bothy's own listener belongs on an ordinary unprivileged port."
+                )
+            if self.config.public_port == self.config.port:
+                raise RuntimeError(
+                    "public_port and port are the same. The whole point of the split is that "
+                    "Funnel cannot reach the tailnet listener even by accident."
+                )
+            self._public_server = WakeServer(
+                store=self.store, routes=public_routes,
+                host="127.0.0.1", port=self.config.public_port,
+                on_wake=self._on_wake, max_skew_seconds=self.config.max_skew_seconds,
+                require_tailnet=False, limiter=RateLimiter(),
+            )
+            self._public_server.serve_forever_in_background()
+            self.audit.append(kind="daemon", action="public_listener",
+                              data={"port": self.config.public_port,
+                                    "funnel_port": self.config.funnel_port,
+                                    "routes": [r.path for r in public_routes]})
+
         self._server = WakeServer(
-            store=self.store, routes=self.routes,
+            # ONLY the private routes. A public route served here too would make
+            # the port split decorative: the whole point is that a route a third
+            # party can reach is not on the port an operator reaches.
+            store=self.store, routes=private_routes, allow_no_routes=True,
             host="127.0.0.1", port=self.config.port,
             on_wake=self._on_wake, max_skew_seconds=self.config.max_skew_seconds,
             require_tailnet=self.config.require_tailnet,
@@ -418,6 +459,8 @@ class Daemon:
         self._drain_wanted.set()
         if self.slack is not None:
             self.slack.listener.stop()
+        if self._public_server is not None:
+            self._public_server.shutdown()
         if self._server is not None:
             self._server.shutdown()
         deadline = clock.monotonic() + grace_seconds

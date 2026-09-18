@@ -238,9 +238,48 @@ def render_newsyslog(target: Target) -> str:
     )
 
 
+FUNNEL_PORTS = (443, 8443, 10000)
+
+
 def render_serve_command(port: int) -> list[str]:
-    """Expose the loopback listener to the tailnet, and to nothing else."""
+    """Expose the loopback listener to the tailnet, and to nothing else.
+
+    Deliberately NOT a funnel-eligible port. A port outside 443/8443/10000
+    cannot be funnelled even by a mistyped command, which is a far stronger
+    guarantee than remembering not to.
+    """
     return ["tailscale", "serve", "--bg", f"https:{port}", "/", f"http://127.0.0.1:{port}"]
+
+
+def render_funnel_commands(funnel_port: int, target_port: int, paths: list[str]) -> list[list[str]]:
+    """Expose ONLY the named paths on a funnel-eligible port.
+
+    Scripted rather than typed, because this is a one-keystroke production
+    change: on a node where the policy already grants `funnel`, a single
+    command goes live with no prompt and no approval. Mounting `/` here, or
+    running `serve` against the same port afterwards, silently flips the whole
+    port — public in the first case, private in the second.
+
+    Paths not mounted here are answered 404 by tailscaled itself and never
+    reach Bothy, which is the one piece of filtering Funnel gives for free.
+    """
+    if funnel_port not in FUNNEL_PORTS:
+        raise ValueError(
+            f"Funnel is only permitted on {FUNNEL_PORTS}; {funnel_port} would be refused by tailscaled"
+        )
+    if target_port in FUNNEL_PORTS:
+        # Bothy runs unprivileged and must never need to bind 443. If the
+        # target and the funnel port were the same, the install would either
+        # demand root or collide with tailscaled's own listener.
+        raise ValueError(
+            f"Bothy's own listener should not be on {target_port}: tailscaled binds the "
+            "privileged port and proxies to an ordinary one."
+        )
+    return [
+        ["tailscale", "funnel", "--bg", f"--https={funnel_port}", f"--set-path={path}",
+         f"http://127.0.0.1:{target_port}"]
+        for path in paths
+    ]
 
 
 def already_installed(target: Target) -> bool:

@@ -154,6 +154,14 @@ class Route:
     # global switch someone flips once for one route and forgets. A public
     # route's HMAC signature is its ONLY gate, which is what signatures are for
     # — but it should be obvious in the file which routes are in that position.
+    #
+    # NOTE THE STRONGER GUARANTEE SITS BELOW THIS FLAG. Tailscale Funnel is
+    # per-PORT, not per-path: the serve config keys AllowFunnel on SNI:port with
+    # no path dimension, and whichever of `serve` or `funnel` ran last flips the
+    # WHOLE port. So public routes get their own listener on a funnel-eligible
+    # port (443/8443/10000) and tailnet routes stay on a port Funnel is not
+    # permitted to touch. This flag is defence in depth; the port split is the
+    # real boundary.
     public: bool = False
     signature_header: str = "X-Webhook-Signature"
     timestamp_header: str = "X-Webhook-Timestamp"
@@ -272,10 +280,26 @@ class _Handler(BaseHTTPRequestHandler):
 
         Any of them failing is a refusal. A verifier that fails open is not one.
         """
-        # A route marked public skips identity entirely: the caller is a
-        # third party with no tailnet account, and demanding one would refuse
-        # the very traffic the route exists for.
-        if not self.require_tailnet or (route is not None and route.public):
+        # Set by tailscaled itself, and unspoofable in both directions: it
+        # deletes any client-supplied copy unconditionally, then re-sets it from
+        # server-side connection context when the request arrived via Funnel.
+        # Present means public origin; absent means tailnet origin.
+        #
+        # Gate on THIS header, never on the absence of Tailscale-User-Login —
+        # identity headers are also absent for TAGGED devices, and tagging is
+        # exactly what a per-client deployment will use, so "no identity header"
+        # would wrongly classify our own nodes as public.
+        via_funnel = (self.headers.get("Tailscale-Funnel-Request") or "").strip() != ""
+
+        if route is not None and route.public:
+            # A third party has no tailnet account; demanding one would refuse
+            # the very traffic the route exists for.
+            return None
+        if via_funnel:
+            raise tailnet.TailnetError(
+                f"{self.path} is tailnet-only and this request arrived over Funnel"
+            )
+        if not self.require_tailnet:
             return None
         hop = self.client_address[0]
         if hop not in {"127.0.0.1", "::1"}:
@@ -439,12 +463,13 @@ class WakeServer:
         port: int = 8787,
         on_wake: Callable[[dict[str, Any]], None] | None = None,
         max_skew_seconds: int = DEFAULT_SKEW_SECONDS,
+        allow_no_routes: bool = False,
         require_tailnet: bool = False,
         tailnet_allow_logins: list[str] | None = None,
         tailnet_allow_nodes: list[str] | None = None,
         limiter: "RateLimiter | None" = None,
     ) -> None:
-        if not routes:
+        if not routes and not allow_no_routes:
             raise ValueError("a wake server with no routes would accept nothing; configure at least one")
         self.host = host
         self.port = port
