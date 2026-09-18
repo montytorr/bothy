@@ -86,6 +86,8 @@ class Daemon:
         routes: list[Route],
         prompt_template: str = DEFAULT_PROMPT_TEMPLATE,
         janitor_interval_seconds: float = 300.0,
+        max_wake_attempts: int = 30,
+        max_wake_age_seconds: float = 6 * 3600.0,
         retention: RetentionPolicy | None = None,
     ) -> None:
         self.config = config
@@ -97,6 +99,8 @@ class Daemon:
         self.routes = routes
         self.prompt_template = prompt_template
         self.janitor_interval_seconds = janitor_interval_seconds
+        self.max_wake_attempts = max_wake_attempts
+        self.max_wake_age_seconds = max_wake_age_seconds
         self.retention = retention or RetentionPolicy()
 
         self.store = WakeStore(config.wake_dir)
@@ -113,6 +117,7 @@ class Daemon:
         self._server: WakeServer | None = None
         self._public_server: WakeServer | None = None
         self.slack: "SlackBridge | None" = None
+        self.discord: "DiscordBridge | None" = None
         self._stopping = threading.Event()
         self._drain_wanted = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -176,6 +181,10 @@ class Daemon:
             payload=json.dumps(payload, indent=2, sort_keys=True)[:6000],
         )
 
+    # A refusal for capacity is not a verdict on the work, so the wake stays
+    # pending and is retried. These are the gates that mean "not now".
+    CAPACITY_GATES = frozenset({"lane_busy", "pool_full", "pool_probing"})
+
     def drain(self) -> int:
         """Turn pending wakes into runs. Returns how many were handled.
 
@@ -183,26 +192,50 @@ class Daemon:
         a periodic one cannot walk the same queue together and start the same
         work twice. A second caller skips this pass rather than queueing behind
         the holder and then running against an already-empty queue.
+
+        WAITING IS BOUNDED. A wake refused for capacity is retried, but every
+        attempt is counted and a wake that has waited too long or been refused
+        too often is dead-lettered rather than retried forever. That is the
+        lesson from a claim-that-never-spawned which spun for two hours across
+        eleven reclaims because the retry path bypassed the failure counter:
+        every path that requeues work must advance a counter that eventually
+        gives up and says so.
         """
         try:
             with reactor_lease(self.lease_path):
                 handled = 0
+                # Lanes already found busy in this pass. Without this, ten wakes
+                # for one busy subject each pay for a full admission attempt on
+                # every sweep, and the log fills with the same refusal.
+                busy_lanes: set[str] = set()
+                pool_exhausted = False
+
                 for event in self.store.pending():
                     if self._stopping.is_set():
                         break
                     subject = str(event.get("subject") or event["id"])
+
+                    if subject in busy_lanes or pool_exhausted:
+                        self._defer(event, gate="lane_busy" if subject in busy_lanes else "pool_full",
+                                    reason="skipped: capacity already known exhausted this pass")
+                        continue
+
+                    if self._too_old(event) or self._too_many_attempts(event):
+                        continue
+
                     result = self.runner.run(
                         subject=subject,
                         prompt=self._prompt_for(event),
                         wake_id=event["id"],
                         profile=event.get("profile"),
                     )
-                    if result.status == "refused" and (result.refusal or {}).get("gate") in {
-                        "lane_busy", "pool_full", "pool_probing"
-                    }:
-                        # Capacity, not a verdict on the work. Leave it pending
-                        # so the next pass picks it up rather than discarding a
-                        # wake because we were briefly busy.
+                    gate = (result.refusal or {}).get("gate")
+                    if result.status == "refused" and gate in self.CAPACITY_GATES:
+                        if gate == "lane_busy":
+                            busy_lanes.add(subject)
+                        else:
+                            pool_exhausted = True
+                        self._defer(event, gate=str(gate), reason=str(result.refusal.get("reason", "")))
                         continue
                     # A scheduled heartbeat that found nothing says NO_REPLY,
                     # and that is filtered everywhere rather than delivered.
@@ -214,6 +247,8 @@ class Daemon:
                     )
                     if said and event.get("route") == "slack" and self.slack is not None:
                         self.slack.reply(event, "\n".join(said))
+                    elif said and event.get("route") == "discord" and self.discord is not None:
+                        self.discord.reply(event, "\n".join(said))
                     elif said and (event.get("payload") or {}).get("heartbeat"):
                         self.alerter.say(
                             f"**{self.config.site}** heartbeat — {subject}\n" + "\n".join(said)[:1500]
@@ -325,6 +360,65 @@ class Daemon:
                                   data={"error": f"{type(exc).__name__}: {exc}"})
             self._stopping.wait(timeout=15.0)
 
+    def _defer(self, event: dict[str, Any], *, gate: str, reason: str) -> None:
+        """Record that a wake waited, and how long it has been waiting.
+
+        Counting is the point. "Still pending" tells an operator nothing; "third
+        attempt, waiting eleven minutes behind lane issue-77" tells them where
+        to look.
+        """
+        attempts = int(event.get("attempts", 0)) + 1
+        fields: dict[str, Any] = {
+            "attempts": attempts,
+            "last_gate": gate,
+            "last_deferred_at": clock.iso(),
+        }
+        if not event.get("waiting_since"):
+            fields["waiting_since"] = event.get("received_at") or clock.iso()
+        self.store.mark(event["id"], **fields)
+
+    def _abandon(self, event: dict[str, Any], *, reason: str) -> None:
+        """Give up on a wake, visibly. Never silently."""
+        self.store.mark(event["id"], processed=True, processed_at=clock.iso(),
+                        outcome="abandoned", abandoned_reason=reason)
+        self.audit.append(kind="wake", action="abandoned", status="failed",
+                          subject=str(event.get("subject") or event["id"]),
+                          data={"wake": event["id"], "reason": reason,
+                                "attempts": event.get("attempts", 0),
+                                "waiting_since": event.get("waiting_since")})
+        self.alerter.incident(
+            job=f"wake:{event.get('route', '?')}", error=reason, severity="warning",
+            detail={"subject": str(event.get("subject") or event["id"])},
+            reaction="Something is holding that lane, or the pool never recovered. bothy status.",
+        )
+
+    def _too_many_attempts(self, event: dict[str, Any]) -> bool:
+        if int(event.get("attempts", 0)) < self.max_wake_attempts:
+            return False
+        self._abandon(event, reason=f"refused {event.get('attempts')} times for "
+                                    f"{event.get('last_gate', 'capacity')}")
+        return True
+
+    def _too_old(self, event: dict[str, Any]) -> bool:
+        """A wake that has waited past its usefulness is dropped, not run late.
+
+        Acting on a six-hour-old webhook is often worse than not acting: the
+        world has moved on and the agent reasons about a state that no longer
+        exists.
+        """
+        since = event.get("waiting_since") or event.get("received_at")
+        if not since:
+            return False
+        try:
+            age = clock.age_seconds(str(since))
+        except (ValueError, TypeError):
+            return False
+        if age < self.max_wake_age_seconds:
+            return False
+        self._abandon(event, reason=f"waited {age / 3600:.1f}h without capacity, past the "
+                                    f"{self.max_wake_age_seconds / 3600:.0f}h limit")
+        return True
+
     # ---- loops ----------------------------------------------------------
 
     def _drain_loop(self) -> None:
@@ -393,6 +487,37 @@ class Daemon:
             ),
         )
 
+    def _build_discord(self) -> "DiscordBridge | None":
+        """Wire Discord if a token is named, and refuse a listening-but-deaf setup."""
+        token_env = self.config.discord_bot_token_env
+        if not token_env:
+            return None
+        token = os.environ.get(token_env)
+        if not token:
+            raise RuntimeError(
+                f"Discord is configured but ${token_env} is unset. Refusing to start half-connected."
+            )
+        if not self.config.discord_allow_from:
+            raise RuntimeError(
+                "Discord is configured with an empty discord_allow_from. An agent that runs "
+                "commands should not take instructions from anyone who can find its channel. "
+                "List the Discord user ids allowed to speak to it."
+            )
+        return DiscordBridge(
+            bot_token=token, store=self.store, audit=self.audit,
+            allow_from=self.config.discord_allow_from,
+            channels=self.config.discord_channels,
+            profile=self.config.discord_profile,
+            message_content=self.config.discord_message_content,
+            on_stored=self._drain_wanted.set,
+            on_error=lambda message, fatal: self.alerter.incident(
+                job="discord", error=message, severity="critical" if fatal else "warning",
+                reaction="Check the bot token and that the privileged MESSAGE_CONTENT intent is "
+                        "enabled in the application settings." if fatal
+                        else "Transient; it is reconnecting on its own.",
+            ),
+        )
+
     def start(self, *, reap: bool = False) -> None:
         """Acquire the state directory and begin. Raises rather than guessing."""
         self.config.ensure_dirs()
@@ -426,6 +551,17 @@ class Daemon:
             for worker, outcome in self.registry.reap():
                 self.audit.append(kind="worker", action="reaped", run_id=worker.run_id,
                                   data={"pgid": worker.pgid, "outcome": outcome})
+
+        self.discord = self._build_discord()
+        if self.discord is not None:
+            thread = threading.Thread(target=self.discord.listener.run_forever,
+                                      name="bothy-discord", daemon=True)
+            thread.start()
+            self._threads.append(thread)
+            self.audit.append(kind="discord", action="listening",
+                              data={"allow_from": len(self.discord.allow_from),
+                                    "channels": sorted(self.discord.channels) or "any",
+                                    "profile": self.discord.profile})
 
         self.slack = self._build_slack()
         if self.slack is not None:
@@ -514,6 +650,8 @@ class Daemon:
             return
         self._stopping.set()
         self._drain_wanted.set()
+        if self.discord is not None:
+            self.discord.listener.stop()
         if self.slack is not None:
             self.slack.listener.stop()
         if self._public_server is not None:
@@ -656,3 +794,101 @@ class SlackBridge:
             return
         with contextlib.suppress(Exception):
             self.client.post(channel, text, thread_ts=where.get("thread_ts"))
+
+
+class DiscordBridge:
+    """Two-way Discord for the daemon, over the gateway.
+
+    The same shape as the Slack bridge, and the same rules: inbound messages
+    become wakes on the one durable queue, replies go back to the channel they
+    came from, and WHO MAY SPEAK IS DENY BY DEFAULT.
+
+    Two differences Discord forces. It has no per-message acknowledgement to
+    withhold, so "we kept it" is expressed by advancing the sequence number only
+    for a stored message — a crash before that means a RESUME replays it.
+    And a bot sees its OWN messages, so ignoring them is not tidiness but the
+    difference between a harness and an infinite loop.
+    """
+
+    def __init__(
+        self,
+        *,
+        bot_token: str,
+        store: "WakeStore",
+        audit: AuditLog,
+        allow_from: list[str],
+        channels: list[str] | None = None,
+        profile: str | None = None,
+        message_content: bool = True,
+        on_stored: Callable[[], None] | None = None,
+        on_error: Callable[[str, bool], None] | None = None,
+    ) -> None:
+        from .discord import DiscordClient, GatewayListener, Intents, message_subject
+
+        self.store = store
+        self.audit = audit
+        self.allow_from = set(allow_from)
+        self.channels = set(channels or ())
+        self.profile = profile
+        self.on_stored = on_stored or (lambda: None)
+        self.client = DiscordClient(bot_token)
+        self._subject_of = message_subject
+        self.bot_user_id: str | None = None
+        self.listener = GatewayListener(
+            bot_token=bot_token,
+            on_message=self._store,
+            intents=Intents.default(message_content=message_content),
+            on_error=on_error or (lambda message, fatal: None),
+        )
+
+    def _store(self, message: dict[str, Any]) -> bool:
+        author = (message.get("author") or {})
+        speaker = str(author.get("id") or "")
+        channel = str(message.get("channel_id") or "")
+        text = str(message.get("content") or "")
+
+        if author.get("bot"):
+            # Including our own voice. A bot that answers itself is not a
+            # harness, it is a loop with a bill attached.
+            return True
+        if self.channels and channel not in self.channels:
+            return True
+        if speaker not in self.allow_from:
+            self.audit.append(kind="discord", action="ignored", status="refused",
+                              subject=channel, actor=speaker,
+                              data={"reason": "speaker is not on the allowlist"})
+            return True
+        if not text.strip():
+            # Almost always a missing MESSAGE_CONTENT intent rather than an
+            # empty message, and it is worth saying which.
+            self.audit.append(kind="discord", action="empty", status="refused",
+                              subject=channel, actor=speaker,
+                              data={"reason": "no content; is the MESSAGE_CONTENT intent enabled?"})
+            return True
+
+        wake = ids_wake_id()
+        self.store.append({
+            "id": wake,
+            "received_at": clock.iso(),
+            "route": "discord",
+            "subject": self._subject_of(message),
+            "delivery_key": f"discord:{message.get('id')}",
+            "payload": {"prompt": text,
+                        "discord": {"channel": channel, "message_id": str(message.get("id") or "")}},
+            "profile": self.profile,
+            "processed": False,
+        })
+        self.audit.append(kind="discord", action="received", subject=self._subject_of(message),
+                          actor=speaker, data={"wake": wake, "channel": channel})
+        with contextlib.suppress(Exception):
+            self.client.react(channel, str(message.get("id") or ""))
+        self.on_stored()
+        return True
+
+    def reply(self, event: dict[str, Any], text: str) -> None:
+        where = ((event.get("payload") or {}).get("discord")) or {}
+        channel = where.get("channel")
+        if not channel or not text.strip():
+            return
+        with contextlib.suppress(Exception):
+            self.client.post(channel, text, reply_to=where.get("message_id"))

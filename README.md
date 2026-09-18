@@ -308,7 +308,8 @@ The cost is honest: latency in seconds to minutes, API quota, and state to keep.
 
 ## Talking to it
 
-Slack, over **Socket Mode** — an *outbound* WebSocket. No public URL, no inbound
+**Slack** over Socket Mode and **Discord** over the gateway. Both are *outbound*
+WebSockets on the client we wrote ourselves. No public URL, no inbound
 port, no TLS certificate to own, no request signatures to verify. It works
 unchanged on a machine that accepts no connections at all, which is the whole
 deployment story.
@@ -320,10 +321,32 @@ deployment story.
 "slack_profile": "selfcare"
 ```
 
-**Deny by default, and it refuses to start without an allowlist.** An agent that
-runs commands on a client's machine should not take instructions from anyone who
-can find its channel, and "the bot is only in a private channel" is a
-configuration nobody audits.
+Discord is the same shape, with its own protocol underneath:
+
+```json
+"discord_bot_token_env": "DISCORD_BOT_TOKEN",
+"discord_allow_from": ["123456789012345678"],
+"discord_channels":  ["987654321098765432"]
+```
+
+**Deny by default, and either refuses to start without an allowlist.** An agent
+that runs commands on a client's machine should not take instructions from
+anyone who can find its channel, and "the bot is only in a private channel" is a
+configuration nobody audits. A bot also sees its own messages, so ignoring them
+isn't tidiness — it's the difference between a harness and a loop with a bill
+attached.
+
+The Discord gateway is a real protocol with state, and four things in it are
+easy to get wrong: a missed heartbeat ack means a **zombie socket** that looks
+fine and delivers nothing; an unresumable session retried forever **pins the bot
+offline**, so it is thrown away after three attempts; some close codes are
+**fatal configuration**, not weather; and `MESSAGE_CONTENT` is a **privileged
+intent**, so without it messages arrive empty and the bot looks broken rather
+than refused — Bothy says which.
+
+There is no per-message ack to withhold, so "we kept it" is expressed by
+advancing the sequence number **only for a stored message**. A crash before that
+means a `RESUME` replays it.
 
 A Slack message becomes a wake on the same durable queue as a webhook, so it is
 admitted, budgeted and lane-serialised identically. Lanes are keyed on the
@@ -455,6 +478,7 @@ so it is explicit in the code rather than implied.
 | `capability.py` | Profiles, generated worker config, and the tools Bothy hosts. |
 | `ws.py` | RFC 6455 client. No dependency, no server role, no extensions. |
 | `slack.py` | Socket Mode in, Web API out, deny by default. |
+| `discord.py` | The gateway: intents, heartbeat, resume, and its failure modes. |
 | `tailnet.py` | Who is calling, asked of tailscaled rather than of a header. |
 | `install.py` | launchd, systemd, the wrapper, and the exit-code contract. |
 | `ratelimit.py` | Token buckets, per route and per caller, before the HMAC. |
@@ -472,7 +496,7 @@ make check          # quiet, non-zero on failure
 make test           # verbose
 ```
 
-**135 tests, standard library `unittest`, no dependency.** They assert
+**184 tests, standard library `unittest`, no dependency.** They assert
 *properties*, not implementation — and every one was first demonstrated by hand
 against the real thing (real Codex, real GitHub, a real systemd install) before
 being written down here.
@@ -512,9 +536,11 @@ they came from. And it installs: one headless command, tailnet-only ingress,
 tailscaled-verified callers, and an exit-code contract both service managers
 honour.
 
-Not yet: Discord inbound, and a live Slack workspace has never been connected —
-the framing, ack discipline and allowlist are proven, the credentials path is
-not.
+Everything that can be built without live credentials is built. What remains is
+connection: no live Slack workspace and no live Discord application have ever
+been connected. The framing, the protocols, the ack discipline, the allowlists
+and the lane keying are all proven against fakes and against the RFC; the
+credentials paths are not.
 
 ## Licence
 

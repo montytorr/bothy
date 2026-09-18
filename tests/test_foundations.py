@@ -134,3 +134,63 @@ class RetentionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PeerTests(unittest.TestCase):
+    """Tags, because one tailnet per client means access by tag, not by device."""
+
+    def test_a_tagged_peer_is_labelled_by_its_tag(self) -> None:
+        """A tagged node has no human owner; naming one would be a lie."""
+        from bothy.tailnet import Peer
+
+        tagged = Peer(login="", node="mini.ts.net", node_id="nABC", tags=("tag:bothy",))
+        self.assertTrue(tagged.is_tagged)
+        self.assertEqual(tagged.label(), "tag:bothy@mini.ts.net")
+
+    def test_an_untagged_peer_is_labelled_by_its_login(self) -> None:
+        from bothy.tailnet import Peer
+
+        peer = Peer(login="you@example.com", node="laptop.ts.net", node_id="nDEF")
+        self.assertFalse(peer.is_tagged)
+        self.assertEqual(peer.label(), "you@example.com@laptop.ts.net")
+
+
+class CapabilityValidationTests(unittest.TestCase):
+    """Contradictory grants are refused when the profile is read."""
+
+    def test_gating_a_tool_must_not_be_what_enables_it(self) -> None:
+        from bothy.capability import Profile
+
+        with self.assertRaises(ValueError) as caught:
+            Profile.from_dict("mail", {
+                "mcp_servers": {"gmail": {"command": "x"}},
+                "mcp_tools": {"gmail": ["search"]},
+                "mcp_ask": {"gmail": ["send"]},
+            })
+        self.assertIn("must not be what enables it", str(caught.exception))
+
+    def test_scoping_a_server_the_profile_does_not_grant_is_refused(self) -> None:
+        from bothy.capability import Profile
+
+        with self.assertRaises(ValueError):
+            Profile.from_dict("p", {"mcp_servers": {}, "mcp_tools": {"slack": ["post"]}})
+
+    def test_a_scoped_server_renders_enabled_tools(self) -> None:
+        """Least privilege rendered, rather than remembered."""
+        from bothy.capability import Profile, render_config_toml
+
+        profile = Profile.from_dict("mail", {
+            "mcp_servers": {"gmail": {"command": "mcp-gmail"}},
+            "mcp_tools": {"gmail": ["search", "send"]},
+            "mcp_ask": {"gmail": ["send"]},
+        })
+        rendered = render_config_toml(profile)
+        self.assertIn('enabled_tools = ["search", "send"]', rendered)
+        self.assertIn("[mcp_servers.gmail.tools.send]", rendered)
+        self.assertIn('approval_mode = "always"', rendered)
+
+    def test_an_unscoped_server_says_so_loudly(self) -> None:
+        from bothy.capability import Profile
+
+        profile = Profile.from_dict("wide", {"mcp_servers": {"gmail": {"command": "x"}}})
+        self.assertIn("ALL TOOLS", profile.summary())

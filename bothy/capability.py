@@ -58,6 +58,13 @@ class Profile:
 
     name: str
     mcp_servers: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
+    # Which of a server's tools this profile actually wants, by server name.
+    # Granting a server grants every tool it offers unless this says otherwise,
+    # and "mcp: gmail" reads as harmless while potentially including `send`.
+    mcp_tools: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    # Tools that must stop and ask, by server name. Codex supports this per
+    # tool; Bothy renders it so a profile author cannot forget to.
+    mcp_ask: dict[str, list[str]] = dataclasses.field(default_factory=dict)
     skill_roots: list[str] = dataclasses.field(default_factory=list)
     tools: list[str] = dataclasses.field(default_factory=list)
     sandbox: str | None = None
@@ -69,15 +76,56 @@ class Profile:
     @classmethod
     def from_dict(cls, name: str, raw: dict[str, Any]) -> "Profile":
         known = {field.name for field in dataclasses.fields(cls)} - {"name"}
-        return cls(name=name, **{key: value for key, value in raw.items() if key in known})
+        profile = cls(name=name, **{key: value for key, value in raw.items() if key in known})
+        profile.validate()
+        return profile
+
+    def validate(self) -> None:
+        """Refuse a profile whose grants contradict each other.
+
+        Checked when the profile is read, not when a run uses it, so a
+        contradiction is a startup error somebody can fix rather than a
+        surprise at three in the morning.
+
+        The contradiction that matters: naming a tool under ``mcp_ask`` while
+        excluding it from ``mcp_tools``. Silently adding it would be a
+        capability grant by side effect — an author writes "make send ask for
+        approval" and unintentionally *enables* send. Silently dropping the gate
+        would be worse. So it is refused and the author says what they meant.
+        """
+        for server, ask in self.mcp_ask.items():
+            if server not in self.mcp_servers:
+                raise ValueError(
+                    f"profile {self.name}: mcp_ask names {server!r}, which this profile does not grant"
+                )
+            allowed = self.mcp_tools.get(server)
+            if allowed is None:
+                continue
+            missing = sorted(set(ask) - set(allowed))
+            if missing:
+                raise ValueError(
+                    f"profile {self.name}: {server} tools {missing} are gated by mcp_ask but not "
+                    f"listed in mcp_tools. Add them to mcp_tools to grant them, or remove them from "
+                    f"mcp_ask — listing a tool as 'ask for approval' must not be what enables it."
+                )
+        for server in self.mcp_tools:
+            if server not in self.mcp_servers:
+                raise ValueError(
+                    f"profile {self.name}: mcp_tools names {server!r}, which this profile does not grant"
+                )
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 
     def summary(self) -> str:
         bits = []
-        if self.mcp_servers:
-            bits.append("mcp: " + ", ".join(sorted(self.mcp_servers)))
+        for server in sorted(self.mcp_servers):
+            allowed = self.mcp_tools.get(server)
+            ask = self.mcp_ask.get(server) or []
+            # Naming the tools, not just the server: "mcp: gmail" reads as
+            # harmless and may include `send`.
+            scope = ", ".join(allowed) if allowed else "ALL TOOLS"
+            bits.append(f"mcp {server}({scope})" + (f" ask:{','.join(ask)}" if ask else ""))
         if self.tools:
             bits.append("tools: " + ", ".join(self.tools))
         if self.skill_roots:
@@ -140,15 +188,23 @@ def render_config_toml(profile: Profile | None, *, extra: dict[str, Any] | None 
     if profile is not None:
         for name, table in sorted(profile.mcp_servers.items()):
             lines += ["", f"[mcp_servers.{name}]"]
+            allowed = profile.mcp_tools.get(name)
             for key, value in table.items():
-                if isinstance(value, dict):
+                if isinstance(value, dict) or key in {"enabled_tools", "tools"}:
                     continue
                 lines.append(f"{key} = {_toml_value(value)}")
+            if allowed:
+                # Least privilege, rendered rather than remembered. Without this
+                # a profile that wanted one read-only tool gets every tool the
+                # server happens to expose, including whatever it adds next.
+                lines.append(f"enabled_tools = {_toml_value(sorted(allowed))}")
             for key, value in table.items():
-                if isinstance(value, dict):
+                if isinstance(value, dict) and key != "tools":
                     lines += [f"[mcp_servers.{name}.{key}]"]
                     for sub, item in value.items():
                         lines.append(f"{sub} = {_toml_value(item)}")
+            for tool in sorted(profile.mcp_ask.get(name) or []):
+                lines += [f"[mcp_servers.{name}.tools.{tool}]", 'approval_mode = "always"']
     return "\n".join(lines) + "\n"
 
 

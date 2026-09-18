@@ -111,6 +111,13 @@ class Config:
     slack_allow_from: list[str] = dataclasses.field(default_factory=list)
     slack_profile: str | None = None
     slack_ack_emoji: str = "eyes"
+    # Two-way Discord, over the gateway. Also an OUTBOUND connection, so it
+    # needs no ingress either. Token name, never the token.
+    discord_bot_token_env: str | None = None
+    discord_allow_from: list[str] = dataclasses.field(default_factory=list)
+    discord_channels: list[str] = dataclasses.field(default_factory=list)
+    discord_profile: str | None = None
+    discord_message_content: bool = True
 
     # ---- derived paths -------------------------------------------------
 
@@ -169,6 +176,8 @@ class Config:
             "slack_socket_mode": "configured" if (self.slack_app_token_env and self.slack_bot_token_env)
                                  else "not configured",
             "slack_allow_from": len(self.slack_allow_from),
+            "discord_gateway": "configured" if self.discord_bot_token_env else "not configured",
+            "discord_allow_from": len(self.discord_allow_from),
             "profiles": sorted(self.profiles),
             "default_profile": self.default_profile,
             "routes": [r.get("path") for r in self.routes],

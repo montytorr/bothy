@@ -106,6 +106,12 @@ class WebSocket:
         self._buffer = bytearray()
         self.max_message_bytes = max_message_bytes
         self.closed = False
+        # The peer's reason for closing, when it gave one. Some protocols —
+        # Discord's gateway among them — distinguish "reconnect" from "your
+        # token is wrong" purely by close code, and a client that discards it
+        # will retry a fatal error forever.
+        self.close_code: int | None = None
+        self.close_reason: str = ""
 
     # ---- connecting ----------------------------------------------------
 
@@ -234,6 +240,9 @@ class WebSocket:
             if frame.opcode == OP_PONG:
                 continue
             if frame.opcode == OP_CLOSE:
+                if len(frame.payload) >= 2:
+                    self.close_code = struct.unpack("!H", frame.payload[:2])[0]
+                    self.close_reason = frame.payload[2:].decode("utf-8", "replace")
                 self.closed = True
                 try:
                     self.send_frame(OP_CLOSE, frame.payload[:2])

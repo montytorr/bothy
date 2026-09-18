@@ -60,12 +60,19 @@ class Peer:
     node: str
     node_id: str
     addresses: tuple[str, ...] = ()
-    is_tagged: bool = False
+    tags: tuple[str, ...] = ()
+
+    @property
+    def is_tagged(self) -> bool:
+        return bool(self.tags)
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 
     def label(self) -> str:
+        if self.tags:
+            # A tagged node has no human owner, so naming one would be a lie.
+            return f"{','.join(self.tags)}@{self.node}"
         return f"{self.login}@{self.node}"
 
 
@@ -136,7 +143,7 @@ def whois(address: str, *, sock: str | None = None, timeout: float = 5.0) -> Pee
         node=str(node.get("Name") or "").rstrip("."),
         node_id=str(node.get("StableID") or ""),
         addresses=tuple(node.get("Addresses") or ()),
-        is_tagged=bool(node.get("Tags")),
+        tags=tuple(str(tag) for tag in (node.get("Tags") or ())),
     )
 
 
@@ -145,12 +152,38 @@ def check(address: str, *, allow_logins: list[str] | None = None,
     """Resolve a peer and enforce the allowlists. Raises TailnetError on refusal.
 
     An empty allowlist means "any tailnet peer", which is a real choice on a
-    single-user tailnet and a bad one on a shared tailnet — so it is stated in
-    the config rather than being the silent default of an absent key.
+    single-user tailnet and a bad one on a shared one — so it is stated in the
+    config rather than being the silent default of an absent key.
+
+    ``allow_nodes`` accepts three things, and the first is the one to prefer:
+
+      ``tag:bothy``  a tailnet ACL tag. Access survives a person leaving and
+                     does not depend on which human account a device happens to
+                     be bound to, which is why the one-tailnet-per-client model
+                     uses tags rather than devices.
+      a StableID     one specific device, forever
+      a node name    convenient, but a name can be reassigned
+
+    A TAGGED NODE HAS NO HUMAN OWNER, so it can never satisfy ``allow_logins``.
+    Mixing the two would silently refuse every tagged device; using tags means
+    putting them in ``allow_nodes``.
     """
     peer = whois(address, sock=sock)
-    if allow_logins and peer.login not in allow_logins:
-        raise TailnetError(f"{peer.label()} is not an allowed login")
-    if allow_nodes and peer.node_id not in allow_nodes and peer.node not in allow_nodes:
-        raise TailnetError(f"{peer.label()} is not an allowed device")
+    if allow_logins:
+        if peer.tags:
+            raise TailnetError(
+                f"{peer.label()} is a tagged device and has no login; "
+                "allow it by tag in tailnet_allow_nodes instead"
+            )
+        if peer.login not in allow_logins:
+            raise TailnetError(f"{peer.label()} is not an allowed login")
+    if allow_nodes:
+        permitted = set(allow_nodes)
+        matches = (
+            peer.node_id in permitted
+            or peer.node in permitted
+            or any(tag in permitted for tag in peer.tags)
+        )
+        if not matches:
+            raise TailnetError(f"{peer.label()} is not an allowed device or tag")
     return peer
