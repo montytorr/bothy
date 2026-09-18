@@ -40,7 +40,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
-from . import clock, ids
+from . import clock, ids, tailnet
 from .vendor.a2a_reactor.queue import append_event, read_queue, write_queue
 
 __all__ = ["Route", "WakeStore", "WakeServer", "verify_signature", "MAX_BODY_BYTES"]
@@ -245,6 +245,38 @@ class _Handler(BaseHTTPRequestHandler):
     store: WakeStore
     on_wake: Callable[[dict[str, Any]], None] | None = None
     max_skew_seconds: int = DEFAULT_SKEW_SECONDS
+    require_tailnet: bool = False
+    tailnet_allow_logins: tuple[str, ...] = ()
+    tailnet_allow_nodes: tuple[str, ...] = ()
+
+    def _peer(self) -> "tailnet.Peer | None":
+        """Identify the tailnet peer behind a forwarded request, or refuse.
+
+        Bothy listens on loopback and is reached through ``tailscale serve``, so
+        the connection always arrives from 127.0.0.1 and the real peer is in the
+        forwarded headers. A header is a claim; the local tailscaled daemon is
+        the proof. Three things must hold together:
+
+          the hop itself is loopback, so the request really came via the local
+          proxy rather than from something that merely set the headers;
+          a forwarded address exists and is not loopback;
+          tailscaled recognises that address as a peer.
+
+        Any of them failing is a refusal. A verifier that fails open is not one.
+        """
+        if not self.require_tailnet:
+            return None
+        hop = self.client_address[0]
+        if hop not in {"127.0.0.1", "::1"}:
+            raise tailnet.TailnetError(f"request did not arrive via the local proxy (from {hop})")
+        forwarded = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+        if not forwarded or forwarded in {"127.0.0.1", "::1"}:
+            raise tailnet.TailnetError("no forwarded client address; is tailscale serve in front?")
+        return tailnet.check(
+            forwarded,
+            allow_logins=list(self.tailnet_allow_logins) or None,
+            allow_nodes=list(self.tailnet_allow_nodes) or None,
+        )
 
     def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
         """Silence the default access log; Bothy records its own events."""
@@ -264,6 +296,15 @@ class _Handler(BaseHTTPRequestHandler):
         self._reply(HTTPStatus.OK, {"ok": True, "service": "bothy", "at": clock.iso()})
 
     def do_POST(self) -> None:  # noqa: N802
+        try:
+            peer = self._peer()
+        except tailnet.TailnetError as exc:
+            # Same discretion as a bad signature: the caller learns nothing, the
+            # reason is kept on our side.
+            print(f"[bothy][wake-refused] {exc}", flush=True)
+            self._reply(HTTPStatus.FORBIDDEN, {"ok": False, "error": "forbidden"})
+            return
+
         route = self.routes.get(self.path.split("?", 1)[0])
         if route is None:
             self._reply(HTTPStatus.NOT_FOUND, {"ok": False, "error": "no such route"})
@@ -322,6 +363,7 @@ class _Handler(BaseHTTPRequestHandler):
             "subject": route.subject(payload, wake_id),
             "delivery_key": delivery_key,
             "payload": payload,
+            "peer": peer.label() if peer else None,
             "profile": route.profile,
             "processed": False,
         }
@@ -366,6 +408,9 @@ class WakeServer:
         port: int = 8787,
         on_wake: Callable[[dict[str, Any]], None] | None = None,
         max_skew_seconds: int = DEFAULT_SKEW_SECONDS,
+        require_tailnet: bool = False,
+        tailnet_allow_logins: list[str] | None = None,
+        tailnet_allow_nodes: list[str] | None = None,
     ) -> None:
         if not routes:
             raise ValueError("a wake server with no routes would accept nothing; configure at least one")
@@ -379,6 +424,9 @@ class WakeServer:
                 "store": store,
                 "on_wake": staticmethod(on_wake) if on_wake else None,
                 "max_skew_seconds": max_skew_seconds,
+                "require_tailnet": require_tailnet,
+                "tailnet_allow_logins": tuple(tailnet_allow_logins or ()),
+                "tailnet_allow_nodes": tuple(tailnet_allow_nodes or ()),
             },
         )
         self._httpd = ThreadingHTTPServer((host, port), handler)

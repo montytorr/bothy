@@ -54,6 +54,12 @@ class Config:
     # read is a config an agent can leak.
     routes: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     janitor_interval_seconds: float = 300.0
+    # Tailnet identity as a second gate in front of the listener. Off unless
+    # switched on, because a box without tailscaled would otherwise refuse
+    # everything and the failure would look like a Bothy bug.
+    require_tailnet: bool = False
+    tailnet_allow_logins: list[str] = dataclasses.field(default_factory=list)
+    tailnet_allow_nodes: list[str] = dataclasses.field(default_factory=list)
     # the worker
     codex_binary: str = "codex"
     # Each run gets its own CODEX_HOME for SQLite isolation, which means each run
@@ -140,6 +146,7 @@ class Config:
             "budget": dataclasses.asdict(self.budget),
             "codex_credentials": "present" if (self.codex_credentials_dir / "auth.json").exists() else "MISSING",
             "codex_inherit_config": self.codex_inherit_config,
+            "require_tailnet": self.require_tailnet,
             "slack_socket_mode": "configured" if (self.slack_app_token_env and self.slack_bot_token_env)
                                  else "not configured",
             "slack_allow_from": len(self.slack_allow_from),

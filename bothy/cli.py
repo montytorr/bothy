@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import pathlib
 import sys
 from typing import Any
 
@@ -22,6 +23,7 @@ from .audit import AuditLog, ChainBreak
 from .budget import BudgetLedger
 from .capability import Profile
 from .config import Config, load
+from . import install as installer
 from .daemon import Daemon
 from .lifecycle import EX_CONFIG
 from .wake import Route
@@ -342,6 +344,140 @@ def cmd_profiles(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
+def cmd_install(args: argparse.Namespace, config: Config) -> int:
+    """Install Bothy as a service. Headless, idempotent, non-zero on failure.
+
+    No prompts and no TTY reads, so it works the same over ssh, in a script, and
+    from a deployment tool. Everything it would do can be printed first with
+    --dry-run, because the first thing anyone sensible does with an installer
+    aimed at their own machine is ask what it is about to touch.
+    """
+    import os as _os
+    import subprocess as _sub
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    target = installer.plan(site=config.site, home=config.home, repo=repo,
+                            user=args.user, kind=args.kind)
+    files = {
+        target.wrapper_path: (installer.render_wrapper(target), 0o755),
+        target.unit_path: (
+            installer.render_launchd(target) if target.kind == installer.LAUNCHD
+            else installer.render_systemd(target), 0o644),
+    }
+    if target.kind == installer.LAUNCHD:
+        files[pathlib.Path("/etc/newsyslog.d/bothy.conf")] = (installer.render_newsyslog(target), 0o644)
+
+    commands = installer.activate(target)
+    serve = installer.render_serve_command(config.port)
+
+    if args.dry_run:
+        print(f"would install {target.label} ({target.kind}) for user {target.user}\n")
+        for path, (_, mode) in files.items():
+            print(f"  write   {path}  mode {mode:o}")
+        print(f"  mkdir   {target.log_dir}")
+        print(f"  ensure  {target.env_path}  mode 0600  (secrets; never in the unit)")
+        for command in commands:
+            print(f"  run     {command}")
+        print(f"  run     {' '.join(serve)}")
+        if args.print_files:
+            for path, (body, _) in files.items():
+                print(f"\n----- {path} -----\n{body}")
+        return 0
+
+    if _os.geteuid() != 0 and target.unit_path.is_absolute() and str(target.unit_path).startswith(("/Library", "/etc")):
+        print(f"bothy: installing to {target.unit_path} needs root. Re-run with sudo, "
+              f"or use --dry-run --print-files to review what it would write.", flush=True)
+        return EX_CONFIG
+
+    # The service does not run as root, so anything it must READ or WRITE has to
+    # belong to it. Found the hard way on the first real install: the secrets
+    # file was created 0600 root:root and the daemon could not read its own
+    # environment, failing with a bare "Permission denied" two layers below
+    # anything that mentions Bothy.
+    import pwd as _pwd
+    try:
+        entry = _pwd.getpwnam(target.user)
+        owner = (entry.pw_uid, entry.pw_gid)
+    except KeyError:
+        print(f"bothy: no such user {target.user!r}", flush=True)
+        return EX_CONFIG
+
+    try:
+        target.log_dir.mkdir(parents=True, exist_ok=True)
+        _os.chown(target.log_dir, *owner)
+        config.ensure_dirs()
+        for path, (body, mode) in files.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+            _os.chmod(path, mode)
+            print(f"  wrote {path}")
+        if not target.env_path.exists():
+            # Created empty and locked down, so there is somewhere obvious to put
+            # secrets and no excuse to put them in the world-readable unit.
+            target.env_path.parent.mkdir(parents=True, exist_ok=True)
+            target.env_path.write_text("# Bothy secrets. Mode 0600. KEY=value per line.\n", encoding="utf-8")
+            _os.chown(target.env_path, *owner)
+            _os.chmod(target.env_path, 0o600)
+            print(f"  created {target.env_path} (mode 0600, owned by {target.user})")
+        else:
+            # An existing file might predate this fix, or have been placed by
+            # hand. Make it readable by the service either way, without
+            # touching its contents.
+            _os.chown(target.env_path, *owner)
+            _os.chmod(target.env_path, 0o600)
+    except OSError as exc:
+        print(f"bothy: install failed: {exc}", flush=True)
+        return 1
+
+    for command in commands:
+        result = _sub.run(command, shell=True, capture_output=True, text=True)  # noqa: S602
+        status = "ok" if result.returncode == 0 else f"exit {result.returncode}"
+        print(f"  {command}  -> {status}")
+        if result.returncode != 0 and "|| true" not in command:
+            print(f"    {(result.stderr or result.stdout).strip()[:300]}")
+            return 1
+
+    if args.serve:
+        result = _sub.run(serve, capture_output=True, text=True)
+        print(f"  {' '.join(serve)}  -> {'ok' if result.returncode == 0 else (result.stderr or '').strip()[:200]}")
+    else:
+        print(f"\n  expose it to the tailnet when ready:\n    {' '.join(serve)}")
+
+    print(f"\ninstalled {target.label}. Next: put secrets in {target.env_path}, then 'bothy doctor'.")
+    return 0
+
+
+def cmd_uninstall(args: argparse.Namespace, config: Config) -> int:
+    """Remove what install added. Leaves state and secrets alone unless asked."""
+    import os as _os
+    import subprocess as _sub
+
+    repo = pathlib.Path(__file__).resolve().parent.parent
+    target = installer.plan(site=config.site, home=config.home, repo=repo, user=args.user, kind=args.kind)
+    for command in installer.deactivate(target):
+        result = _sub.run(command, shell=True, capture_output=True, text=True)  # noqa: S602
+        print(f"  {command}  -> {'ok' if result.returncode == 0 else 'skipped'}")
+    for path in (target.unit_path, target.wrapper_path, pathlib.Path("/etc/newsyslog.d/bothy.conf")):
+        try:
+            if path.exists():
+                path.unlink()
+                print(f"  removed {path}")
+        except OSError as exc:
+            print(f"  could not remove {path}: {exc}")
+    print(f"\nleft alone: {target.env_path} (secrets) and {config.home} (state).")
+    if not args.purge:
+        print("pass --purge to remove those too.")
+    else:
+        import shutil as _shutil
+        for path in (target.env_path,):
+            with __import__("contextlib").suppress(OSError):
+                path.unlink()
+                print(f"  removed {path}")
+        _shutil.rmtree(config.home, ignore_errors=True)
+        print(f"  removed {config.home}")
+    return 0
+
+
 def cmd_reap(args: argparse.Namespace, config: Config) -> int:
     """Kill anything a previous instance left behind, and release what it held.
 
@@ -403,6 +539,20 @@ def main(argv: list[str] | None = None) -> int:
     audit.add_argument("--verify", action="store_true", help="check the hash chain")
     audit.add_argument("--json", action="store_true")
     audit.set_defaults(func=cmd_audit)
+
+    install_cmd = subparsers.add_parser("install", help="install as a service; headless and idempotent")
+    install_cmd.add_argument("--dry-run", action="store_true", help="print what it would do and stop")
+    install_cmd.add_argument("--print-files", action="store_true", help="with --dry-run, show file contents")
+    install_cmd.add_argument("--kind", choices=["launchd", "systemd"], default=None)
+    install_cmd.add_argument("--user", default=None, help="account the service runs as")
+    install_cmd.add_argument("--serve", action="store_true", help="also run 'tailscale serve' now")
+    install_cmd.set_defaults(func=cmd_install)
+
+    uninstall_cmd = subparsers.add_parser("uninstall", help="remove the service")
+    uninstall_cmd.add_argument("--kind", choices=["launchd", "systemd"], default=None)
+    uninstall_cmd.add_argument("--user", default=None)
+    uninstall_cmd.add_argument("--purge", action="store_true", help="also remove state and the secrets file")
+    uninstall_cmd.set_defaults(func=cmd_uninstall)
 
     profiles = subparsers.add_parser("profiles", help="what each capability profile grants")
     profiles.add_argument("--json", action="store_true")

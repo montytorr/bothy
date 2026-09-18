@@ -384,6 +384,9 @@ class Daemon:
             store=self.store, routes=self.routes,
             host="127.0.0.1", port=self.config.port,
             on_wake=self._on_wake, max_skew_seconds=self.config.max_skew_seconds,
+            require_tailnet=self.config.require_tailnet,
+            tailnet_allow_logins=self.config.tailnet_allow_logins,
+            tailnet_allow_nodes=self.config.tailnet_allow_nodes,
         )
         self._server.serve_forever_in_background()
 
