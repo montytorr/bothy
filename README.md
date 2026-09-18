@@ -161,6 +161,58 @@ Routes are declared in config; **secrets are named, never stored**:
 of racing. A route whose secret is unset is a **startup error**, not a warning —
 Bothy will not hold a door open it meant to lock.
 
+## Putting it on a machine
+
+One command. No prompts, no TTY reads, idempotent, non-zero on failure — so it
+works the same over ssh, in a script, and from a deployment tool.
+
+```bash
+sudo bin/bothy install --dry-run          # exactly what it will touch
+sudo bin/bothy install                    # launchd on macOS, systemd on Linux
+sudo bin/bothy install --serve            # and expose it to the tailnet
+```
+
+Reachability is `tailscale serve`'s job: it terminates TLS with the tailnet's
+own certificate, refuses anyone outside, and forwards to loopback. There is no
+public listener to misconfigure and no certificate for Bothy to own.
+
+With `require_tailnet` on, Bothy also asks the **local tailscaled daemon** who
+is calling, rather than believing a forwarded header — a header is a claim, the
+daemon is the proof:
+
+```json
+"require_tailnet": true,
+"tailnet_allow_logins": ["you@example.com"]
+```
+
+Tailnet identity says who *connected*; a webhook signature says who *wrote the
+payload*. Both are checked, because they are different questions.
+
+**The exit code is the contract, and the two service managers need opposite
+handling of it.** systemd reads `78` directly via `RestartPreventExitStatus`.
+launchd has no equivalent, so there the wrapper translates `78` into a clean
+exit that `SuccessfulExit=false` reads as "do not restart". Getting this wrong
+is subtle: an earlier version translated for *both*, and since the unit also
+says `Restart=always` — which restarts on a clean exit too — systemd cheerfully
+restarted the very thing that had just said restarting cannot help.
+
+Proven on a real install, not rendered and eyeballed:
+
+```
+installed as a systemd service            active
+signed webhook -> supervised Codex run    audit shows the full chain
+secret removed                            status=78, NRestarts=0  (stops, does not loop)
+secret restored                           active again
+uninstalled                               no unit, no wrapper, no process
+                                          secrets and state left alone
+```
+
+The wrapper carries the three things a service definition cannot express:
+waiting for the tailscaled socket (launchd has no ordering graph, and systemd's
+`After=` waits for a unit to be *active*, not for its socket to be *usable*),
+reading secrets from a `0600` file (launchd has no `EnvironmentFile`, and a
+plist is world-readable), and log rotation (launchd does none).
+
 ## Talking to it
 
 Slack, over **Socket Mode** — an *outbound* WebSocket. No public URL, no inbound
@@ -310,6 +362,8 @@ so it is explicit in the code rather than implied.
 | `capability.py` | Profiles, generated worker config, and the tools Bothy hosts. |
 | `ws.py` | RFC 6455 client. No dependency, no server role, no extensions. |
 | `slack.py` | Socket Mode in, Web API out, deny by default. |
+| `tailnet.py` | Who is calling, asked of tailscaled rather than of a header. |
+| `install.py` | launchd, systemd, the wrapper, and the exit-code contract. |
 | `daemon.py` | Four loops: listen, drain, schedule, sweep. |
 
 `bothy/vendor/a2a_reactor/` is vendored verbatim from
@@ -319,7 +373,8 @@ go upstream.
 
 ## Status
 
-**P0, P1 and P2**, proven end to end against a real Codex app-server.
+**P0 through P4**, proven end to end against a real Codex app-server and a real
+service install.
 
 A signed webhook arrives on loopback, is verified and deduped, hits disk before
 the `202`, and becomes a supervised Codex run whose lane, slot and budget were
@@ -334,10 +389,14 @@ fired on schedule, ran, worked through the checklist, hit a real sandbox
 limitation and reported it — rather than failing quietly, and rather than
 saying something when there was nothing to say.
 
-It talks, too: Slack over Socket Mode, deny-by-default, with replies landing in
-the thread they came from.
+It talks: Slack over Socket Mode, deny-by-default, replies landing in the thread
+they came from. And it installs: one headless command, tailnet-only ingress,
+tailscaled-verified callers, and an exit-code contract both service managers
+honour.
 
-Not yet: Discord inbound, launchd and `tailscale serve` packaging (P4).
+Not yet: Discord inbound, and a live Slack workspace has never been connected —
+the framing, ack discipline and allowlist are proven, the credentials path is
+not.
 
 ## Licence
 
