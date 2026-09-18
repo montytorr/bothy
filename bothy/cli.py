@@ -1,0 +1,243 @@
+"""The operator's view. Plain text, exit codes that mean something.
+
+``doctor`` exits NON-ZERO when something is wrong and can print JSON, so it can
+gate a deploy. That sounds obvious; the closest comparable project has a doctor
+with two dozen checks that always returns success and has no machine-readable
+output, so nothing can be built on it. A health command that cannot fail is
+decoration.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from typing import Any
+
+from . import __version__, clock, codex
+from .alert import Alerter, CompositeSink, DiscordWebhookSink, SlackWebhookSink, StderrSink
+from .audit import AuditLog, ChainBreak
+from .budget import BudgetLedger
+from .config import Config, load
+from .pool import Admission
+from .proc import ProcessRegistry
+from .runner import Runner
+from .tracker import CairnTracker
+
+__all__ = ["main", "build"]
+
+
+def build(config: Config) -> tuple[Runner, Admission, AuditLog, ProcessRegistry]:
+    """Assemble the harness from a config. One place, so every entry point agrees."""
+    config.ensure_dirs()
+    audit = AuditLog(config.audit_path)
+    ledger = BudgetLedger(config.budget_path, config.budget)
+    admission = Admission(config.pool, ledger)
+    registry = ProcessRegistry(config.registry_path)
+    tracker = CairnTracker(
+        agent=config.cairn_agent, binary=config.cairn_binary, project=config.cairn_project
+    )
+    sinks: list[Any] = [StderrSink()]
+    if config.discord_webhook_url:
+        sinks.append(DiscordWebhookSink(config.discord_webhook_url))
+    if config.slack_webhook_url:
+        sinks.append(SlackWebhookSink(config.slack_webhook_url))
+    alerter = Alerter(CompositeSink(*sinks), host=config.site)
+    runner = Runner(config, admission=admission, audit=audit, registry=registry,
+                    tracker=tracker, alerter=alerter)
+    return runner, admission, audit, registry
+
+
+# --------------------------------------------------------------------------
+# commands
+
+
+def cmd_status(args: argparse.Namespace, config: Config) -> int:
+    runner, admission, audit, registry = build(config)
+    observed = None
+    if config.budget.mode == "subscription" and args.refresh:
+        observed, _ = runner.rate_limit_position(refresh=True)
+    snapshot = admission.snapshot(observed_used=observed)
+    survivors = registry.survivors()
+
+    if args.json:
+        print(json.dumps({"site": config.site, "version": __version__,
+                          "pool": snapshot, "workers": [w.as_dict() for w in survivors]}, indent=2))
+        return 0
+
+    budget = snapshot["budget"]
+    print(f"bothy {__version__} — {config.site}")
+    print(f"  pool     {snapshot['state']}  {snapshot['in_flight']}/{snapshot['effective_size']} busy "
+          f"(max {snapshot['max_workers']}, failure ratio {snapshot['failure_ratio']} over {snapshot['samples']})")
+    print(f"  budget   {budget['used']} used + {budget['reserved']} reserved "
+          f"of {budget['limit']} {budget['unit']}  ({budget['headroom']} left, {budget['mode']} mode)")
+    if snapshot["lanes"]:
+        for subject, run_id in sorted(snapshot["lanes"].items()):
+            print(f"  lane     {subject} -> {run_id}")
+    else:
+        print("  lane     nothing in flight")
+    print(f"  workers  {len(survivors)} live process group(s)")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
+    """Check the things that would stop Bothy working, and fail if any do."""
+    runner, admission, audit, registry = build(config)
+    checks: list[dict[str, Any]] = []
+
+    def check(name: str, ok: bool, detail: str, *, fatal: bool = True) -> None:
+        checks.append({"check": name, "ok": ok, "detail": detail, "fatal": fatal})
+
+    check("state directory writable", config.state_dir.exists() and
+          __import__("os").access(config.state_dir, __import__("os").W_OK), str(config.state_dir))
+
+    try:
+        count = audit.verify()
+        check("audit chain intact", True, f"{count} records verified")
+    except ChainBreak as exc:
+        check("audit chain intact", False, f"broken at record {exc.sequence}")
+
+    try:
+        import subprocess
+        version = subprocess.run([config.codex_binary, "--version"], capture_output=True, text=True, timeout=20)
+        check("codex present", version.returncode == 0, version.stdout.strip() or version.stderr.strip())
+    except Exception as exc:  # noqa: BLE001
+        check("codex present", False, str(exc))
+
+    tracker = CairnTracker(agent=config.cairn_agent, binary=config.cairn_binary)
+    check("cairn reachable", tracker.available(), "memory and task ledger", fatal=False)
+
+    survivors = registry.survivors()
+    check("no orphaned workers", not survivors,
+          f"{len(survivors)} process group(s) left by a previous instance")
+
+    check("alert route configured",
+          bool(config.discord_webhook_url or config.slack_webhook_url),
+          "a failure nobody hears about is not handled", fatal=False)
+
+    if config.budget.mode == "subscription":
+        observed, resets = runner.rate_limit_position(refresh=args.refresh)
+        check("subscription window readable", observed is not None,
+              f"{observed}% used, resets {resets}" if observed is not None else "could not read")
+
+    failed = [c for c in checks if not c["ok"] and c["fatal"]]
+    warned = [c for c in checks if not c["ok"] and not c["fatal"]]
+
+    if args.json:
+        print(json.dumps({"ok": not failed, "checks": checks}, indent=2))
+    else:
+        for entry in checks:
+            mark = "ok  " if entry["ok"] else ("FAIL" if entry["fatal"] else "warn")
+            print(f"  [{mark}] {entry['check']}: {entry['detail']}")
+        print(f"\n{len(checks) - len(failed) - len(warned)} passed, {len(warned)} warned, {len(failed)} failed")
+    return 1 if failed else 0
+
+
+def cmd_run(args: argparse.Namespace, config: Config) -> int:
+    runner, _, _, _ = build(config)
+    result = runner.run(subject=args.subject, prompt=args.prompt, cairn_ref=args.ref,
+                        wall_clock_seconds=args.wall_clock)
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2))
+    else:
+        print(f"{result.status}  {result.run_id}  {result.cost:.4f} {result.unit}")
+        if result.refusal:
+            print(f"  refused at gate '{result.refusal.get('gate')}': {result.refusal.get('reason')}")
+        for message in result.messages:
+            print(f"  {message}")
+        if result.error:
+            print(f"  error: {result.error}")
+    return 0 if result.ok else 1
+
+
+def cmd_audit(args: argparse.Namespace, config: Config) -> int:
+    audit = AuditLog(config.audit_path)
+    if args.verify:
+        try:
+            print(f"chain intact: {audit.verify()} records")
+            return 0
+        except ChainBreak as exc:
+            print(f"CHAIN BROKEN at record {exc.sequence} in {exc.path}", file=sys.stderr)
+            return 1
+    for record in audit.records():
+        if args.run and record.get("run_id") != args.run:
+            continue
+        if args.json:
+            print(json.dumps(record))
+        else:
+            print(f"{record['ts']}  {record['kind']:8} {record['action']:16} {record['status']:8} "
+                  f"{record.get('subject') or '-':24} {record.get('run_id') or '-'}")
+    return 0
+
+
+def cmd_reap(args: argparse.Namespace, config: Config) -> int:
+    """Kill anything a previous instance left behind, and release what it held.
+
+    Killing the process is only half of recovery. A crashed run still holds its
+    budget reservation, and leaving that to expire on its TTL means an hour of
+    refusing real work to protect money nobody is spending. Reaping settles it
+    in the same pass.
+    """
+    _, _, audit, registry = build(config)
+    ledger = BudgetLedger(config.budget_path, config.budget)
+    outcomes = registry.reap()
+    released = 0
+    for worker, outcome in outcomes:
+        settled = ledger.settle_run(worker.run_id)
+        released += len(settled)
+        freed = f", released {len(settled)} reservation(s)" if settled else ""
+        print(f"  {worker.run_id}  pgid {worker.pgid}  {outcome}{freed}")
+        audit.append(kind="worker", action="reaped", run_id=worker.run_id,
+                     data={"pgid": worker.pgid, "outcome": outcome,
+                           "reservations_released": [r.id for r in settled]})
+    # Anything left behind by a run the registry never recorded still ages out.
+    expired = ledger.expire_stale()
+    if expired:
+        print(f"  {len(expired)} reservation(s) expired on TTL")
+    print(f"{len(outcomes)} recorded worker(s) handled, {released + len(expired)} reservation(s) released")
+    return 0
+
+
+# --------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="bothy", description="a small agent harness you can leave somewhere")
+    parser.add_argument("--config", default=None, help="path to config.json")
+    parser.add_argument("--version", action="version", version=f"bothy {__version__}")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    status = subparsers.add_parser("status", help="what it is doing right now")
+    status.add_argument("--json", action="store_true")
+    status.add_argument("--refresh", action="store_true", help="re-read the subscription window (spawns a probe)")
+    status.set_defaults(func=cmd_status)
+
+    doctor = subparsers.add_parser("doctor", help="check what would stop it working; non-zero if anything would")
+    doctor.add_argument("--json", action="store_true")
+    doctor.add_argument("--refresh", action="store_true")
+    doctor.set_defaults(func=cmd_doctor)
+
+    run = subparsers.add_parser("run", help="run one supervised turn now")
+    run.add_argument("prompt")
+    run.add_argument("--subject", required=True, help="what this is about; one run per subject at a time")
+    run.add_argument("--ref", default=None, help="Cairn task reference to claim and annotate")
+    run.add_argument("--wall-clock", type=float, default=None)
+    run.add_argument("--json", action="store_true")
+    run.set_defaults(func=cmd_run)
+
+    audit = subparsers.add_parser("audit", help="read the record")
+    audit.add_argument("--run", default=None, help="only this run id")
+    audit.add_argument("--verify", action="store_true", help="check the hash chain")
+    audit.add_argument("--json", action="store_true")
+    audit.set_defaults(func=cmd_audit)
+
+    reap = subparsers.add_parser("reap", help="kill workers a previous instance left behind")
+    reap.set_defaults(func=cmd_reap)
+
+    args = parser.parse_args(argv)
+    config = load(args.config)
+    return int(args.func(args, config))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
