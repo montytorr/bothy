@@ -23,6 +23,7 @@ unauditable harness at a client site should get quieter, not carry on.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -118,8 +119,20 @@ class AuditLog:
         Checks three things per record: that the sequence increments by one,
         that ``prev`` matches the predecessor's hash, and that the hash is the
         digest of the record's own contents.
+
+        A rotated file does not start at sequence one. Its first record is a
+        ``rotated`` marker naming the file it continues and that file's final
+        hash, so each segment verifies on its own AND the segments link — which
+        is the property that makes rotation safe for a tamper-evident log.
+        Without it, rotating would quietly reset the chain and every rotation
+        would be a gap an editor could hide in.
         """
-        expected_seq, previous = 1, GENESIS
+        first = next(self.records(), None)
+        if first is not None and first.get("action") == "rotated" and first.get("kind") == "audit":
+            expected_seq = int(first.get("seq", 1))
+            previous = str((first.get("data") or {}).get("previous_hash", GENESIS))
+        else:
+            expected_seq, previous = 1, GENESIS
         count = 0
         for record in self.records():
             seq = record.get("seq")
@@ -197,3 +210,52 @@ class AuditLog:
                 raise AuditError(f"could not append to {self.path}: {exc}") from exc
             self._tip = (record["seq"], record["hash"])
             return record
+
+    def rotate(self, *, keep: int = 8) -> Path | None:
+        """Start a new segment, carrying the chain across the boundary.
+
+        Returns the path the old segment was moved to, or None if there was
+        nothing to rotate. The new file opens with a ``rotated`` record naming
+        its predecessor and that predecessor's final hash, so ``verify`` can
+        check each segment alone and confirm the segments join.
+        """
+        with self._lock:
+            if not self.path.exists() or self.path.stat().st_size == 0:
+                return None
+            sequence, previous = self.tip()
+            stamp = clock.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            archived = self.path.with_name(f"{self.path.stem}-{stamp}{self.path.suffix}")
+            os.replace(self.path, archived)
+            self._tip = (sequence, previous)
+
+            record: dict[str, Any] = {
+                "seq": sequence + 1,
+                "ts": clock.iso(),
+                "kind": "audit",
+                "action": "rotated",
+                "status": "ok",
+                "run_id": None,
+                "subject": None,
+                "actor": None,
+                "data": {"previous_file": archived.name, "previous_hash": previous},
+                "prev": previous,
+            }
+            record["hash"] = _digest(record)
+            line = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._tip = (record["seq"], record["hash"])
+
+            segments = sorted(self.path.parent.glob(f"{self.path.stem}-*{self.path.suffix}"))
+            for stale in segments[:-keep] if keep > 0 else segments:
+                with contextlib.suppress(OSError):
+                    stale.unlink()
+            return archived
+
+    def should_rotate(self) -> bool:
+        try:
+            return self.path.exists() and self.path.stat().st_size >= self.max_bytes
+        except OSError:
+            return False

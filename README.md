@@ -96,6 +96,18 @@ the numbers to act on.
 **`doctor` exits non-zero and speaks JSON**, so a deploy can gate on it. A
 health command that cannot fail is decoration.
 
+**A restart replaces; it does not accumulate.** If a previous instance's workers
+are still alive, Bothy refuses to start beside them and names them. The
+alternative logs "found left-over process … ignoring", which is how five
+duplicate listeners once accumulated and fought over one session.
+
+**The exit code is a message to the supervisor.** `75` means restart me, `78`
+means stop — so a typo in a config file does not burn the restart budget that
+exists for real crashes. Bothy never self-supervises and never daemonises.
+
+**It cannot page you when it is dead.** Nothing can emit its own zero. So it
+writes a heartbeat file every loop and the deployment watches that from outside.
+
 **A signature authenticates the sender, not the content.** A verified GitHub
 webhook proves GitHub sent it. The pull request title inside was written by a
 stranger.
@@ -114,11 +126,26 @@ cat > $BOTHY_HOME/config.json <<'JSON'
 }
 JSON
 
-bin/bothy doctor
-bin/bothy run "Summarise what changed this week" --subject weekly --ref ACME-12
+bin/bothy doctor                 # non-zero if anything would stop it working
+bin/bothy run "..." --subject weekly --ref ACME-12
+bin/bothy serve                  # the daemon, in the foreground, for a real supervisor
 bin/bothy status
 bin/bothy audit --run run_20260918T061249Z_9b9f6971
+bin/bothy reap                   # kill what a previous instance left behind
 ```
+
+Routes are declared in config; **secrets are named, never stored**:
+
+```json
+"routes": [
+  { "path": "/hook/github", "secret_env": "GITHUB_WEBHOOK_SECRET",
+    "subject_from": "issue.id", "subject_prefix": "issue-" }
+]
+```
+
+`subject_from` is what makes two webhooks about one issue share a lane instead
+of racing. A route whose secret is unset is a **startup error**, not a warning —
+Bothy will not hold a door open it meant to lock.
 
 Real output:
 
@@ -182,6 +209,9 @@ so it is explicit in the code rather than implied.
 | `wake.py` | Signed, deduped, durable-before-ack wakes on loopback. |
 | `runner.py` | One run, door to record. Group killed and budget settled in `finally`. |
 | `config.py` | The whole surface. *If a setting cannot have a correct unattended default, it does not get to be a setting.* |
+| `lifecycle.py` | One instance, unclean-death detection, the 75/78 exit contract. |
+| `retention.py` | The janitor. Written the same day as the writers. |
+| `daemon.py` | Three loops: listen, drain, sweep. |
 
 `bothy/vendor/a2a_reactor/` is vendored verbatim from
 [a2a-comms](https://github.com/montytorr/a2a-comms) (MIT) — event triage,
@@ -190,13 +220,18 @@ go upstream.
 
 ## Status
 
-**P0.** Proven end to end against a real Codex app-server: supervised turns,
-parallel runs on separate subjects, same-subject serialisation, budget refusal
-on live quota, crash recovery under `SIGKILL`, and a hash-chained audit trail
-joining all of it.
+**P0 and P1**, proven end to end against a real Codex app-server.
 
-Not yet: a supervised daemon and retention (P1), scheduler and heartbeat (P2),
-inbound chat (P3), launchd and `tailscale serve` packaging (P4).
+A signed webhook arrives on loopback, is verified and deduped, hits disk before
+the `202`, and becomes a supervised Codex run whose lane, slot and budget were
+all granted together — then settles, records itself in Cairn, and lands in a
+hash-chained audit log you can replay by run id. Two subjects run at once; a
+third on a busy subject is turned away by name. Killed with `SIGKILL`, it leaves
+orphans exactly as physics requires and reaps them on the next start, releasing
+their budget in the same pass.
+
+Not yet: scheduler and heartbeat (P2), inbound chat (P3), launchd and
+`tailscale serve` packaging (P4).
 
 ## Licence
 

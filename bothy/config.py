@@ -49,6 +49,11 @@ class Config:
     # tailscale serve's job and there is no setting here that can expose it.
     port: int = 8787
     max_skew_seconds: int = 300
+    # Inbound routes. Each entry names the ENV VAR holding its secret; the
+    # secret itself never appears in this file, because a config an agent can
+    # read is a config an agent can leak.
+    routes: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    janitor_interval_seconds: float = 300.0
     # the worker
     codex_binary: str = "codex"
     # Each run gets its own CODEX_HOME for SQLite isolation, which means each run
@@ -123,6 +128,7 @@ class Config:
             "budget": dataclasses.asdict(self.budget),
             "codex_credentials": "present" if (self.codex_credentials_dir / "auth.json").exists() else "MISSING",
             "codex_inherit_config": self.codex_inherit_config,
+            "routes": [r.get("path") for r in self.routes],
             "cairn_agent": self.cairn_agent,
             "cairn_project": self.cairn_project,
             "discord_webhook": "configured" if self.discord_webhook_url else "not configured",

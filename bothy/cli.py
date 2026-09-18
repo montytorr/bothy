@@ -14,11 +14,16 @@ import json
 import sys
 from typing import Any
 
+import os
+
 from . import __version__, clock, codex
 from .alert import Alerter, CompositeSink, DiscordWebhookSink, SlackWebhookSink, StderrSink
 from .audit import AuditLog, ChainBreak
 from .budget import BudgetLedger
 from .config import Config, load
+from .daemon import Daemon
+from .lifecycle import EX_CONFIG
+from .wake import Route
 from .pool import Admission
 from .proc import ProcessRegistry
 from .runner import Runner
@@ -46,6 +51,54 @@ def build(config: Config) -> tuple[Runner, Admission, AuditLog, ProcessRegistry]
     runner = Runner(config, admission=admission, audit=audit, registry=registry,
                     tracker=tracker, alerter=alerter)
     return runner, admission, audit, registry
+
+
+def build_routes(config: Config) -> list[Route]:
+    """Resolve configured routes, taking each secret from the environment.
+
+    A route whose secret is missing is a startup ERROR, never a warning. Bothy
+    will not hold a door open that it meant to lock, because the day that
+    warning scrolls past unread is the day it matters.
+    """
+    routes: list[Route] = []
+    for entry in config.routes:
+        env_key = entry.get("secret_env")
+        if not env_key:
+            raise ValueError(f"route {entry.get('path')} has no secret_env; secrets never live in config.json")
+        secret = os.environ.get(env_key)
+        if not secret:
+            raise ValueError(
+                f"route {entry.get('path')} expects its secret in ${env_key}, which is unset. "
+                "Refusing to listen on an unsigned endpoint."
+            )
+        routes.append(Route(
+            path=entry["path"],
+            secret=secret,
+            subject_from=entry.get("subject_from"),
+            subject_prefix=entry.get("subject_prefix", ""),
+            signature_header=entry.get("signature_header", "X-Webhook-Signature"),
+            timestamp_header=entry.get("timestamp_header", "X-Webhook-Timestamp"),
+        ))
+    return routes
+
+
+def cmd_serve(args: argparse.Namespace, config: Config) -> int:
+    """Run the daemon in the foreground, for a real supervisor to own."""
+    runner, admission, audit, registry = build(config)
+    try:
+        routes = build_routes(config)
+    except ValueError as exc:
+        print(f"bothy: {exc}", flush=True)
+        return EX_CONFIG
+    if not routes:
+        print("bothy: no routes configured; there would be nothing to wake on", flush=True)
+        return EX_CONFIG
+    daemon = Daemon(
+        config, runner=runner, admission=admission, audit=audit, registry=registry,
+        alerter=runner.alerter, routes=routes,
+        janitor_interval_seconds=config.janitor_interval_seconds,
+    )
+    return daemon.run_forever(reap=args.reap)
 
 
 # --------------------------------------------------------------------------
@@ -233,6 +286,11 @@ def main(argv: list[str] | None = None) -> int:
 
     reap = subparsers.add_parser("reap", help="kill workers a previous instance left behind")
     reap.set_defaults(func=cmd_reap)
+
+    serve = subparsers.add_parser("serve", help="run the daemon in the foreground")
+    serve.add_argument("--reap", action="store_true",
+                       help="kill a previous instance's workers instead of refusing to start")
+    serve.set_defaults(func=cmd_serve)
 
     args = parser.parse_args(argv)
     config = load(args.config)

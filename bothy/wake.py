@@ -61,6 +61,21 @@ def _candidates(secret: bytes, body: bytes, timestamp: str | None, event_id: str
     signs a differently-serialised form of the same JSON will otherwise fail
     verification for a payload that is perfectly authentic. The
     ``{id}.{timestamp}.{body}`` form is the Standard Webhooks shape.
+
+    WHAT THE CANONICAL FALLBACK ACTUALLY PROMISES, because it is weaker than it
+    looks and the difference matters. It verifies the PARSED CONTENT, not the
+    bytes. When the signed body was itself canonical, any re-encoding that parses
+    to the same object is accepted — different whitespace, different key order, a
+    duplicate key whose last value wins. Measured: a changed value, an added
+    field and a removed field are all rejected; only semantically identical
+    re-encodings pass.
+
+    That is safe here for exactly one reason, and it is a constraint on the rest
+    of Bothy rather than a property of this function: the payload is always taken
+    from ``json.loads(body)`` and the raw bytes are never used again. If anything
+    downstream ever re-reads the raw body — to re-sign it, forward it verbatim,
+    or hash it for an id — this equivalence stops being harmless, because the
+    bytes it sees may not be the bytes that were signed.
     """
     out = [hmac.new(secret, body, hashlib.sha256).hexdigest()]
     with contextlib.suppress(json.JSONDecodeError, TypeError):
