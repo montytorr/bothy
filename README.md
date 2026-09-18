@@ -23,14 +23,14 @@ client's Mac mini, walk away from, and monitor from a distance.
 
 ```mermaid
 flowchart LR
-    W[signed webhook]:::in --> Q
-    S[schedule]:::in --> Q
-    C[Slack / Discord]:::in --> Q
-    P[polling]:::in --> Q
+    W[signed webhook]:::src --> Q
+    S[schedule]:::src --> Q
+    C["Slack / Discord"]:::src --> Q
+    P[polling]:::src --> Q
 
     Q["durable queue<br/><i>fsync before the ack</i>"]:::core --> G
 
-    G{"admission gate<br/><b>lane · slot · budget</b>"}:::gate -->|refused, and why| R[recorded]:::out
+    G{"admission gate<br/><b>lane · slot · budget</b>"}:::gate -->|refused, and why| R["recorded, with its gate"]:::out
     G -->|admitted| K
 
     K["codex app-server<br/><i>approvals · metering<br/>wall clock · interrupt</i>"]:::core --> O
@@ -40,7 +40,7 @@ flowchart LR
     O --> D[Discord / Slack]:::out
     O --> X["process group<br/>killed"]:::out
 
-    classDef in fill:#1f2937,stroke:#475569,color:#e2e8f0
+    classDef src fill:#1f2937,stroke:#475569,color:#e2e8f0
     classDef core fill:#0f766e,stroke:#14b8a6,color:#f0fdfa
     classDef gate fill:#7c2d12,stroke:#ea580c,color:#fff7ed
     classDef out fill:#312e81,stroke:#6366f1,color:#eef2ff
