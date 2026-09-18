@@ -4,7 +4,7 @@
 
 ### A small agent harness you can leave somewhere.
 
-*Wakes on signed webhooks, schedules, chat or polling.*
+*Woken by signed webhooks, cron schedules, chat, or polling.*
 *Runs Codex under supervision. Remembers in Cairn.*
 *Speaks up when it needs you. Closed to everything but the tailnet.*
 
@@ -24,7 +24,7 @@ client's Mac mini, walk away from, and monitor from a distance.
 ```mermaid
 flowchart LR
     W[signed webhook]:::src --> Q
-    S[schedule]:::src --> Q
+    S["cron / interval"]:::src --> Q
     C["Slack / Discord"]:::src --> Q
     P[polling]:::src --> Q
 
@@ -135,6 +135,10 @@ refused  run_20260918T061120Z_b3ec3ddd  0.0000 percent
 ```
 
 ## Four ways to wake it
+
+All four produce the same durable wake and pass the same admission gate — one
+place where lanes, budget and concurrency are enforced, not four that could
+drift apart.
 
 | | ingress | latency | the gate |
 |---|---|---|---|

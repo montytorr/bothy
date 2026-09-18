@@ -19,3 +19,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+THIRD-PARTY CODE
+
+bothy/vendor/a2a_reactor/ is vendored verbatim from the a2a-comms project
+(https://github.com/montytorr/a2a-comms), which is MIT licensed. It is included
+rather than depended upon because Bothy is installed at sites where a package
+index may not be reachable. It is not modified here; fixes belong upstream.
