@@ -496,7 +496,7 @@ make check          # quiet, non-zero on failure
 make test           # verbose
 ```
 
-**184 tests, standard library `unittest`, no dependency.** They assert
+**176 tests, standard library `unittest`, no dependency.** They assert
 *properties*, not implementation — and every one was first demonstrated by hand
 against the real thing (real Codex, real GitHub, a real systemd install) before
 being written down here.
