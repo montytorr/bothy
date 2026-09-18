@@ -161,6 +161,40 @@ Routes are declared in config; **secrets are named, never stored**:
 of racing. A route whose secret is unset is a **startup error**, not a warning —
 Bothy will not hold a door open it meant to lock.
 
+## Talking to it
+
+Slack, over **Socket Mode** — an *outbound* WebSocket. No public URL, no inbound
+port, no TLS certificate to own, no request signatures to verify. It works
+unchanged on a machine that accepts no connections at all, which is the whole
+deployment story.
+
+```json
+"slack_app_token_env": "SLACK_APP_TOKEN",
+"slack_bot_token_env": "SLACK_BOT_TOKEN",
+"slack_allow_from": ["U012ABCDEF"],
+"slack_profile": "selfcare"
+```
+
+**Deny by default, and it refuses to start without an allowlist.** An agent that
+runs commands on a client's machine should not take instructions from anyone who
+can find its channel, and "the bot is only in a private channel" is a
+configuration nobody audits.
+
+A Slack message becomes a wake on the same durable queue as a webhook, so it is
+admitted, budgeted and lane-serialised identically. Lanes are keyed on the
+**conversation** — channel plus thread — so a follow-up joins the run already
+working on it instead of starting a second agent on the same discussion.
+
+An envelope is acknowledged **only once it is durably stored**. Slack redelivers
+what it has not seen acknowledged, and that is a safety net worth keeping: an
+ack for something we then lost is exactly the bug the rule exists to prevent.
+
+The WebSocket client is ours — a few hundred lines of RFC 6455, verified against
+the RFC's own example frames, because a test built from the same
+misunderstanding as the code will agree with it happily. That keeps the
+zero-dependency promise, which is worth more at a client site than it costs
+here.
+
 ## Capability is per job, not per install
 
 A worker starts with nothing beyond Codex's built-ins. Everything else comes
@@ -274,6 +308,8 @@ so it is explicit in the code rather than implied.
 | `cronspec.py` | Five fields, in a named timezone, with cron's real OR rule. |
 | `schedule.py` | Jobs, the heartbeat, and the guards that stop it spamming. |
 | `capability.py` | Profiles, generated worker config, and the tools Bothy hosts. |
+| `ws.py` | RFC 6455 client. No dependency, no server role, no extensions. |
+| `slack.py` | Socket Mode in, Web API out, deny by default. |
 | `daemon.py` | Four loops: listen, drain, schedule, sweep. |
 
 `bothy/vendor/a2a_reactor/` is vendored verbatim from
@@ -298,7 +334,10 @@ fired on schedule, ran, worked through the checklist, hit a real sandbox
 limitation and reported it — rather than failing quietly, and rather than
 saying something when there was nothing to say.
 
-Not yet: inbound chat (P3), launchd and `tailscale serve` packaging (P4).
+It talks, too: Slack over Socket Mode, deny-by-default, with replies landing in
+the thread they came from.
+
+Not yet: Discord inbound, launchd and `tailscale serve` packaging (P4).
 
 ## Licence
 

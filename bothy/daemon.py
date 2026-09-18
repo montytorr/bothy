@@ -29,12 +29,13 @@ a dead man's switch has to be held by someone still alive.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from . import clock
 from .ids import wake_id as ids_wake_id
@@ -105,6 +106,7 @@ class Daemon:
         self.lease_path = config.state_dir / "drain.lock"
 
         self._server: WakeServer | None = None
+        self.slack: "SlackBridge | None" = None
         self._stopping = threading.Event()
         self._drain_wanted = threading.Event()
         self._threads: list[threading.Thread] = []
@@ -204,7 +206,9 @@ class Daemon:
                         processed_at=clock.iso(), run_id=result.run_id, outcome=result.status,
                         spoke=bool(said),
                     )
-                    if said and (event.get("payload") or {}).get("heartbeat"):
+                    if said and event.get("route") == "slack" and self.slack is not None:
+                        self.slack.reply(event, "\n".join(said))
+                    elif said and (event.get("payload") or {}).get("heartbeat"):
                         self.alerter.say(
                             f"**{self.config.site}** heartbeat — {subject}\n" + "\n".join(said)[:1500]
                         )
@@ -302,6 +306,36 @@ class Daemon:
 
     # ---- lifecycle ------------------------------------------------------
 
+    def _build_slack(self) -> "SlackBridge | None":
+        """Wire Slack if both tokens are present, and refuse a listening-but-deaf setup."""
+        app_env = self.config.slack_app_token_env
+        bot_env = self.config.slack_bot_token_env
+        if not (app_env and bot_env):
+            return None
+        app_token, bot_token = os.environ.get(app_env), os.environ.get(bot_env)
+        if not app_token or not bot_token:
+            raise RuntimeError(
+                f"Slack is configured but its tokens are unset (${app_env}, ${bot_env}). "
+                "Refusing to start half-connected."
+            )
+        if not self.config.slack_allow_from:
+            raise RuntimeError(
+                "Slack is configured with an empty slack_allow_from. An agent that runs commands "
+                "should not take instructions from anyone who can find its channel. "
+                "List the Slack user ids allowed to speak to it."
+            )
+        return SlackBridge(
+            app_token=app_token, bot_token=bot_token, store=self.store, audit=self.audit,
+            allow_from=self.config.slack_allow_from, profile=self.config.slack_profile,
+            ack_emoji=self.config.slack_ack_emoji,
+            on_stored=self._drain_wanted.set,
+            on_error=lambda message, fatal: self.alerter.incident(
+                job="slack", error=message, severity="critical" if fatal else "warning",
+                reaction="Check the app and bot tokens and the connections:write scope."
+                        if fatal else "Transient; it is reconnecting on its own.",
+            ),
+        )
+
     def start(self, *, reap: bool = False) -> None:
         """Acquire the state directory and begin. Raises rather than guessing."""
         self.config.ensure_dirs()
@@ -336,6 +370,16 @@ class Daemon:
                 self.audit.append(kind="worker", action="reaped", run_id=worker.run_id,
                                   data={"pgid": worker.pgid, "outcome": outcome})
 
+        self.slack = self._build_slack()
+        if self.slack is not None:
+            thread = threading.Thread(target=self.slack.listener.run_forever,
+                                      name="bothy-slack", daemon=True)
+            thread.start()
+            self._threads.append(thread)
+            self.audit.append(kind="slack", action="listening",
+                              data={"allow_from": len(self.slack.allow_from),
+                                    "profile": self.slack.profile})
+
         self._server = WakeServer(
             store=self.store, routes=self.routes,
             host="127.0.0.1", port=self.config.port,
@@ -366,6 +410,8 @@ class Daemon:
             return
         self._stopping.set()
         self._drain_wanted.set()
+        if self.slack is not None:
+            self.slack.listener.stop()
         if self._server is not None:
             self._server.shutdown()
         deadline = clock.monotonic() + grace_seconds
@@ -411,3 +457,96 @@ class Daemon:
         finally:
             self.stop(reason="signal")
         return 0
+
+
+# --------------------------------------------------------------------------
+# Slack, as a wake source
+
+
+class SlackBridge:
+    """Two-way Slack for the daemon, over Socket Mode.
+
+    Inbound envelopes become wakes on the same durable queue as everything
+    else, so a Slack message is admitted, budgeted and lane-serialised exactly
+    like a webhook. Replies go back to the thread the message came from.
+
+    WHO IS ALLOWED TO TALK TO IT IS A DENY-BY-DEFAULT LIST. An agent that will
+    run commands on a client's machine should not take instructions from anyone
+    who can find its channel, and "the bot is in a private channel" is a
+    configuration nobody audits. With no allowlist configured, nothing is
+    accepted and the daemon says so at startup rather than listening quietly.
+    """
+
+    def __init__(
+        self,
+        *,
+        app_token: str,
+        bot_token: str,
+        store: "WakeStore",
+        audit: AuditLog,
+        allow_from: list[str],
+        profile: str | None = None,
+        ack_emoji: str = "eyes",
+        on_stored: Callable[[], None] | None = None,
+        on_error: Callable[[str, bool], None] | None = None,
+    ) -> None:
+        from .slack import SlackClient, SocketModeListener, envelope_subject, envelope_text
+
+        self.store = store
+        self.audit = audit
+        self.allow_from = set(allow_from)
+        self.profile = profile
+        self.ack_emoji = ack_emoji
+        self.on_stored = on_stored or (lambda: None)
+        self.client = SlackClient(bot_token=bot_token)
+        self._subject_of = envelope_subject
+        self._text_of = envelope_text
+        self.listener = SocketModeListener(
+            app_token=app_token, on_envelope=self._store, on_error=on_error or (lambda m, f: None)
+        )
+
+    def _store(self, message: dict[str, Any]) -> bool:
+        """Durably record an envelope. Returning False leaves it unacknowledged."""
+        payload = message.get("payload") or {}
+        event = payload.get("event") or {}
+        if event.get("bot_id") or event.get("subtype") == "bot_message":
+            return True          # our own voice; stored nowhere, acked so Slack stops
+        speaker = str(event.get("user") or "")
+        text = self._text_of(message)
+        channel = str(event.get("channel") or "")
+
+        if speaker not in self.allow_from:
+            self.audit.append(kind="slack", action="ignored", status="refused",
+                              subject=channel, actor=speaker,
+                              data={"reason": "speaker is not on the allowlist"})
+            return True          # acked: it was delivered correctly, we simply decline
+        if not text.strip():
+            return True
+
+        wake = ids_wake_id()
+        self.store.append({
+            "id": wake,
+            "received_at": clock.iso(),
+            "route": "slack",
+            "subject": self._subject_of(message),
+            "delivery_key": f"slack:{message.get('envelope_id')}",
+            "payload": {"prompt": text, "slack": {"channel": channel,
+                                                  "thread_ts": event.get("thread_ts") or event.get("ts")}},
+            "profile": self.profile,
+            "processed": False,
+        })
+        self.audit.append(kind="slack", action="received", subject=self._subject_of(message),
+                          actor=speaker, data={"wake": wake, "channel": channel})
+        with contextlib.suppress(Exception):
+            self.client.react(channel, str(event.get("ts") or ""), self.ack_emoji)
+        self.on_stored()
+        return True
+
+    def reply(self, event: dict[str, Any], text: str) -> None:
+        """Answer in the thread the message came from."""
+        where = ((event.get("payload") or {}).get("slack")) or {}
+        channel = where.get("channel")
+        if not channel or not text.strip():
+            return
+        with contextlib.suppress(Exception):
+            self.client.post(channel, text, thread_ts=where.get("thread_ts"))

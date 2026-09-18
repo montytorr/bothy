@@ -82,6 +82,13 @@ class Config:
     # where a human finds out
     discord_webhook_url: str | None = None
     slack_webhook_url: str | None = None
+    # Two-way Slack, over Socket Mode: an OUTBOUND connection, so no public URL
+    # and no inbound port. Token names, never tokens.
+    slack_app_token_env: str | None = None     # xapp-..., scope connections:write
+    slack_bot_token_env: str | None = None     # xoxb-...
+    slack_allow_from: list[str] = dataclasses.field(default_factory=list)
+    slack_profile: str | None = None
+    slack_ack_emoji: str = "eyes"
 
     # ---- derived paths -------------------------------------------------
 
@@ -133,6 +140,9 @@ class Config:
             "budget": dataclasses.asdict(self.budget),
             "codex_credentials": "present" if (self.codex_credentials_dir / "auth.json").exists() else "MISSING",
             "codex_inherit_config": self.codex_inherit_config,
+            "slack_socket_mode": "configured" if (self.slack_app_token_env and self.slack_bot_token_env)
+                                 else "not configured",
+            "slack_allow_from": len(self.slack_allow_from),
             "profiles": sorted(self.profiles),
             "default_profile": self.default_profile,
             "routes": [r.get("path") for r in self.routes],

@@ -138,6 +138,9 @@ def cmd_status(args: argparse.Namespace, config: Config) -> int:
 
 def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
     """Check the things that would stop Bothy working, and fail if any do."""
+    import pathlib
+    import subprocess
+
     runner, admission, audit, registry = build(config)
     checks: list[dict[str, Any]] = []
 
@@ -154,7 +157,6 @@ def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
         check("audit chain intact", False, f"broken at record {exc.sequence}")
 
     try:
-        import subprocess
         version = subprocess.run([config.codex_binary, "--version"], capture_output=True, text=True, timeout=20)
         check("codex present", version.returncode == 0, version.stdout.strip() or version.stderr.strip())
     except Exception as exc:  # noqa: BLE001
@@ -166,6 +168,36 @@ def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
     survivors = registry.survivors()
     check("no orphaned workers", not survivors,
           f"{len(survivors)} process group(s) left by a previous instance")
+
+    # The sandbox is the only real boundary against an adversarial model, so a
+    # sandbox that cannot start is a finding, not a footnote. This was found the
+    # hard way: every model-only test passed and the first run that needed a
+    # shell — a heartbeat working through its checklist — discovered it.
+    import shutil as _shutil
+    bwrap = _shutil.which("bwrap")
+    bundled = list(pathlib.Path("/usr/lib/node_modules/@openai").glob("**/codex-resources/bwrap")) \
+        if pathlib.Path("/usr/lib/node_modules/@openai").exists() else []
+    if config.sandbox != "dangerFullAccess":
+        probe = subprocess.run([bwrap or (str(bundled[0]) if bundled else "bwrap"),
+                                "--ro-bind", "/", "/", "--unshare-net", "--", "/bin/true"],
+                               capture_output=True, text=True, timeout=20) if (bwrap or bundled) else None
+        if probe is None:
+            check("sandbox can start", False, "no bubblewrap found on PATH or bundled", fatal=False)
+        elif probe.returncode == 0:
+            check("sandbox can start", True, bwrap or str(bundled[0]))
+        else:
+            check("sandbox can start", False,
+                  (probe.stderr or probe.stdout).strip().splitlines()[-1][:160] +
+                  "  — runs needing a shell will fail", fatal=False)
+
+    if config.slack_app_token_env or config.slack_bot_token_env:
+        import os as _os
+        tokens_present = bool(_os.environ.get(config.slack_app_token_env or "")) and \
+                         bool(_os.environ.get(config.slack_bot_token_env or ""))
+        check("slack tokens present", tokens_present,
+              f"${config.slack_app_token_env}, ${config.slack_bot_token_env}")
+        check("slack allowlist set", bool(config.slack_allow_from),
+              f"{len(config.slack_allow_from)} speaker(s) permitted")
 
     check("alert route configured",
           bool(config.discord_webhook_url or config.slack_webhook_url),
