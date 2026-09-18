@@ -465,6 +465,30 @@ so it is explicit in the code rather than implied.
 semantic dedupe, turn budgets, and a process-wide lease. Do not edit it; fixes
 go upstream.
 
+## Tests
+
+```bash
+make check          # quiet, non-zero on failure
+make test           # verbose
+```
+
+**135 tests, standard library `unittest`, no dependency.** They assert
+*properties*, not implementation — and every one was first demonstrated by hand
+against the real thing (real Codex, real GitHub, a real systemd install) before
+being written down here.
+
+The WebSocket tests are checked against **RFC 6455's own example frames**, because
+a test built from the same misunderstanding as the code will agree with it
+happily. The suite also checks on itself: it asserts a minimum test count and
+that every module imports, since *"a test suite that has never executed is not
+coverage"* — a rule learned from a system whose reactor tests had never run
+because the launcher was a shim whose module was never installed.
+
+Several tests exist specifically to pin a bug that was found the hard way, and
+say so in their docstring — the zombie mistaken for a live process, the launchd
+translation that defeated systemd's mechanism, the pool recovery that made
+"degraded" indistinguishable from "hung".
+
 ## Status
 
 **P0 through P4**, proven end to end against a real Codex app-server and a real
