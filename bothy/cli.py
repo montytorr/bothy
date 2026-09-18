@@ -327,6 +327,42 @@ def cmd_checklist(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
+def cmd_poll(args: argparse.Namespace, config: Config) -> int:
+    """Poll a source once, by hand, without enqueuing anything.
+
+    The thing an operator wants when a source has gone quiet: does it answer,
+    does it authenticate, what shape does it return, and how many of those items
+    would actually have been treated as new.
+    """
+    from .poll import PollState, Poller, Source
+
+    config.ensure_dirs()
+    sources = {entry["name"]: Source(**entry) for entry in config.poll_sources}
+    if not sources:
+        print("no poll sources configured")
+        return 0
+    chosen = [sources[args.name]] if args.name else list(sources.values())
+    if args.name and args.name not in sources:
+        print(f"bothy: no source called {args.name!r}; known: {', '.join(sorted(sources))}", flush=True)
+        return EX_CONFIG
+
+    poller = Poller(PollState(config.state_dir / "poll.json"))
+    failed = False
+    for source in chosen:
+        result, wakes = poller.poll(source)
+        failed = failed or result.status == "failed"
+        if args.json:
+            print(json.dumps({"result": result.as_dict(),
+                              "subjects": [w["subject"] for w in wakes]}, indent=2))
+        else:
+            print(f"  {source.name:16} {result.status:10} http={result.http_status or '-':4} "
+                  f"fetched={result.fetched} new={result.new} dup={result.duplicates}"
+                  f"{('  ' + result.detail) if result.detail else ''}")
+            for wake in wakes[:5]:
+                print(f"      would wake: {wake['subject']}")
+    return 1 if failed else 0
+
+
 def cmd_funnel(args: argparse.Namespace, config: Config) -> int:
     """Print, or run, the exact tailscale commands for this configuration.
 
@@ -600,6 +636,11 @@ def main(argv: list[str] | None = None) -> int:
     uninstall_cmd.add_argument("--user", default=None)
     uninstall_cmd.add_argument("--purge", action="store_true", help="also remove state and the secrets file")
     uninstall_cmd.set_defaults(func=cmd_uninstall)
+
+    poll = subparsers.add_parser("poll", help="poll a source once, by hand")
+    poll.add_argument("name", nargs="?", default=None)
+    poll.add_argument("--json", action="store_true")
+    poll.set_defaults(func=cmd_poll)
 
     funnel = subparsers.add_parser("funnel", help="the tailscale commands this config implies")
     funnel.add_argument("--apply", action="store_true", help="run them instead of printing them")

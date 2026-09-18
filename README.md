@@ -263,8 +263,48 @@ is what signatures are for. Funnel also gives you **no DoS protection you
 control** — every request on a mounted path reaches your process — which is why
 the rate limiter runs before signature verification.
 
-If sub-minute latency is acceptable, **polling avoids all of this** and keeps the
-box sealed. Worth weighing first.
+## Or keep the box sealed entirely
+
+Polling reaches *out* on a schedule, so nothing has to reach *in*. No public
+listener, nothing in certificate transparency logs as a live endpoint, no
+unauthenticated path to defend, no signature to get wrong, no DoS vector at all.
+It also survives the machine being off: events queue at the provider and you
+catch up, where a missed webhook depends on the sender's retry policy.
+
+```json
+"poll_sources": [{
+  "name": "commits", "url": "https://api.github.com/repos/you/repo/commits",
+  "interval_seconds": 120, "id_path": "sha",
+  "subject_from": "sha", "subject_prefix": "commit-",
+  "header_env": { "Authorization": "GH_POLL_TOKEN" }
+}]
+```
+
+```bash
+bin/bothy poll commits     # by hand: does it answer, authenticate, and what is new
+```
+
+Proven against the real GitHub API:
+
+```
+first poll    http=200  fetched=9  new=9  dup=0
+second poll   http=304  fetched=0  new=0  dup=0     ← costs no quota
+after restart           fetched=9  new=0  dup=9     ← seen ids survived
+```
+
+**Conditional requests are the whole economy.** With `ETag` and
+`Last-Modified`, an unchanged poll costs a 304 and nothing else — a poller that
+ignores them is why people believe polling is expensive.
+
+**Polling is at-least-once too, and more obviously so.** A webhook is
+redelivered when an ack is missed; a poller re-reads an overlapping window every
+time, so duplicates are the *normal* case. Dedupe is on the item's own id and
+persisted, because replaying work in an agent harness means spending money twice.
+
+A failing source backs off on its own and never stalls the others. A missing
+credential is reported as a configuration problem — visible, not retried forever.
+
+The cost is honest: latency in seconds to minutes, API quota, and state to keep.
 
 ## Talking to it
 

@@ -47,6 +47,7 @@ from .pool import Admission
 from .proc import ProcessRegistry
 from .retention import RetentionPolicy, sweep
 from .runner import Runner
+from .poll import PollState, Poller, Source
 from .schedule import Job, Schedule, strip_no_reply
 from .vendor.a2a_reactor.lease import LeaseBusy, reactor_lease
 from .ratelimit import RateLimiter
@@ -100,6 +101,9 @@ class Daemon:
 
         self.store = WakeStore(config.wake_dir)
         self.schedule = Schedule(config.state_dir / "jobs.json")
+        self.poller = Poller(PollState(config.state_dir / "poll.json"))
+        self.sources = [Source(**entry) for entry in config.poll_sources]
+        self._next_poll: dict[str, float] = {}
         self.checklist_path = config.state_dir / "checklist.md"
         self.lock = InstanceLock(config.state_dir / "bothy.lock")
         self.ledger = LifecycleLedger(config.state_dir / "lifecycle.json")
@@ -270,6 +274,57 @@ class Daemon:
                                       reaction="bothy schedule list; a job definition is probably bad")
             self._stopping.wait(timeout=20.0)
 
+    def poll_once(self) -> list[Any]:
+        """Poll every source whose interval has elapsed. Returns the outcomes.
+
+        Each source keeps its own schedule and its own failure count, so a slow
+        or broken one never delays the others — the loop visits them all and
+        skips the ones that are not due yet.
+        """
+        outcomes = []
+        for source in self.sources:
+            due_at = self._next_poll.get(source.name, 0.0)
+            if clock.monotonic() < due_at:
+                continue
+            result, wakes = self.poller.poll(source)
+            outcomes.append(result)
+            # A failing source backs off rather than hammering, but is still
+            # visited eventually — no source is ever abandoned silently.
+            multiplier = 4 if result.status == "failed" else 1
+            self._next_poll[source.name] = clock.monotonic() + source.interval_seconds * multiplier
+            for wake in wakes:
+                self.store.append(wake)
+            if wakes:
+                self._drain_wanted.set()
+            if result.status in {"failed", "skipped"} or wakes:
+                self.audit.append(
+                    kind="poll", action=result.status,
+                    status="failed" if result.status == "failed" else "ok",
+                    subject=f"poll:{source.name}", data=result.as_dict(),
+                )
+            if result.status == "failed":
+                self.alerter.incident(
+                    job=f"poll:{source.name}", error=result.detail, severity="warning",
+                    reaction=f"bothy poll {source.name} to reproduce it by hand",
+                )
+            elif result.status == "skipped":
+                self.alerter.incident(
+                    job=f"poll:{source.name}", error=result.detail, severity="critical",
+                    reaction="A missing credential will not fix itself; set the environment variable.",
+                )
+            else:
+                self.alerter.resolved(job=f"poll:{source.name}", error=result.detail)
+        return outcomes
+
+    def _poll_loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                self.poll_once()
+            except Exception as exc:  # noqa: BLE001 - one bad pass must not end polling
+                self.audit.append(kind="poll", action="failed", status="failed",
+                                  data={"error": f"{type(exc).__name__}: {exc}"})
+            self._stopping.wait(timeout=15.0)
+
     # ---- loops ----------------------------------------------------------
 
     def _drain_loop(self) -> None:
@@ -435,7 +490,8 @@ class Daemon:
 
         for target, name in ((self._drain_loop, "bothy-drain"),
                              (self._janitor_loop, "bothy-janitor"),
-                             (self._schedule_loop, "bothy-schedule")):
+                             (self._schedule_loop, "bothy-schedule"),
+                             (self._poll_loop, "bothy-poll")):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self._threads.append(thread)
@@ -445,6 +501,7 @@ class Daemon:
                           data={"pid": os.getpid(), "listen": f"{host}:{port}",
                                 "routes": [route.path for route in self.routes],
                                 "public_routes": [r.path for r in self.routes if r.public],
+                                "poll_sources": [s.name for s in self.sources],
                                 "pool": self.config.pool.max_workers,
                                 "budget_mode": self.config.budget.mode})
         self.beat(state="running")

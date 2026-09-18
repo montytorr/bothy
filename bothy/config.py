@@ -66,6 +66,10 @@ class Config:
     # permitted to use. tailscaled binds the privileged one; Bothy never does.
     public_port: int | None = None
     funnel_port: int = 443
+    # Reaching OUT instead of being reached. A deployment that polls needs no
+    # public ingress at all — no listener in certificate transparency logs, no
+    # unauthenticated path to defend, nothing to flood.
+    poll_sources: list[dict[str, Any]] = dataclasses.field(default_factory=list)
     # Tailnet identity as a second gate in front of the listener. Off unless
     # switched on, because a box without tailscaled would otherwise refuse
     # everything and the failure would look like a Bothy bug.
@@ -160,6 +164,7 @@ class Config:
             "codex_inherit_config": self.codex_inherit_config,
             "require_tailnet": self.require_tailnet,
             "public_port": self.public_port,
+            "poll_sources": [src.get("name") for src in self.poll_sources],
             "funnel_port": self.funnel_port,
             "slack_socket_mode": "configured" if (self.slack_app_token_env and self.slack_bot_token_env)
                                  else "not configured",
