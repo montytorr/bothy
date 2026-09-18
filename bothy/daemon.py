@@ -187,6 +187,7 @@ class Daemon:
                         subject=subject,
                         prompt=self._prompt_for(event),
                         wake_id=event["id"],
+                        profile=event.get("profile"),
                     )
                     if result.status == "refused" and (result.refusal or {}).get("gate") in {
                         "lane_busy", "pool_full", "pool_probing"
@@ -238,6 +239,7 @@ class Daemon:
             "subject": job.lane(),
             "delivery_key": f"job:{job.id}:{wake_id}",
             "payload": {"prompt": prompt, "job": job.id, "heartbeat": job.heartbeat},
+            "profile": job.profile,
             "processed": False,
         }
         self.store.append(event)

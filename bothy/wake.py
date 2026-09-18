@@ -147,6 +147,7 @@ class Route:
     secret: str
     subject_from: str | None = None
     subject_prefix: str = ""
+    profile: str | None = None
     signature_header: str = "X-Webhook-Signature"
     timestamp_header: str = "X-Webhook-Timestamp"
     delivery_headers: tuple[str, ...] = (
@@ -321,6 +322,7 @@ class _Handler(BaseHTTPRequestHandler):
             "subject": route.subject(payload, wake_id),
             "delivery_key": delivery_key,
             "payload": payload,
+            "profile": route.profile,
             "processed": False,
         }
 

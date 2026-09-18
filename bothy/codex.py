@@ -42,6 +42,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from . import clock, proc
+from .capability import ToolRegistry
 
 __all__ = [
     "CodexError",
@@ -129,6 +130,7 @@ class CodexClient:
         env: dict[str, str] | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
         approval: Callable[[str, dict[str, Any]], ApprovalDecision] = default_approval,
+        tools: "ToolRegistry | None" = None,
     ) -> None:
         self.run_id = run_id
         self.codex_home = Path(codex_home)
@@ -138,6 +140,7 @@ class CodexClient:
         self._env = env
         self._on_event = on_event or (lambda method, params: None)
         self._approval = approval
+        self._tools = tools
 
         self._popen: subprocess.Popen | None = None
         self._next_id = 0
@@ -265,7 +268,12 @@ class CodexClient:
             self._on_event(method, params)
         except Exception:  # noqa: BLE001
             pass
-        if "requestApproval" in method or method.endswith("/requestUserInput"):
+        if method == "item/tool/call":
+            # A tool Bothy declared on thread/start. The handler runs inside this
+            # process, which is the point: it can touch the ledger, the checklist
+            # and the audit log directly, with no subprocess, port or credential.
+            self._handle_tool_call(message, params)
+        elif "requestApproval" in method or method.endswith("/requestUserInput"):
             verdict = self._approval(method, params)
             self._send({"id": message["id"], "result": {"decision": verdict.decision}})
         else:
@@ -276,6 +284,24 @@ class CodexClient:
                     "error": {"code": -32601, "message": f"{self.client_name} does not implement {method}"},
                 }
             )
+
+    def _handle_tool_call(self, message: dict[str, Any], params: dict[str, Any]) -> None:
+        """Answer a dynamic tool call. Never raises, always replies.
+
+        A tool that fails answers ``success: false`` with the reason as text, so
+        the model can read what went wrong and carry on. Leaving the request
+        unanswered would hang the turn until its wall clock, which turns a small
+        tool bug into a lost run.
+        """
+        name = str(params.get("tool") or "")
+        if self._tools is None:
+            ok, text = False, f"{name} is not available to this run"
+        else:
+            ok, text = self._tools.call(name, params.get("arguments"))
+        self._send({
+            "id": message["id"],
+            "result": {"success": ok, "contentItems": [{"type": "inputText", "text": text}]},
+        })
 
     def _send(self, payload: dict[str, Any]) -> None:
         if self._popen is None or self._popen.stdin is None:
@@ -353,6 +379,9 @@ class CodexClient:
         writable_roots: list[str] | None = None,
         ephemeral: bool = True,
         skip_git_repo_check: bool = True,
+        dynamic_tools: list[dict[str, Any]] | None = None,
+        config: dict[str, Any] | None = None,
+        developer_instructions: str | None = None,
         timeout: float = 60.0,
     ) -> str:
         """Open a thread and return its id.
@@ -369,17 +398,22 @@ class CodexClient:
         elif sandbox == "workspaceWrite":
             policy["networkAccess"] = network_access
             policy["writableRoots"] = writable_roots or [str(cwd)]
-        result = self.request(
-            "thread/start",
-            {
-                "cwd": str(cwd),
-                "sandboxPolicy": policy,
-                "approvalPolicy": approval_policy,
-                "skipGitRepoCheck": skip_git_repo_check,
-                "ephemeral": ephemeral,
-            },
-            timeout=timeout,
-        )
+        params: dict[str, Any] = {
+            "cwd": str(cwd),
+            "sandboxPolicy": policy,
+            "approvalPolicy": approval_policy,
+            "skipGitRepoCheck": skip_git_repo_check,
+            "ephemeral": ephemeral,
+        }
+        # Declared here rather than written to a file: capability becomes a
+        # property of the JOB, not of the installation.
+        if dynamic_tools:
+            params["dynamicTools"] = dynamic_tools
+        if config:
+            params["config"] = config
+        if developer_instructions:
+            params["developerInstructions"] = developer_instructions
+        result = self.request("thread/start", params, timeout=timeout)
         thread = result.get("thread") or {}
         thread_id = thread.get("id")
         if not thread_id:

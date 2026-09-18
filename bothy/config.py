@@ -63,6 +63,11 @@ class Config:
     # hooks). Off by default: a worker should be shaped by Bothy, not by whatever
     # the host account happens to have configured.
     codex_inherit_config: bool = False
+    # Named capability bundles. A job names one; a job that names none gets
+    # nothing beyond Codex's built-ins, which is the safe default and the
+    # reason capability is opt-in rather than opt-out.
+    profiles: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
+    default_profile: str | None = None
     workspace: Path = dataclasses.field(default_factory=Path.cwd)
     sandbox: str = "readOnly"
     approval_policy: str = "never"
@@ -128,6 +133,8 @@ class Config:
             "budget": dataclasses.asdict(self.budget),
             "codex_credentials": "present" if (self.codex_credentials_dir / "auth.json").exists() else "MISSING",
             "codex_inherit_config": self.codex_inherit_config,
+            "profiles": sorted(self.profiles),
+            "default_profile": self.default_profile,
             "routes": [r.get("path") for r in self.routes],
             "cairn_agent": self.cairn_agent,
             "cairn_project": self.cairn_project,

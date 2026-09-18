@@ -161,6 +161,52 @@ Routes are declared in config; **secrets are named, never stored**:
 of racing. A route whose secret is unset is a **startup error**, not a warning —
 Bothy will not hold a door open it meant to lock.
 
+## Capability is per job, not per install
+
+A worker starts with nothing beyond Codex's built-ins. Everything else comes
+from a named **profile** attached to the job:
+
+```json
+"profiles": {
+  "mail": {
+    "mcp_servers": { "gmail": { "command": "mcp-gmail", "args": ["--readonly"],
+                                "env_vars": ["GMAIL_TOKEN"] } },
+    "tools": ["bothy_note"], "sandbox": "readOnly"
+  },
+  "selfcare": {
+    "tools": ["bothy_checklist_read", "bothy_checklist_update", "bothy_status"]
+  }
+}
+```
+
+A mail job gets mail; a code-review job does not. It is nearly free, because
+every run already has its own `CODEX_HOME` — so scoping capability to a run
+costs a generated file rather than an architecture. The config is **generated,
+never inherited**: a worker shaped by the host's own `config.toml` behaves
+differently on a client's machine than it did on yours, and that difference is
+found in the field rather than in a test. **No secret is ever written to it** —
+an MCP server names the environment variable holding its token.
+
+Three kinds of capability, and they are genuinely different:
+
+| | what it is |
+|---|---|
+| **MCP servers** | an external process or endpoint — mail, a browser, anything |
+| **skill roots** | prose the model reads. Behaviour, not mechanism |
+| **dynamic tools** | a tool **Bothy hosts itself**, declared on `thread/start` and answered over the same connection — no subprocess, no port, no credential |
+
+The third is how the agent maintains its own standing checklist, which the
+heartbeat design always assumed and nothing previously implemented. Verified:
+given `bothy_checklist_update`, a run read its checklist, added an item about
+verifying the audit chain, and the file on disk changed.
+
+**This is also the prompt-injection surface.** Bothy's wake prompt already tells
+the model a payload is untrusted, because a signature authenticates the sender
+and never the content. The moment a worker can also reach a mailbox, that
+sentence stops being advice. Profiles keep the chain short: the job that reads
+webhooks is not the job that can send mail, and a job that names no profile gets
+nothing at all.
+
 Real output:
 
 ```
@@ -227,6 +273,7 @@ so it is explicit in the code rather than implied.
 | `retention.py` | The janitor. Written the same day as the writers. |
 | `cronspec.py` | Five fields, in a named timezone, with cron's real OR rule. |
 | `schedule.py` | Jobs, the heartbeat, and the guards that stop it spamming. |
+| `capability.py` | Profiles, generated worker config, and the tools Bothy hosts. |
 | `daemon.py` | Four loops: listen, drain, schedule, sweep. |
 
 `bothy/vendor/a2a_reactor/` is vendored verbatim from

@@ -104,6 +104,7 @@ class Job:
     active_hours: list[int] | None = None      # [start, end) in the job's tz
     min_spacing_seconds: float = 60.0
     heartbeat: bool = False                    # append the standing checklist
+    profile: str | None = None                 # capability bundle; None = built-ins only
     last_fired_at: str | None = None
     next_due_at: str | None = None
     misfires: int = 0

@@ -20,6 +20,7 @@ from . import __version__, clock, codex
 from .alert import Alerter, CompositeSink, DiscordWebhookSink, SlackWebhookSink, StderrSink
 from .audit import AuditLog, ChainBreak
 from .budget import BudgetLedger
+from .capability import Profile
 from .config import Config, load
 from .daemon import Daemon
 from .lifecycle import EX_CONFIG
@@ -77,6 +78,7 @@ def build_routes(config: Config) -> list[Route]:
             secret=secret,
             subject_from=entry.get("subject_from"),
             subject_prefix=entry.get("subject_prefix", ""),
+            profile=entry.get("profile"),
             signature_header=entry.get("signature_header", "X-Webhook-Signature"),
             timestamp_header=entry.get("timestamp_header", "X-Webhook-Timestamp"),
         ))
@@ -190,7 +192,7 @@ def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
 def cmd_run(args: argparse.Namespace, config: Config) -> int:
     runner, _, _, _ = build(config)
     result = runner.run(subject=args.subject, prompt=args.prompt, cairn_ref=args.ref,
-                        wall_clock_seconds=args.wall_clock)
+                        wall_clock_seconds=args.wall_clock, profile=args.profile)
     if args.json:
         print(json.dumps(result.as_dict(), indent=2))
     else:
@@ -241,6 +243,8 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
             flags = []
             if job.heartbeat:
                 flags.append("heartbeat")
+            if job.profile:
+                flags.append(job.profile)
             if not job.enabled:
                 flags.append("disabled")
             if job.misfires:
@@ -259,7 +263,7 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
     try:
         job = schedule.put(Job(
             id=args.id, kind=args.kind, spec=args.spec, prompt=args.prompt,
-            subject=args.subject, tz=args.tz, heartbeat=args.heartbeat,
+            subject=args.subject, tz=args.tz, heartbeat=args.heartbeat, profile=args.profile,
             min_spacing_seconds=args.min_spacing,
             active_hours=[args.active_from, args.active_to] if args.active_from is not None else None,
         ))
@@ -285,6 +289,24 @@ def cmd_checklist(args: argparse.Namespace, config: Config) -> int:
         print(f"no checklist yet — write one with: bothy checklist --set - < notes.md\n({path})")
         return 0
     print(path.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def cmd_profiles(args: argparse.Namespace, config: Config) -> int:
+    """Show what each capability profile would give a worker."""
+    if args.json:
+        print(json.dumps(config.profiles, indent=2))
+        return 0
+    if not config.profiles:
+        print("no profiles configured — every run gets Codex built-ins only")
+        return 0
+    for name in sorted(config.profiles):
+        profile = Profile.from_dict(name, config.profiles[name])
+        marker = "  (default)" if name == config.default_profile else ""
+        print(f"  {name}{marker}\n      {profile.summary()}")
+        for server, table in sorted(profile.mcp_servers.items()):
+            where = table.get("command") or table.get("url") or "?"
+            print(f"      mcp {server}: {where}")
     return 0
 
 
@@ -340,6 +362,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--subject", required=True, help="what this is about; one run per subject at a time")
     run.add_argument("--ref", default=None, help="Cairn task reference to claim and annotate")
     run.add_argument("--wall-clock", type=float, default=None)
+    run.add_argument("--profile", default=None, help="capability profile; omit for Codex built-ins only")
     run.add_argument("--json", action="store_true")
     run.set_defaults(func=cmd_run)
 
@@ -348,6 +371,10 @@ def main(argv: list[str] | None = None) -> int:
     audit.add_argument("--verify", action="store_true", help="check the hash chain")
     audit.add_argument("--json", action="store_true")
     audit.set_defaults(func=cmd_audit)
+
+    profiles = subparsers.add_parser("profiles", help="what each capability profile grants")
+    profiles.add_argument("--json", action="store_true")
+    profiles.set_defaults(func=cmd_profiles)
 
     reap = subparsers.add_parser("reap", help="kill workers a previous instance left behind")
     reap.set_defaults(func=cmd_reap)
@@ -361,6 +388,7 @@ def main(argv: list[str] | None = None) -> int:
     schedule.add_argument("--prompt", default="Anything need attention?")
     schedule.add_argument("--subject", default=None, help="lane to occupy; defaults to job:<id>")
     schedule.add_argument("--tz", default="UTC")
+    schedule.add_argument("--profile", default=None, help="capability profile for this job")
     schedule.add_argument("--heartbeat", action="store_true",
                           help="carry the standing checklist and honour NO_REPLY")
     schedule.add_argument("--min-spacing", type=float, default=60.0)

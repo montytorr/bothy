@@ -35,6 +35,7 @@ from typing import Any
 
 from . import clock, codex, ids
 from .alert import Alerter
+from .capability import Profile, ToolRegistry, builtin_tools, render_config_toml
 from .audit import AuditError, AuditLog
 from .budget import PRICING, Usage
 from .config import Config
@@ -91,6 +92,7 @@ class Runner:
         self.alerter = alerter
         self._last_used_percent: float | None = None
         self._last_resets_at: str | None = None
+        self.checklist_path = config.state_dir / "checklist.md"
 
     # ---- budget position -----------------------------------------------
 
@@ -140,6 +142,39 @@ class Runner:
                     reaction="Bothy cannot record what it is doing; investigate the disk before trusting the log.",
                 )
 
+    def profile(self, name: str | None) -> Profile | None:
+        """Resolve a named capability bundle, or None for built-ins only."""
+        chosen = name or self.config.default_profile
+        if not chosen:
+            return None
+        raw = self.config.profiles.get(chosen)
+        if raw is None:
+            # Named but absent is a configuration error worth surfacing, not a
+            # silent downgrade to full privilege or to none.
+            raise KeyError(f"no capability profile called {chosen!r}")
+        return Profile.from_dict(chosen, raw)
+
+    def _registry(self, profile: Profile | None) -> ToolRegistry:
+        """The dynamic tools this run may call, hosted inside Bothy."""
+        tracker = self.tracker
+
+        def note(ref: str, text: str) -> bool:
+            if tracker is None or not ref:
+                return False
+            try:
+                return tracker.annotate(ref, text)
+            except CairnUnavailable:
+                return False
+
+        everything = builtin_tools(
+            checklist_path=self.checklist_path,
+            note=note if tracker is not None else None,
+            status=lambda: self.admission.snapshot(),
+        )
+        if profile is None or not profile.tools:
+            return ToolRegistry()
+        return everything.select(profile.tools)
+
     def _seed_home(self, home: Path) -> None:
         """Give an isolated worker home the credentials it needs.
 
@@ -162,6 +197,19 @@ class Runner:
             if candidate.exists():
                 shutil.copy2(candidate, home / name)
 
+    def _write_worker_config(self, home: Path, profile: Profile | None) -> None:
+        """Generate the worker's config.toml from the profile.
+
+        Generated, never inherited. A worker shaped by the host's own config
+        behaves differently on a client's machine than it did on ours, and that
+        difference is discovered in the field rather than in a test.
+        """
+        if self.config.codex_inherit_config:
+            return
+        (home / "config.toml").write_text(
+            render_config_toml(profile, extra={"projects": {}}), encoding="utf-8"
+        )
+
     # ---- the run --------------------------------------------------------
 
     def run(
@@ -172,6 +220,7 @@ class Runner:
         cairn_ref: str | None = None,
         wall_clock_seconds: float | None = None,
         wake_id: str | None = None,
+        profile: str | None = None,
     ) -> RunResult:
         run_id = ids.run_id()
         started = clock.iso()
@@ -226,13 +275,26 @@ class Runner:
                 self._record(kind="task", action="claim_failed", status="failed",
                              run_id=run_id, subject=cairn_ref, data={"error": str(exc)})
 
+        try:
+            active = self.profile(profile)
+        except KeyError as exc:
+            result.status = "refused"
+            result.refusal = {"gate": "profile", "reason": str(exc)}
+            self._record(kind="run", action="refused", status="refused", run_id=run_id,
+                         subject=subject, data=result.refusal)
+            self.admission.release(run_id, ok=False, actual=0.0)
+            return result
+
+        registry = self._registry(active)
         home = self.config.homes_dir / run_id
         self._seed_home(home)
+        self._write_worker_config(home, active)
         client = codex.CodexClient(
             run_id=run_id,
             codex_home=home,
             binary=self.config.codex_binary,
             on_event=lambda method, params: None,
+            tools=registry,
         )
         spent = 0.0
         pricing = PRICING.get(self.config.budget.model_pricing, PRICING["default"])
@@ -248,13 +310,29 @@ class Runner:
             client.start()
             self.registry.register(run_id, client.popen, ["codex", "app-server"])
             client.handshake()
+            sandbox = (active.sandbox if active and active.sandbox else self.config.sandbox)
             thread_id = client.start_thread(
                 cwd=self.config.workspace,
-                sandbox=self.config.sandbox,
-                approval_policy=self.config.approval_policy,
+                sandbox=sandbox,
+                approval_policy=(active.approval_policy if active and active.approval_policy
+                                 else self.config.approval_policy),
+                dynamic_tools=registry.specs() or None,
+                developer_instructions=(active.developer_instructions if active else None),
             )
+            if active and active.skill_roots:
+                # Skills are prose the model reads, pointed at per run rather
+                # than installed globally, so a profile's guidance travels with
+                # the job instead of leaking into every other one.
+                try:
+                    client.request("skills/extraRoots/set", {"extraRoots": active.skill_roots})
+                except codex.CodexError as exc:
+                    self._record(kind="run", action="skills_unavailable", status="failed",
+                                 run_id=run_id, subject=subject, data={"error": str(exc)})
             self._record(kind="run", action="started", run_id=run_id, subject=subject,
-                         data={"thread": thread_id, "pgid": client.pgid, "sandbox": self.config.sandbox})
+                         data={"thread": thread_id, "pgid": client.pgid, "sandbox": sandbox,
+                               "profile": active.name if active else None,
+                               "tools": registry.names(),
+                               "mcp": sorted(active.mcp_servers) if active else []})
 
             outcome = client.run_turn(
                 thread_id=thread_id,
