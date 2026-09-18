@@ -49,6 +49,7 @@ from .retention import RetentionPolicy, sweep
 from .runner import Runner
 from .schedule import Job, Schedule, strip_no_reply
 from .vendor.a2a_reactor.lease import LeaseBusy, reactor_lease
+from .ratelimit import RateLimiter
 from .wake import Route, WakeServer, WakeStore
 
 __all__ = ["Daemon", "DEFAULT_PROMPT_TEMPLATE"]
@@ -387,6 +388,7 @@ class Daemon:
             require_tailnet=self.config.require_tailnet,
             tailnet_allow_logins=self.config.tailnet_allow_logins,
             tailnet_allow_nodes=self.config.tailnet_allow_nodes,
+            limiter=RateLimiter(),
         )
         self._server.serve_forever_in_background()
 
@@ -401,6 +403,7 @@ class Daemon:
         self.audit.append(kind="daemon", action="started",
                           data={"pid": os.getpid(), "listen": f"{host}:{port}",
                                 "routes": [route.path for route in self.routes],
+                                "public_routes": [r.path for r in self.routes if r.public],
                                 "pool": self.config.pool.max_workers,
                                 "budget_mode": self.config.budget.mode})
         self.beat(state="running")

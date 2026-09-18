@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import clock, ids, tailnet
+from .ratelimit import RateLimiter
 from .vendor.a2a_reactor.queue import append_event, read_queue, write_queue
 
 __all__ = ["Route", "WakeStore", "WakeServer", "verify_signature", "MAX_BODY_BYTES"]
@@ -148,6 +149,12 @@ class Route:
     subject_from: str | None = None
     subject_prefix: str = ""
     profile: str | None = None
+    # Tailnet-only unless a route says otherwise. Exposing an endpoint to the
+    # internet is then a deliberate, visible act in the config rather than a
+    # global switch someone flips once for one route and forgets. A public
+    # route's HMAC signature is its ONLY gate, which is what signatures are for
+    # — but it should be obvious in the file which routes are in that position.
+    public: bool = False
     signature_header: str = "X-Webhook-Signature"
     timestamp_header: str = "X-Webhook-Timestamp"
     delivery_headers: tuple[str, ...] = (
@@ -248,8 +255,9 @@ class _Handler(BaseHTTPRequestHandler):
     require_tailnet: bool = False
     tailnet_allow_logins: tuple[str, ...] = ()
     tailnet_allow_nodes: tuple[str, ...] = ()
+    limiter: "RateLimiter | None" = None
 
-    def _peer(self) -> "tailnet.Peer | None":
+    def _peer(self, route: "Route | None") -> "tailnet.Peer | None":
         """Identify the tailnet peer behind a forwarded request, or refuse.
 
         Bothy listens on loopback and is reached through ``tailscale serve``, so
@@ -264,7 +272,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         Any of them failing is a refusal. A verifier that fails open is not one.
         """
-        if not self.require_tailnet:
+        # A route marked public skips identity entirely: the caller is a
+        # third party with no tailnet account, and demanding one would refuse
+        # the very traffic the route exists for.
+        if not self.require_tailnet or (route is not None and route.public):
             return None
         hop = self.client_address[0]
         if hop not in {"127.0.0.1", "::1"}:
@@ -296,8 +307,28 @@ class _Handler(BaseHTTPRequestHandler):
         self._reply(HTTPStatus.OK, {"ok": True, "service": "bothy", "at": clock.iso()})
 
     def do_POST(self) -> None:  # noqa: N802
+        route_path = self.path.split("?", 1)[0]
+        caller = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip() \
+            or self.client_address[0]
+
+        # The cheap check comes first, deliberately. A limiter that runs after
+        # signature verification is an amplifier, not a limiter: every junk
+        # request would still cost an HMAC before being turned away.
+        if self.limiter is not None:
+            allowed, retry_after, which = self.limiter.check(route_path, caller)
+            if not allowed:
+                self.send_response(HTTPStatus.TOO_MANY_REQUESTS)
+                self.send_header("Retry-After", str(max(1, int(retry_after) + 1)))
+                self.send_header("Content-Type", "application/json")
+                body = json.dumps({"ok": False, "error": "rate limited", "limit": which}).encode()
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+        route_for_gate = self.routes.get(route_path)
         try:
-            peer = self._peer()
+            peer = self._peer(route_for_gate)
         except tailnet.TailnetError as exc:
             # Same discretion as a bad signature: the caller learns nothing, the
             # reason is kept on our side.
@@ -305,7 +336,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply(HTTPStatus.FORBIDDEN, {"ok": False, "error": "forbidden"})
             return
 
-        route = self.routes.get(self.path.split("?", 1)[0])
+        route = route_for_gate
         if route is None:
             self._reply(HTTPStatus.NOT_FOUND, {"ok": False, "error": "no such route"})
             return
@@ -411,6 +442,7 @@ class WakeServer:
         require_tailnet: bool = False,
         tailnet_allow_logins: list[str] | None = None,
         tailnet_allow_nodes: list[str] | None = None,
+        limiter: "RateLimiter | None" = None,
     ) -> None:
         if not routes:
             raise ValueError("a wake server with no routes would accept nothing; configure at least one")
@@ -427,6 +459,7 @@ class WakeServer:
                 "require_tailnet": require_tailnet,
                 "tailnet_allow_logins": tuple(tailnet_allow_logins or ()),
                 "tailnet_allow_nodes": tuple(tailnet_allow_nodes or ()),
+                "limiter": limiter,
             },
         )
         self._httpd = ThreadingHTTPServer((host, port), handler)

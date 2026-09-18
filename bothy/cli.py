@@ -81,6 +81,7 @@ def build_routes(config: Config) -> list[Route]:
             subject_from=entry.get("subject_from"),
             subject_prefix=entry.get("subject_prefix", ""),
             profile=entry.get("profile"),
+            public=bool(entry.get("public", False)),
             signature_header=entry.get("signature_header", "X-Webhook-Signature"),
             timestamp_header=entry.get("timestamp_header", "X-Webhook-Timestamp"),
         ))
