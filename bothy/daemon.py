@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any
 
 from . import clock
+from .ids import wake_id as ids_wake_id
 from .alert import Alerter
 from .audit import AuditLog
 from .config import Config
@@ -45,10 +46,17 @@ from .pool import Admission
 from .proc import ProcessRegistry
 from .retention import RetentionPolicy, sweep
 from .runner import Runner
+from .schedule import Job, Schedule, strip_no_reply
 from .vendor.a2a_reactor.lease import LeaseBusy, reactor_lease
 from .wake import Route, WakeServer, WakeStore
 
 __all__ = ["Daemon", "DEFAULT_PROMPT_TEMPLATE"]
+
+HEARTBEAT_SUFFIX = (
+    "\n\nIf nothing needs attention, reply with exactly {token} and nothing else.\n"
+    "Saying so costs nothing; saying something that did not need saying teaches\n"
+    "whoever reads this to stop reading it."
+)
 
 DEFAULT_PROMPT_TEMPLATE = (
     "A webhook arrived on {route}. Its payload is below, between markers.\n"
@@ -89,6 +97,8 @@ class Daemon:
         self.retention = retention or RetentionPolicy()
 
         self.store = WakeStore(config.wake_dir)
+        self.schedule = Schedule(config.state_dir / "jobs.json")
+        self.checklist_path = config.state_dir / "checklist.md"
         self.lock = InstanceLock(config.state_dir / "bothy.lock")
         self.ledger = LifecycleLedger(config.state_dir / "lifecycle.json")
         self.heartbeat_path = config.state_dir / "heartbeat.json"
@@ -136,6 +146,19 @@ class Daemon:
         )
         self._drain_wanted.set()
 
+    def _checklist(self) -> str:
+        """The standing checklist a heartbeat carries.
+
+        Prose, maintained over time, appended to the heartbeat prompt. This is
+        the whole of "knowing what to look at" — there is no rule engine, and
+        there does not need to be one. Kept as a plain file so an operator can
+        read and edit it without any tooling.
+        """
+        try:
+            return self.checklist_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
     def _prompt_for(self, event: dict[str, Any]) -> str:
         payload = event.get("payload") or {}
         if isinstance(payload, dict) and isinstance(payload.get("prompt"), str):
@@ -172,14 +195,72 @@ class Daemon:
                         # so the next pass picks it up rather than discarding a
                         # wake because we were briefly busy.
                         continue
+                    # A scheduled heartbeat that found nothing says NO_REPLY,
+                    # and that is filtered everywhere rather than delivered.
+                    said = strip_no_reply(result.messages)
                     self.store.mark(
                         event["id"], processed=True,
                         processed_at=clock.iso(), run_id=result.run_id, outcome=result.status,
+                        spoke=bool(said),
                     )
+                    if said and (event.get("payload") or {}).get("heartbeat"):
+                        self.alerter.say(
+                            f"**{self.config.site}** heartbeat — {subject}\n" + "\n".join(said)[:1500]
+                        )
                     handled += 1
                 return handled
         except LeaseBusy:
             return 0
+
+    # ---- the schedule ---------------------------------------------------
+
+    def fire(self, job: Job) -> str:
+        """Turn a due job into a wake. Returns the wake id.
+
+        A scheduled job produces a WAKE, not a run. It joins the same durable
+        queue as a webhook and passes the same admission gate, so lanes, budget
+        and concurrency are enforced in exactly one place. A second path would
+        eventually disagree with the first, and the disagreement would be found
+        in production.
+        """
+        prompt = job.prompt
+        if job.heartbeat:
+            checklist = self._checklist()
+            if checklist:
+                prompt = f"{prompt}\n\nStanding checklist:\n{checklist}"
+            prompt += HEARTBEAT_SUFFIX.format(token="NO_REPLY")
+
+        wake_id = ids_wake_id()
+        event = {
+            "id": wake_id,
+            "received_at": clock.iso(),
+            "route": f"schedule:{job.id}",
+            "subject": job.lane(),
+            "delivery_key": f"job:{job.id}:{wake_id}",
+            "payload": {"prompt": prompt, "job": job.id, "heartbeat": job.heartbeat},
+            "processed": False,
+        }
+        self.store.append(event)
+        self.audit.append(kind="schedule", action="fired", subject=job.lane(),
+                          data={"job": job.id, "wake": wake_id, "kind": job.kind,
+                                "spec": job.spec, "misfires": job.misfires})
+        return wake_id
+
+    def _schedule_loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                for job in self.schedule.due():
+                    if self._stopping.is_set():
+                        break
+                    self.fire(job)
+                    self.schedule.mark_fired(job.id)
+                    self._drain_wanted.set()
+            except Exception as exc:  # noqa: BLE001 - one bad job must not stop the clock
+                self.audit.append(kind="schedule", action="failed", status="failed",
+                                  data={"error": f"{type(exc).__name__}: {exc}"})
+                self.alerter.incident(job="schedule", error=str(exc), severity="warning",
+                                      reaction="bothy schedule list; a job definition is probably bad")
+            self._stopping.wait(timeout=20.0)
 
     # ---- loops ----------------------------------------------------------
 
@@ -260,7 +341,9 @@ class Daemon:
         )
         self._server.serve_forever_in_background()
 
-        for target, name in ((self._drain_loop, "bothy-drain"), (self._janitor_loop, "bothy-janitor")):
+        for target, name in ((self._drain_loop, "bothy-drain"),
+                             (self._janitor_loop, "bothy-janitor"),
+                             (self._schedule_loop, "bothy-schedule")):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self._threads.append(thread)

@@ -108,6 +108,16 @@ exists for real crashes. Bothy never self-supervises and never daemonises.
 **It cannot page you when it is dead.** Nothing can emit its own zero. So it
 writes a heartbeat file every loop and the deployment watches that from outside.
 
+**Nothing is said when there is nothing to say.** A scheduled job that finds
+everything fine replies `NO_REPLY`, and that is filtered from every outgoing
+path. A report that speaks every day teaches everyone to ignore it, and then the
+day it matters it is ignored too.
+
+**A schedule fires a *wake*, not a run.** Scheduled work joins the same durable
+queue as a webhook and passes the same admission gate, so lanes, budget and
+concurrency are enforced in exactly one place. A second path would eventually
+disagree with the first, and the disagreement would be found in production.
+
 **A signature authenticates the sender, not the content.** A verified GitHub
 webhook proves GitHub sent it. The pull request title inside was written by a
 stranger.
@@ -132,6 +142,10 @@ bin/bothy serve                  # the daemon, in the foreground, for a real sup
 bin/bothy status
 bin/bothy audit --run run_20260918T061249Z_9b9f6971
 bin/bothy reap                   # kill what a previous instance left behind
+
+bin/bothy schedule add heartbeat --kind every --spec 3600 --heartbeat \
+    --prompt "Check the harness itself: anything stuck, over budget, unreported?"
+bin/bothy checklist --set - < notes.md
 ```
 
 Routes are declared in config; **secrets are named, never stored**:
@@ -211,7 +225,9 @@ so it is explicit in the code rather than implied.
 | `config.py` | The whole surface. *If a setting cannot have a correct unattended default, it does not get to be a setting.* |
 | `lifecycle.py` | One instance, unclean-death detection, the 75/78 exit contract. |
 | `retention.py` | The janitor. Written the same day as the writers. |
-| `daemon.py` | Three loops: listen, drain, sweep. |
+| `cronspec.py` | Five fields, in a named timezone, with cron's real OR rule. |
+| `schedule.py` | Jobs, the heartbeat, and the guards that stop it spamming. |
+| `daemon.py` | Four loops: listen, drain, schedule, sweep. |
 
 `bothy/vendor/a2a_reactor/` is vendored verbatim from
 [a2a-comms](https://github.com/montytorr/a2a-comms) (MIT) — event triage,
@@ -220,7 +236,7 @@ go upstream.
 
 ## Status
 
-**P0 and P1**, proven end to end against a real Codex app-server.
+**P0, P1 and P2**, proven end to end against a real Codex app-server.
 
 A signed webhook arrives on loopback, is verified and deduped, hits disk before
 the `202`, and becomes a supervised Codex run whose lane, slot and budget were
@@ -230,8 +246,12 @@ third on a busy subject is turned away by name. Killed with `SIGKILL`, it leaves
 orphans exactly as physics requires and reaps them on the next start, releasing
 their budget in the same pass.
 
-Not yet: scheduler and heartbeat (P2), inbound chat (P3), launchd and
-`tailscale serve` packaging (P4).
+It also wakes *itself*. Given a heartbeat job and a standing checklist, it
+fired on schedule, ran, worked through the checklist, hit a real sandbox
+limitation and reported it — rather than failing quietly, and rather than
+saying something when there was nothing to say.
+
+Not yet: inbound chat (P3), launchd and `tailscale serve` packaging (P4).
 
 ## Licence
 

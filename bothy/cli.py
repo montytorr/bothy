@@ -27,6 +27,7 @@ from .wake import Route
 from .pool import Admission
 from .proc import ProcessRegistry
 from .runner import Runner
+from .schedule import Job, Schedule, ScheduleError
 from .tracker import CairnTracker
 
 __all__ = ["main", "build"]
@@ -223,6 +224,70 @@ def cmd_audit(args: argparse.Namespace, config: Config) -> int:
     return 0
 
 
+def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
+    """List, add or remove scheduled jobs."""
+    config.ensure_dirs()
+    schedule = Schedule(config.state_dir / "jobs.json")
+
+    if args.action == "list":
+        jobs = schedule.jobs()
+        if args.json:
+            print(json.dumps([job.as_dict() for job in jobs], indent=2))
+            return 0
+        if not jobs:
+            print("no scheduled jobs")
+            return 0
+        for job in sorted(jobs, key=lambda j: j.next_due_at or ""):
+            flags = []
+            if job.heartbeat:
+                flags.append("heartbeat")
+            if not job.enabled:
+                flags.append("disabled")
+            if job.misfires:
+                flags.append(f"{job.misfires} missed")
+            if job.active_hours:
+                flags.append(f"{job.active_hours[0]:02d}-{job.active_hours[1]:02d} {job.tz}")
+            print(f"  {job.id:16} {job.kind:6} {job.spec:18} next {job.next_due_at or 'never'}"
+                  f"{('  [' + ', '.join(flags) + ']') if flags else ''}")
+        return 0
+
+    if args.action == "remove":
+        print("removed" if schedule.remove(args.id) else f"no job called {args.id}")
+        return 0
+
+    # add
+    try:
+        job = schedule.put(Job(
+            id=args.id, kind=args.kind, spec=args.spec, prompt=args.prompt,
+            subject=args.subject, tz=args.tz, heartbeat=args.heartbeat,
+            min_spacing_seconds=args.min_spacing,
+            active_hours=[args.active_from, args.active_to] if args.active_from is not None else None,
+        ))
+    except ScheduleError as exc:
+        # Validated now, at the moment a human can fix it, rather than at 3am
+        # when it was supposed to fire.
+        print(f"bothy: {exc}", flush=True)
+        return EX_CONFIG
+    print(f"{job.id}: next {job.next_due_at}")
+    return 0
+
+
+def cmd_checklist(args: argparse.Namespace, config: Config) -> int:
+    """Show or replace the standing checklist a heartbeat carries."""
+    config.ensure_dirs()
+    path = config.state_dir / "checklist.md"
+    if args.set is not None:
+        text = sys.stdin.read() if args.set == "-" else args.set
+        path.write_text(text.strip() + "\n", encoding="utf-8")
+        print(f"checklist written to {path} ({len(text.strip())} chars)")
+        return 0
+    if not path.exists():
+        print(f"no checklist yet — write one with: bothy checklist --set - < notes.md\n({path})")
+        return 0
+    print(path.read_text(encoding="utf-8"), end="")
+    return 0
+
+
 def cmd_reap(args: argparse.Namespace, config: Config) -> int:
     """Kill anything a previous instance left behind, and release what it held.
 
@@ -286,6 +351,27 @@ def main(argv: list[str] | None = None) -> int:
 
     reap = subparsers.add_parser("reap", help="kill workers a previous instance left behind")
     reap.set_defaults(func=cmd_reap)
+
+    schedule = subparsers.add_parser("schedule", help="jobs that fire without being asked")
+    schedule.add_argument("action", choices=["list", "add", "remove"])
+    schedule.add_argument("id", nargs="?", default=None)
+    schedule.add_argument("--kind", choices=["at", "every", "cron"], default="every")
+    schedule.add_argument("--spec", default="3600",
+                          help="an ISO instant, seconds, or five cron fields")
+    schedule.add_argument("--prompt", default="Anything need attention?")
+    schedule.add_argument("--subject", default=None, help="lane to occupy; defaults to job:<id>")
+    schedule.add_argument("--tz", default="UTC")
+    schedule.add_argument("--heartbeat", action="store_true",
+                          help="carry the standing checklist and honour NO_REPLY")
+    schedule.add_argument("--min-spacing", type=float, default=60.0)
+    schedule.add_argument("--active-from", type=int, default=None)
+    schedule.add_argument("--active-to", type=int, default=None)
+    schedule.add_argument("--json", action="store_true")
+    schedule.set_defaults(func=cmd_schedule)
+
+    checklist = subparsers.add_parser("checklist", help="the standing checklist a heartbeat carries")
+    checklist.add_argument("--set", default=None, help="replace it; '-' reads stdin")
+    checklist.set_defaults(func=cmd_checklist)
 
     serve = subparsers.add_parser("serve", help="run the daemon in the foreground")
     serve.add_argument("--reap", action="store_true",
