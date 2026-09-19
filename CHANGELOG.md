@@ -21,11 +21,18 @@ Every release states its **Breaking Changes** heading even when it is empty.
   ratio.
 - **Capability profiles:** MCP servers, individual MCP tools, per-tool approval
   gating, skill roots, and tools Bothy hosts itself over the same connection.
+- **Questions reach a person.** Codex asks through `.../requestUserInput`, which
+  is not a permission request. It was routed into the approval handler and
+  declined in milliseconds with nobody told, so the one moment an agent reached
+  for a human was the one moment it could not get one. Questions are now
+  recorded on the run, alerted while the run is still going, and carried into
+  the audit entry as `questions_unanswered`. The turn is told plainly that no
+  answer is coming, which it can act on — unlike a bare refusal.
 - **Hash-chained audit log**, verifiable across rotation, joinable by one run id.
 - **Two doors:** tailnet-only routes and public routes on separate ports, with
   tailscaled-verified callers and rate limiting ahead of signature checks.
 - **Headless install** for launchd and systemd, with the 75/78 exit contract.
-- 176 tests, standard library only.
+- 191 tests, standard library only.
 
 ### Breaking Changes
 - None. First release.

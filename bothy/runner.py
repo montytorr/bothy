@@ -62,6 +62,10 @@ class RunResult:
     refusal: dict[str, Any] | None = None
     error: str | None = None
     cairn_ref: str | None = None
+    #: Questions the agent put to a person mid-run. A run can be `completed`
+    #: and still have these: the work got done around the gap, but somebody
+    #: asked and nobody answered, and that should not vanish into a transcript.
+    questions: list[dict[str, Any]] = dataclasses.field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -125,6 +129,39 @@ class Runner:
             self._last_resets_at = codex.resets_at(outcome.rate_limits or {})
 
     # ---- audit helper ---------------------------------------------------
+
+    def _question_asked(self, run_id: str, subject: str, question: Any) -> None:
+        """An agent stopped to ask a person. Make sure a person hears it.
+
+        Codex asks through `.../requestUserInput`, which Bothy used to route
+        into the approval handler and decline in milliseconds with nobody told.
+        The audit entry is written first and the alert second, deliberately: the
+        record must survive even when there is no alerter configured, or when
+        posting to Discord fails.
+        """
+        self._record(
+            kind="run", action="question", status="pending",
+            run_id=run_id, subject=subject,
+            data={"prompt": question.prompt, "method": question.method, "asked_at": question.asked_at},
+        )
+        if self.alerter is None:
+            return
+        try:
+            self.alerter.incident(
+                job=f"run:{subject}",
+                error=f"agent asked a question: {question.prompt[:300]}",
+                # A question is not a failure. It is warning-level because the
+                # run carries on without an answer, which is a worse outcome
+                # than it sounds and should not read as routine.
+                severity="warning",
+                run_id=run_id,
+                detail={"subject": subject, "asked_at": question.asked_at},
+                reaction=f"bothy audit --run {run_id}",
+            )
+        except Exception:  # noqa: BLE001
+            # The audit entry above is the durable record; a notifier that is
+            # down must not end a run that is otherwise fine.
+            pass
 
     def _record(self, **fields: Any) -> None:
         """Append to the audit log, and degrade loudly if we cannot.
@@ -294,6 +331,10 @@ class Runner:
             codex_home=home,
             binary=self.config.codex_binary,
             on_event=lambda method, params: None,
+            # Tell a human WHILE the run is still going. Alerting at the end
+            # would be the same silence with extra steps — by then the turn has
+            # already carried on without the answer.
+            on_question=lambda question: self._question_asked(run_id, subject, question),
             tools=registry,
         )
         spent = 0.0
@@ -344,6 +385,7 @@ class Runner:
             result.status = outcome.status
             result.messages = outcome.messages
             result.usage = outcome.usage
+            result.questions = [q.as_dict() for q in outcome.questions]
             result.error = outcome.error
             if self.config.budget.mode == "api":
                 spent = pricing.cost(Usage.from_app_server(outcome.usage))
@@ -368,7 +410,11 @@ class Runner:
                 status="ok" if result.status == "completed" else result.status,
                 run_id=run_id, subject=subject,
                 data={"outcome": result.status, "cost": round(settled, 5), "unit": result.unit,
-                      "disposal": disposal, "usage": result.usage, "error": result.error},
+                      "disposal": disposal, "usage": result.usage, "error": result.error,
+                      # A run that completed with questions outstanding did the
+                      # work around a gap somebody flagged. `bothy audit` should
+                      # not have to read the transcript to notice.
+                      "questions_unanswered": len(result.questions)},
             )
             # Per-run homes are disposable; keeping them would grow without bound,
             # and Codex rollouts are the single biggest disk risk on a small box.

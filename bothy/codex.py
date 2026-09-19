@@ -51,6 +51,8 @@ __all__ = [
     "TurnOutcome",
     "CodexClient",
     "default_approval",
+    "default_question",
+    "Question",
 ]
 
 
@@ -90,8 +92,56 @@ def default_approval(method: str, params: dict[str, Any]) -> ApprovalDecision:
     return ApprovalDecision("decline", reason=f"no approval policy configured for {method}")
 
 
+def _question_text(params: dict[str, Any]) -> str:
+    """Pull the human-readable question out of a requestUserInput payload.
+
+    The app-server has carried it under several keys across versions, and a
+    question nobody can read is no better than one nobody was told about — so
+    try the known shapes, then fall back to the whole payload rather than
+    reporting an empty string.
+    """
+    for key in ("prompt", "question", "message", "text", "title"):
+        value = params.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    # Some versions nest it one level down.
+    for container in ("input", "request", "userInput"):
+        nested = params.get(container)
+        if isinstance(nested, dict):
+            inner = _question_text(nested)
+            if inner:
+                return inner
+    return json.dumps(params, default=str)[:2000]
+
+
+def default_question(question: "Question") -> None:
+    """Do nothing, loudly — a caller that supplies no handler still gets the
+    question on the outcome, where the audit log will keep it."""
+    return None
+
+
 # --------------------------------------------------------------------------
 # outcome
+
+
+@dataclasses.dataclass
+class Question:
+    """Something the agent stopped to ask a person.
+
+    Codex asks through `.../requestUserInput`, which is NOT a permission
+    request: it is the model saying it needs information only a human has.
+    Bothy used to route it through the approval handler and decline it in
+    milliseconds with nobody told — the one moment the agent reaches for a
+    person is the one moment it was guaranteed not to get one.
+    """
+
+    method: str
+    prompt: str
+    params: dict[str, Any] = dataclasses.field(default_factory=dict)
+    asked_at: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"method": self.method, "prompt": self.prompt, "asked_at": self.asked_at}
 
 
 @dataclasses.dataclass
@@ -107,6 +157,10 @@ class TurnOutcome:
     error: str | None = None
     error_code: str | None = None
     items: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    #: Questions the agent put to a person during the turn. A turn can complete
+    #: with questions outstanding — Bothy cannot block waiting for an answer —
+    #: so this is how they survive the run rather than being lost.
+    questions: list[Question] = dataclasses.field(default_factory=list)
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -130,6 +184,7 @@ class CodexClient:
         env: dict[str, str] | None = None,
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
         approval: Callable[[str, dict[str, Any]], ApprovalDecision] = default_approval,
+        on_question: Callable[[Question], None] = default_question,
         tools: "ToolRegistry | None" = None,
     ) -> None:
         self.run_id = run_id
@@ -140,6 +195,10 @@ class CodexClient:
         self._env = env
         self._on_event = on_event or (lambda method, params: None)
         self._approval = approval
+        self._on_question = on_question
+        #: Every question asked this run, in order. Read by run_turn onto the
+        #: outcome so they reach the audit log and the operator.
+        self.questions: list[Question] = []
         self._tools = tools
 
         self._popen: subprocess.Popen | None = None
@@ -273,7 +332,45 @@ class CodexClient:
             # process, which is the point: it can touch the ledger, the checklist
             # and the audit log directly, with no subprocess, port or credential.
             self._handle_tool_call(message, params)
-        elif "requestApproval" in method or method.endswith("/requestUserInput"):
+        elif method.endswith("/requestUserInput"):
+            # NOT an approval. The model is asking a person for information, and
+            # routing it through the approval handler declined it in
+            # milliseconds with nobody told — the single moment the agent
+            # reaches for a human was the one moment it could not get one.
+            #
+            # Bothy still cannot block: a turn waiting on a person would hold a
+            # slot and a budget reservation indefinitely. So the question is
+            # recorded, handed to whoever is listening while the run is still
+            # going, and the turn is told plainly that it will not get an answer
+            # now — which is a fact the model can act on, unlike a bare refusal.
+            question = Question(
+                method=method,
+                prompt=_question_text(params),
+                params=params,
+                asked_at=clock.iso(),
+            )
+            self.questions.append(question)
+            try:
+                self._on_question(question)
+            except Exception:  # noqa: BLE001
+                # A failing notifier must not take the run down with it; the
+                # question is already on the outcome either way.
+                pass
+            self._send(
+                {
+                    "id": message["id"],
+                    "result": {
+                        "decision": "decline",
+                        "reason": (
+                            "Bothy runs unattended and cannot wait for an answer. "
+                            "Your question has been recorded and sent to an operator. "
+                            "Continue with what you can do without it, or stop and say "
+                            "what you are blocked on."
+                        ),
+                    },
+                }
+            )
+        elif "requestApproval" in method:
             verdict = self._approval(method, params)
             self._send({"id": message["id"], "result": {"decision": verdict.decision}})
         else:
@@ -507,6 +604,9 @@ class CodexClient:
                     outcome.error = str(finished["error"])
                 break
 
+        # A turn can complete with questions outstanding — Bothy never blocks on
+        # one — so they ride out on the outcome or they are lost.
+        outcome.questions = list(self.questions)
         return outcome
 
 
