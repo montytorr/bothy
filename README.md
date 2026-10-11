@@ -8,7 +8,7 @@
 *Runs Codex under supervision. Remembers in Cairn.*
 *Speaks up when it needs you. Closed to everything but the tailnet.*
 
-`stdlib only` · `no virtualenv` · `no build step` · `~9.5k lines` · `254 tests`
+`stdlib only` · `no virtualenv` · `no build step` · `~9.5k lines` · `260 tests`
 
 </div>
 
@@ -223,7 +223,7 @@ make check     # quiet, non-zero on failure
 make test      # verbose
 ```
 
-**254 tests, standard library `unittest`.** They assert *properties*, and each
+**260 tests, standard library `unittest`.** They assert *properties*, and each
 was demonstrated by hand against the real thing — real Codex, the real GitHub
 API, a real systemd install — **before** being written down. The tests are
 recorded evidence, not a guess at what the code does.

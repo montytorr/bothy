@@ -45,13 +45,20 @@ Every release states its **Breaking Changes** heading even when it is empty.
   planner (`for: planner`, or `answer.type: planner` on an older Drove) are not
   sent. A crash between the send and its record sends that item again, which
   is documented rather than hidden.
+- **Process groups on macOS.** Liveness, whole-tree kill and orphan reaping read
+  `/proc`, which macOS lacks, so on a Mac every group answered "nobody is there":
+  a kill reported `already-gone` without signalling anything and a restart could
+  not find its orphans. The same table now comes from `ps`, with `kern.boottime`
+  for the boot and `ps` start time for the pid fingerprint, and the lifecycle
+  ledger reads the same boot id, so a reboot can be told from a crash there too.
+  Linux is unchanged.
 - `Alerter.deliver` and a delivery result from the webhook sinks, so a caller
   that must be heard can tell a message that arrived from one that did not.
 - **Hash-chained audit log**, verifiable across rotation, joinable by one run id.
 - **Two doors:** tailnet-only routes and public routes on separate ports, with
   tailscaled-verified callers and rate limiting ahead of signature checks.
 - **Headless install** for launchd and systemd, with the 75/78 exit contract.
-- 254 tests, standard library only.
+- 260 tests, standard library only.
 
 ### Breaking Changes
 - None. First release.
@@ -60,7 +67,6 @@ Every release states its **Breaking Changes** heading even when it is empty.
 - Drove runs and attention forwarding are tested against a stand-in for `drove`
   that speaks the shapes in Drove's README. No run has yet been started by
   Bothy on a real herdr, and no item has reached a real channel.
-- `test_proc` needs `/proc` and fails on macOS (two tests); that is not new.
 - No live Slack workspace or Discord application has been connected.
 - Not yet run on macOS.
 - `bwrap` cannot start inside a nested container, so runs needing a shell fail

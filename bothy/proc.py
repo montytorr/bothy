@@ -40,7 +40,7 @@ from typing import Any, Sequence
 
 from . import clock
 
-__all__ = ["Worker", "ProcessRegistry", "spawn_group", "kill_group", "group_alive", "group_members", "pid_alive"]
+__all__ = ["Worker", "ProcessRegistry", "spawn_group", "kill_group", "group_alive", "group_members", "pid_alive", "boot_id"]
 
 
 # --------------------------------------------------------------------------
@@ -78,6 +78,56 @@ def _proc_stat(pid: int) -> list[str] | None:
     return tail if len(tail) >= 20 else None
 
 
+def _has_proc() -> bool:
+    """Whether this kernel has a Linux-style /proc. macOS does not."""
+    return os.path.exists("/proc/self/stat")
+
+
+def _parse_ps(text: str) -> list[tuple[int, int, bool]]:
+    """Rows of `ps -A -o pid=,pgid=,stat=` as (pid, pgid, is_zombie).
+
+    A zombie's STAT begins with Z on both BSD and procps. A row that does not
+    parse is skipped rather than guessed at.
+    """
+    rows: list[tuple[int, int, bool]] = []
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or not fields[0].isdigit() or not fields[1].isdigit():
+            continue
+        rows.append((int(fields[0]), int(fields[1]), fields[2].startswith("Z")))
+    return rows
+
+
+def _process_table() -> list[tuple[int, int, bool]] | None:
+    """(pid, pgid, is_zombie) for every process, or None if it cannot be read.
+
+    Linux reads /proc, which is cheap and exact. macOS has no /proc, so the same
+    table comes from ps. Until this existed every liveness question on macOS was
+    answered "nobody is there", so a whole-tree kill returned "already-gone"
+    without signalling anything and a restart could never find its orphans.
+    """
+    if _has_proc():
+        rows: list[tuple[int, int, bool]] = []
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return None
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            fields = _proc_stat(int(entry))
+            if fields is None:
+                continue
+            rows.append((int(entry), int(fields[2]), fields[0] == "Z"))
+        return rows
+    try:
+        done = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True,
+                              text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _parse_ps(done.stdout) if done.returncode == 0 else None
+
+
 def group_members(pgid: int) -> list[int]:
     """Live pids in a process group, excluding zombies.
 
@@ -92,22 +142,18 @@ def group_members(pgid: int) -> list[int]:
     """
     if pgid <= 0:
         return []
-    members: list[int] = []
-    try:
-        entries = os.listdir("/proc")
-    except OSError:
-        return []
-    for entry in entries:
-        if not entry.isdigit():
-            continue
-        fields = _proc_stat(int(entry))
-        if fields is None:
-            continue
-        if fields[0] == "Z":  # exited, not yet reaped: dead for our purposes
-            continue
-        if fields[2] == str(pgid):
-            members.append(int(entry))
-    return sorted(members)
+    table = _process_table()
+    if table is None:
+        # The table could not be read, which is not the same as nobody being
+        # there. killpg(pgid, 0) cannot tell a zombie from a live process, but
+        # that error is the safe one: it keeps a group "alive" a little long.
+        try:
+            os.killpg(pgid, 0)
+        except OSError as exc:
+            return [pgid] if exc.errno == errno.EPERM else []
+        return [pgid]
+    # A zombie has exited and is not yet reaped: dead for our purposes.
+    return sorted(pid for pid, group, zombie in table if group == pgid and not zombie)
 
 
 def group_alive(pgid: int) -> bool:
@@ -122,9 +168,21 @@ def _start_time(pid: int) -> str | None:
     trusts a bare pid will eventually kill something innocent. Field 22 of
     /proc/<pid>/stat is the process start time in clock ticks since boot, which
     together with the pid is unique for the life of the boot.
+
+    macOS has no /proc, so the fingerprint is ps's start time. It has second
+    resolution, which is coarser, but a recycled pid landing in the same second
+    as the original is not a case worth a worse dependency.
     """
-    fields = _proc_stat(pid)
-    return fields[19] if fields else None
+    if _has_proc():
+        fields = _proc_stat(pid)
+        return fields[19] if fields else None
+    try:
+        done = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
+                              text=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    stamp = " ".join(done.stdout.split())
+    return stamp if done.returncode == 0 and stamp else None
 
 
 def spawn_group(
@@ -226,7 +284,7 @@ class Worker:
         Returns False after a reboot: the recorded boot id no longer matches, so
         whatever holds that pid now is somebody else's and must not be signalled.
         """
-        if self.boot_id is not None and self.boot_id != _boot_id():
+        if self.boot_id is not None and self.boot_id != boot_id():
             return False
         if not group_alive(self.pgid):
             return False
@@ -235,11 +293,19 @@ class Worker:
         return _start_time(self.pid) == self.start_ticks
 
 
-def _boot_id() -> str | None:
+def boot_id() -> str | None:
     try:
         return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
     except OSError:
+        pass
+    # macOS: the boot time identifies the boot as well as a random id does.
+    try:
+        done = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True, text=True,
+                              timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
         return None
+    stamp = done.stdout.strip()
+    return stamp if done.returncode == 0 and stamp else None
 
 
 class ProcessRegistry:
@@ -287,7 +353,7 @@ class ProcessRegistry:
             argv=list(argv),
             started_at=clock.iso(),
             start_ticks=_start_time(popen.pid),
-            boot_id=_boot_id(),
+            boot_id=boot_id(),
         )
         data = self._load()
         data[run_id] = worker.as_dict()

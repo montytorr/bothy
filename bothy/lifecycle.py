@@ -45,6 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from . import clock
+from .proc import boot_id
 
 __all__ = ["EX_TEMPFAIL", "EX_CONFIG", "AlreadyRunning", "InstanceLock", "LifecycleLedger", "UncleanDeath"]
 
@@ -164,10 +165,10 @@ class LifecycleLedger:
 
     @staticmethod
     def _boot_id() -> str | None:
-        try:
-            return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="utf-8").strip()
-        except OSError:
-            return None
+        # One answer for the whole package. On macOS, where this file used to
+        # read /proc and return None both times, "the machine rebooted" could
+        # never be told apart from "the process died".
+        return boot_id()
 
     @staticmethod
     def _memory_evidence() -> dict[str, Any]:
