@@ -52,7 +52,7 @@ that holds it, and the value is read at startup from a `0600` file.
 | `tailnet_allow_nodes` | `[]` | `tag:bothy` preferred; a StableID or node name also works |
 | `tailnet_allow_logins` | `[]` | Cannot be combined with tagged devices — they have no login |
 | `max_skew_seconds` | `300` | Signature timestamp window |
-| `routes[]` | `[]` | `{path, secret_env, subject_from, subject_prefix, profile, public}` |
+| `routes[]` | `[]` | `{path, secret_env, subject_from, subject_prefix, profile, public, drove}` |
 
 `subject_from` is what makes two webhooks about one thing share a lane instead of
 racing.
@@ -92,6 +92,53 @@ it.
 |---|---|---|
 | `discord_webhook_url` | `null` | Outbound only; no bot needed |
 | `slack_webhook_url` | `null` | |
+
+## Drove
+
+Drove's CLI, run as a plain process. No model turn is involved, so the worker
+settings above (`sandbox`, `wall_clock_seconds`, `profiles`) do not apply to it,
+and **its spend is not in Bothy's budget**: `drove_max_runs` is the cap.
+
+| Key | Default | |
+|---|---|---|
+| `drove_binary` | `drove` | An absolute path is safest: a service's `PATH` is short |
+| `drove_repo` | `null` | The repository a started run is bound to. **No default**: a daemon's working directory is Bothy's own checkout, so a start with no repo is refused as `no-repo` |
+| `drove_home` | `null` | `DROVE_HOME` for every command Bothy runs. Unset leaves Drove's own default. A person answering items must use the same one |
+| `drove_start_timeout_seconds` | `120` | Past it a start is reported as failed and is **not** retried: it may have made a run |
+| `drove_run_deadline_seconds` | `21600` | How long Bothy watches a run it started. Past it Bothy says so and stops watching. It does not stop the run |
+| `drove_poll_seconds` | `60` | How often a watched run's roster is read |
+| `drove_max_runs` | `1` | Runs Bothy will have going at once. A start beyond it waits, counted, like any capacity refusal |
+| `drove_attention_interval_seconds` | `null` | Not forwarded. A number polls `drove attention --all --json` that often and sends what needs a person to the webhook alerter |
+
+`drove_attention_interval_seconds` without `discord_webhook_url` or
+`slack_webhook_url` is refused at start: items would be read and told to nobody.
+
+**Starting a run from a schedule:**
+
+```bash
+bothy schedule add nightly --kind cron --spec "0 2 * * *" --tz Europe/Paris --drove-next DROVE
+bothy schedule add resume  --kind at --spec 2026-10-12T07:00:00+00:00 --drove-up drove-20261011-0200-a1b2
+bothy schedule add one     --kind at --spec 2026-10-12T07:00:00+00:00 --drove-from-cairn DROVE-5
+```
+
+**Starting a run from a webhook:** a route may carry a `drove` action instead of
+being a prompt.
+
+```json
+"routes": [
+  { "path": "/drove/nightly", "secret_env": "DROVE_HOOK_SECRET",
+    "drove": { "action": "plan", "next": "DROVE" } },
+  { "path": "/drove/task", "secret_env": "DROVE_HOOK_SECRET",
+    "drove": { "action": "plan", "from_cairn": { "payload": "task.ref" } } }
+]
+```
+
+An action is `plan` with `from_cairn` (a Cairn ref), `next` (a project key), or
+`up` with `run` (a run id), and optionally an absolute `repo`. The one thing a
+payload may supply is **one value**, written `{"payload": "dotted.path"}`, and it
+must be a plain ref, key or id that cannot begin with a dash. An action found
+inside a payload is data and is never obeyed. A route whose payload has no valid
+value answers `422` and queues nothing.
 
 ## Housekeeping
 

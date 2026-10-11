@@ -8,7 +8,7 @@
 *Runs Codex under supervision. Remembers in Cairn.*
 *Speaks up when it needs you. Closed to everything but the tailnet.*
 
-`stdlib only` · `no virtualenv` · `no build step` · `~8k lines` · `176 tests`
+`stdlib only` · `no virtualenv` · `no build step` · `~9.5k lines` · `254 tests`
 
 </div>
 
@@ -168,6 +168,12 @@ MCP servers, skill roots, a sandbox — and individual **tools**, because
 }
 ```
 
+Not every job needs a model. A schedule or a signed webhook can instead start a
+Drove run — a planner and its workers on a Cairn task — as a plain process, watch
+it until it is down, and send whatever needs a person to Slack or Discord once,
+with a follow-up when it stops waiting. No Codex turn, no sandbox, and no budget
+of Bothy's: see [docs/OPERATING.md](docs/OPERATING.md).
+
 Bothy also hosts tools of its own over the same connection — no subprocess, no
 port, no credential. That is how the agent maintains its own standing checklist:
 
@@ -205,6 +211,7 @@ is a contract — `75` restart me, `78` stop — and the two service managers ne
 | `tailnet` `ratelimit` `install` | Who is calling, how often, and putting it on a machine |
 | `runner` `daemon` `schedule` `cronspec` | One run door-to-record; four loops; the heartbeat |
 | `tracker` `alert` `retention` `config` | Cairn, saying something, sweeping up, the whole surface |
+| `drove` | Starting Drove runs, watching them, passing on what needs a person |
 
 `bothy/vendor/a2a_reactor/` is vendored verbatim from
 [a2a-comms](https://github.com/montytorr/a2a-comms) (MIT). Do not edit it.
@@ -216,7 +223,7 @@ make check     # quiet, non-zero on failure
 make test      # verbose
 ```
 
-**176 tests, standard library `unittest`.** They assert *properties*, and each
+**254 tests, standard library `unittest`.** They assert *properties*, and each
 was demonstrated by hand against the real thing — real Codex, the real GitHub
 API, a real systemd install — **before** being written down. The tests are
 recorded evidence, not a guess at what the code does.

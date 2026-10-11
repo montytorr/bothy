@@ -37,6 +37,8 @@ bothy audit --run run_20260918T061249Z_9b9f6971
 | Chat is silent | Allowlists are deny-by-default. Was the speaker listed? |
 | Discord messages arrive empty | The `MESSAGE_CONTENT` privileged intent is not enabled |
 | A poll source went quiet | `bothy poll <name>` runs it once by hand and shows what it saw |
+| A scheduled Drove run did not begin | `bothy audit \| grep drove` — a refusal carries Drove's own code (`herdr-down`, `task-closed`, `no-repo`) |
+| Drove needs a person and chat is silent | `bothy drove attention` shows what Drove says is waiting and what Bothy has done about each |
 
 ## Refusals are not failures
 
@@ -50,6 +52,72 @@ Bothy refuses work deliberately and records why. These are all normal:
 A wake that is refused for capacity too often, or waits too long, is
 **abandoned** with an alert rather than retried forever.
 
+## Drove runs
+
+Bothy can start Drove runs (a planner and its workers in herdr panes, on a Cairn
+task) and tell you when one needs a person. It runs Drove's CLI as a plain process: no model turn,
+no Codex, no sandbox. Its settings are under "Drove" in `CONFIG.md`.
+
+```bash
+bothy drove start --from-cairn DROVE-5   # what a schedule or webhook does, by hand
+bothy drove status                       # the runs it started and is watching
+bothy drove attention                    # what needs a person, and whether chat has been told
+```
+
+**What the machine needs.** All of it, for the account Bothy runs as:
+
+- a **herdr server running**. Drove opens a workspace in it and never starts it,
+  so with none a start is refused `herdr-down` and **waits**, counted, like any
+  capacity refusal (30 attempts, about five minutes, then abandoned out loud);
+- `drove`, `herdr`, `node` 22.18+, `git`, `cairn` and the planner's agent
+  (`claude` or `codex`) on `PATH`, **and signed in**;
+- the repository named by `drove_repo`, with its folder trusted once by hand.
+  Drove never answers a trust dialog; it shows as an item that needs a person.
+
+**`PATH` is the usual trap.** The generated launchd unit sets
+`/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`, which has
+neither `~/.local/bin` nor a Node version manager. The wrapper sources
+`/usr/local/etc/bothy.env`, so a `PATH=...` line there is how a service finds
+them. `bothy doctor` runs `drove --help` and says if it cannot.
+
+**What it does with a run.** A start returns at once with a run id, which Bothy
+writes to `state/drove-runs.json` and the audit. It then reads
+`drove roster --run ID --json` every `drove_poll_seconds` until the run is
+`down`, saying what the last report was, or until `drove_run_deadline_seconds`
+pass, saying the run is still up. **It never stops a run.** If the roster cannot
+be read, the run is *unknown*, not down: after five misses you are told, and the
+watch carries on.
+
+**What it does about attention.** With `drove_attention_interval_seconds` set,
+every item in `drove attention --all --json` that needs a person is sent to your
+webhook once, and a follow-up is sent when it stops waiting. The follow-up means
+*it is no longer in Drove's list*: someone answered it, the dialog cleared, or
+the run went down — the message says which of the last it knows. Items Drove
+addresses to its planner (`for: planner`: `stalled`, `idle-without-report`,
+`budget`, `pending-delivery`) are not sent; a channel that carries them is one
+people stop reading. An item with no `for` field, from an older Drove, is a
+person's unless its `answer.type` is `planner`. Bothy does not pass
+`--for human`, so it works against either.
+
+**Told once, and the one way it is not.** An item is written to
+`state/drove-attention.json` as *to tell* before it is sent and as *told* after.
+A restart tells nothing twice. A crash in the instant between the send and the
+second write sends that one item again: a duplicate is the cheaper mistake when
+the message is "a person is needed". Ids are Drove's and are never reused, so an
+item that went away and came back is a new message.
+
+**If chat is down**, an item stays *to tell* and is retried every poll. After 20
+failed attempts it is abandoned and audited, and the alert goes to the log if
+chat is what is down. It is still open in Drove, which `bothy drove attention`
+will show.
+
+**Spend.** Drove's models are paid from the Claude or Codex account signed in on
+the machine, not from Bothy's budget. `drove_max_runs` (default 1) is the cap.
+
+**Not yet proven live:** a run started by Bothy's own cron on a real herdr, and
+an item reaching a real channel. Everything above is tested against a stand-in
+for `drove` that speaks the shapes in Drove's README.
+
 ## Things that need a human
 
 | Alert | What it means |
@@ -59,6 +127,9 @@ A wake that is refused for capacity too often, or waits too long, is
 | `audit` | Bothy cannot record what it is doing. Check the disk before trusting the log |
 | `wake … abandoned` | Something has held a lane for hours, or the pool never recovered |
 | `daemon unclean_restart` | The previous run did not shut down. Check memory pressure |
+| `drove:<route>` | A start Drove refused, with its code and the first thing to do about it |
+| `drove:<run id>` | A run was still up at the deadline, or Drove has forgotten it, or its state cannot be read |
+| `drove:attention` | Drove could not be asked, or an item could not be delivered after 20 tries |
 
 Repeated identical failures are **one** incident, not a thousand pings: alerts
 are fingerprinted on the error text and suppressed until it changes.
@@ -103,6 +174,8 @@ $BOTHY_HOME/
     workers.json        process groups we started
     jobs.json           the schedule
     poll.json           cursors, ETags and seen ids
+    drove-runs.json     Drove runs it started, and where each watch stands
+    drove-attention.json  which items it has told chat about
     checklist.md        the standing checklist, editable by hand or by the agent
     wakes/wakes.jsonl   the durable queue
     homes/              one disposable CODEX_HOME per run
