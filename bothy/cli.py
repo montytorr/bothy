@@ -82,10 +82,21 @@ def build_routes(config: Config) -> list[Route]:
             subject_prefix=entry.get("subject_prefix", ""),
             profile=entry.get("profile"),
             public=bool(entry.get("public", False)),
+            drove=entry.get("drove"),
             signature_header=entry.get("signature_header", "X-Webhook-Signature"),
             timestamp_header=entry.get("timestamp_header", "X-Webhook-Timestamp"),
         ))
     return routes
+
+
+def _has_other_wake_source(config: Config) -> bool:
+    """Whether anything but a webhook route can wake it.
+
+    A daemon that only runs a schedule is a real deployment, and refusing to
+    start it for want of a route made a cron-only install exit 78 and stop.
+    """
+    return bool(config.poll_sources or config.slack_app_token_env or config.discord_bot_token_env
+                or Schedule(config.state_dir / "jobs.json").jobs())
 
 
 def cmd_serve(args: argparse.Namespace, config: Config) -> int:
@@ -96,8 +107,9 @@ def cmd_serve(args: argparse.Namespace, config: Config) -> int:
     except ValueError as exc:
         print(f"bothy: {exc}", flush=True)
         return EX_CONFIG
-    if not routes:
-        print("bothy: no routes configured; there would be nothing to wake on", flush=True)
+    if not routes and not _has_other_wake_source(config):
+        print("bothy: no routes, schedule, poll source or chat configured; there would be "
+              "nothing to wake on", flush=True)
         return EX_CONFIG
     daemon = Daemon(
         config, runner=runner, admission=admission, audit=audit, registry=registry,
@@ -206,6 +218,22 @@ def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
           bool(config.discord_webhook_url or config.slack_webhook_url),
           "a failure nobody hears about is not handled", fatal=False)
 
+    if _uses_drove(config):
+        try:
+            probe = subprocess.run([config.drove_binary, "--help"], capture_output=True, text=True, timeout=20)
+            check("drove present", probe.returncode == 0,
+                  config.drove_binary if probe.returncode == 0 else (probe.stderr.strip() or "non-zero exit")[:160])
+        except Exception as exc:  # noqa: BLE001
+            check("drove present", False, f"{config.drove_binary}: {exc}")
+        repo = config.drove_repo
+        check("drove repo is a git repository",
+              bool(repo) and pathlib.Path(repo, ".git").exists(),
+              repo or "drove_repo is unset: a start is refused unless its action names a repo", fatal=False)
+        if config.drove_attention_interval_seconds:
+            check("drove attention has somewhere to go",
+                  bool(config.discord_webhook_url or config.slack_webhook_url),
+                  "drove_attention_interval_seconds is set; the daemon refuses to start without a webhook")
+
     if config.budget.mode == "subscription":
         observed, resets = runner.rate_limit_position(refresh=args.refresh)
         check("subscription window readable", observed is not None,
@@ -280,6 +308,8 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
                 flags.append("heartbeat")
             if job.profile:
                 flags.append(job.profile)
+            if job.drove:
+                flags.append("drove " + " ".join(f"{k}={v}" for k, v in job.drove.items() if k != "action"))
             if not job.enabled:
                 flags.append("disabled")
             if job.misfires:
@@ -295,10 +325,12 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
         return 0
 
     # add
+    action = _drove_action(args)
     try:
         job = schedule.put(Job(
-            id=args.id, kind=args.kind, spec=args.spec, prompt=args.prompt,
+            id=args.id, kind=args.kind, spec=args.spec, prompt="" if action else args.prompt,
             subject=args.subject, tz=args.tz, heartbeat=args.heartbeat, profile=args.profile,
+            drove=action,
             min_spacing_seconds=args.min_spacing,
             active_hours=[args.active_from, args.active_to] if args.active_from is not None else None,
         ))
@@ -309,6 +341,90 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
         return EX_CONFIG
     print(f"{job.id}: next {job.next_due_at}")
     return 0
+
+
+def _drove_action(args: argparse.Namespace) -> dict[str, Any] | None:
+    """The action named by --drove-* flags, or None when the job is a prompt."""
+    if args.drove_from_cairn:
+        action: dict[str, Any] = {"action": "plan", "from_cairn": args.drove_from_cairn}
+    elif args.drove_next:
+        action = {"action": "plan", "next": args.drove_next}
+    elif args.drove_up:
+        action = {"action": "up", "run": args.drove_up}
+    else:
+        return None
+    if args.drove_repo:
+        action["repo"] = args.drove_repo
+    return action
+
+
+def _uses_drove(config: Config) -> bool:
+    """Whether anything configured would call Drove, so doctor knows to look."""
+    if config.drove_attention_interval_seconds or any(route.get("drove") for route in config.routes):
+        return True
+    return any(job.drove for job in Schedule(config.state_dir / "jobs.json").jobs())
+
+
+def cmd_drove(args: argparse.Namespace, config: Config) -> int:
+    """Start, list and listen to Drove runs by hand, the way the daemon does."""
+    from .drove import ActionError, AttentionForwarder, DroveCli, DroveRuns, parse_action
+
+    runner, _, audit, _ = build(config)
+    cli = DroveCli(binary=config.drove_binary, home=config.drove_home, repo=config.drove_repo,
+                   timeout=config.drove_start_timeout_seconds)
+
+    if args.action == "attention":
+        forwarder = AttentionForwarder(config.state_dir / "drove-attention.json", cli,
+                                       lambda message: False, audit, site=config.site)
+        seen, error = forwarder.view()
+        if args.json:
+            print(json.dumps({"ok": not error, "error": error,
+                              "items": [{"state": state, "item": item} for item, state in seen]}, indent=2))
+        elif error:
+            print(f"bothy: could not read Drove: {error}", flush=True)
+        elif not seen:
+            print("nothing waits on a person")
+        for item, state in ([] if error else seen):
+            if not args.json:
+                print(f"  {state:8} {item['kind']:18} {item['run']}  {item['seat']}  {item['id']}")
+                print(f"           {' '.join(str(item.get('text', '')).split())[:110]}")
+        return 1 if error else 0
+
+    runs = DroveRuns(config.state_dir / "drove-runs.json", cli, audit, runner.alerter,
+                     max_runs=config.drove_max_runs, deadline_seconds=config.drove_run_deadline_seconds,
+                     poll_seconds=config.drove_poll_seconds, repo=config.drove_repo, site=config.site)
+
+    if args.action == "status":
+        records = runs.records()
+        if args.json:
+            print(json.dumps(records, indent=2))
+            return 0
+        if not records:
+            print("no Drove runs started from here")
+        for rec in records:
+            print(f"  {rec['run']:34} {rec['status']:9} {rec.get('planner_state') or '-':10} "
+                  f"{rec.get('target', '?')}  started {rec.get('started_at', '?')}")
+        return 0
+
+    action = _drove_action(args)
+    if action is None:
+        print("bothy: say what to start: --from-cairn REF, --next PROJECT or --up RUN", flush=True)
+        return EX_CONFIG
+    try:
+        parse_action(action)
+    except ActionError as exc:
+        print(f"bothy: {exc}", flush=True)
+        return EX_CONFIG
+    result = runs.start(action, source="cli")
+    if args.json:
+        print(json.dumps(result.as_dict(), indent=2))
+    elif result.status == "started":
+        print(f"started  {result.run}  {parse_action(action).target}")
+        print(f"  watched until it is down or {config.drove_run_deadline_seconds / 3600:g}h pass "
+              f"(the daemon does the watching)")
+    else:
+        print(f"{result.status}  {result.code}: {result.detail}")
+    return 0 if result.status == "started" else 1
 
 
 def cmd_checklist(args: argparse.Namespace, config: Config) -> int:
@@ -440,12 +556,18 @@ def cmd_install(args: argparse.Namespace, config: Config) -> int:
 
     repo = pathlib.Path(__file__).resolve().parent.parent
     target = installer.plan(site=config.site, home=config.home, repo=repo,
-                            user=args.user, kind=args.kind)
+                            user=args.user, kind=args.kind, path=args.path, python=sys.executable)
+    if target.kind == installer.LAUNCHAGENT and _os.geteuid() == 0 and not args.dry_run:
+        # Under sudo it would write root's LaunchAgents and load into root's
+        # session, which is exactly the account that cannot reach what it is for.
+        print("bothy: a launchagent installs into your own account. Run it without sudo.", flush=True)
+        return EX_CONFIG
+    renderers = {installer.LAUNCHD: installer.render_launchd,
+                 installer.LAUNCHAGENT: installer.render_launchagent,
+                 installer.SYSTEMD: installer.render_systemd}
     files = {
         target.wrapper_path: (installer.render_wrapper(target), 0o755),
-        target.unit_path: (
-            installer.render_launchd(target) if target.kind == installer.LAUNCHD
-            else installer.render_systemd(target), 0o644),
+        target.unit_path: (renderers[target.kind](target), 0o644),
     }
     if target.kind == installer.LAUNCHD:
         files[pathlib.Path("/etc/newsyslog.d/bothy.conf")] = (installer.render_newsyslog(target), 0o644)
@@ -459,6 +581,10 @@ def cmd_install(args: argparse.Namespace, config: Config) -> int:
             print(f"  write   {path}  mode {mode:o}")
         print(f"  mkdir   {target.log_dir}")
         print(f"  ensure  {target.env_path}  mode 0600  (secrets; never in the unit)")
+        if target.kind == installer.LAUNCHAGENT:
+            print(f"  python  {target.python}")
+            print(f"  PATH    {target.path}")
+            print(f"  domain  gui/{target.uid}  (your login session; it starts when you log in)")
         for command in commands:
             print(f"  run     {command}")
         print(f"  run     {' '.join(serve)}")
@@ -540,7 +666,10 @@ def cmd_uninstall(args: argparse.Namespace, config: Config) -> int:
     for command in installer.deactivate(target):
         result = _sub.run(command, shell=True, capture_output=True, text=True)  # noqa: S602
         print(f"  {command}  -> {'ok' if result.returncode == 0 else 'skipped'}")
-    for path in (target.unit_path, target.wrapper_path, pathlib.Path("/etc/newsyslog.d/bothy.conf")):
+    leftovers = [target.unit_path, target.wrapper_path]
+    if target.kind == installer.LAUNCHD:
+        leftovers.append(pathlib.Path("/etc/newsyslog.d/bothy.conf"))
+    for path in leftovers:
         try:
             if path.exists():
                 path.unlink()
@@ -626,13 +755,17 @@ def main(argv: list[str] | None = None) -> int:
     install_cmd = subparsers.add_parser("install", help="install as a service; headless and idempotent")
     install_cmd.add_argument("--dry-run", action="store_true", help="print what it would do and stop")
     install_cmd.add_argument("--print-files", action="store_true", help="with --dry-run, show file contents")
-    install_cmd.add_argument("--kind", choices=["launchd", "systemd"], default=None)
+    install_cmd.add_argument("--kind", choices=["launchd", "launchagent", "systemd"], default=None,
+                             help="launchagent installs into your own account, with no sudo, and runs "
+                                  "in your login session")
     install_cmd.add_argument("--user", default=None, help="account the service runs as")
+    install_cmd.add_argument("--path", default=None,
+                             help="launchagent only: the PATH the service gets; defaults to this shell's")
     install_cmd.add_argument("--serve", action="store_true", help="also run 'tailscale serve' now")
     install_cmd.set_defaults(func=cmd_install)
 
     uninstall_cmd = subparsers.add_parser("uninstall", help="remove the service")
-    uninstall_cmd.add_argument("--kind", choices=["launchd", "systemd"], default=None)
+    uninstall_cmd.add_argument("--kind", choices=["launchd", "launchagent", "systemd"], default=None)
     uninstall_cmd.add_argument("--user", default=None)
     uninstall_cmd.add_argument("--purge", action="store_true", help="also remove state and the secrets file")
     uninstall_cmd.set_defaults(func=cmd_uninstall)
@@ -665,11 +798,30 @@ def main(argv: list[str] | None = None) -> int:
     schedule.add_argument("--profile", default=None, help="capability profile for this job")
     schedule.add_argument("--heartbeat", action="store_true",
                           help="carry the standing checklist and honour NO_REPLY")
+    drove_what = schedule.add_mutually_exclusive_group()
+    drove_what.add_argument("--drove-from-cairn", default=None, metavar="REF",
+                            help="start a Drove run on this Cairn task instead of waking Codex")
+    drove_what.add_argument("--drove-next", default=None, metavar="PROJECT",
+                            help="start a Drove run on the top task of this Cairn project")
+    drove_what.add_argument("--drove-up", default=None, metavar="RUN",
+                            help="resume this Drove run")
+    schedule.add_argument("--drove-repo", default=None,
+                          help="the repository a started run is bound to; defaults to drove_repo")
     schedule.add_argument("--min-spacing", type=float, default=60.0)
     schedule.add_argument("--active-from", type=int, default=None)
     schedule.add_argument("--active-to", type=int, default=None)
     schedule.add_argument("--json", action="store_true")
     schedule.set_defaults(func=cmd_schedule)
+
+    drove = subparsers.add_parser("drove", help="start, list and listen to Drove runs, no model involved")
+    drove.add_argument("action", choices=["start", "status", "attention"])
+    drove_start = drove.add_mutually_exclusive_group()
+    drove_start.add_argument("--from-cairn", dest="drove_from_cairn", default=None, metavar="REF")
+    drove_start.add_argument("--next", dest="drove_next", default=None, metavar="PROJECT")
+    drove_start.add_argument("--up", dest="drove_up", default=None, metavar="RUN")
+    drove.add_argument("--repo", dest="drove_repo", default=None, help="defaults to drove_repo")
+    drove.add_argument("--json", action="store_true")
+    drove.set_defaults(func=cmd_drove)
 
     checklist = subparsers.add_parser("checklist", help="the standing checklist a heartbeat carries")
     checklist.add_argument("--set", default=None, help="replace it; '-' reads stdin")

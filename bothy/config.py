@@ -101,6 +101,28 @@ class Config:
     cairn_binary: str = "cairn"
     cairn_agent: str = "bothy"
     cairn_project: str | None = None
+    # Drove, run as a plain process: no model turn, so none of the worker
+    # settings above apply to it. A run is bound to the folder it is started in,
+    # so there is deliberately no default repo: a daemon's working directory is
+    # Bothy's own checkout, and guessing it would plan work against Bothy.
+    drove_binary: str = "drove"
+    drove_repo: str | None = None
+    # Left unset, Drove uses its own default. Set it when a person answers items
+    # as another user: every command that touches a run must share one.
+    drove_home: str | None = None
+    # A start returns at once in the normal case; this is the ceiling on one
+    # that does not, after which the outcome is reported as unknown.
+    drove_start_timeout_seconds: float = 120.0
+    # How long Bothy watches a run it started. Past it, Bothy stops watching and
+    # says so; it does not stop the run.
+    drove_run_deadline_seconds: float = 21600.0
+    drove_poll_seconds: float = 60.0
+    # Drove's spend is not in Bothy's budget, so the number of runs it may have
+    # going is the cap. One is the safe number on a machine nobody is watching.
+    drove_max_runs: int = 1
+    # null: not forwarded. Set to a number of seconds to send what needs a
+    # person to the webhook alerter below, once each.
+    drove_attention_interval_seconds: float | None = None
     # where a human finds out
     discord_webhook_url: str | None = None
     slack_webhook_url: str | None = None
@@ -183,6 +205,14 @@ class Config:
             "routes": [r.get("path") for r in self.routes],
             "cairn_agent": self.cairn_agent,
             "cairn_project": self.cairn_project,
+            "drove": {
+                "binary": self.drove_binary,
+                "repo": self.drove_repo,
+                "max_runs": self.drove_max_runs,
+                "run_deadline_seconds": self.drove_run_deadline_seconds,
+                "attention": f"every {self.drove_attention_interval_seconds:g}s"
+                             if self.drove_attention_interval_seconds else "not forwarded",
+            },
             "discord_webhook": "configured" if self.discord_webhook_url else "not configured",
             "slack_webhook": "configured" if self.slack_webhook_url else "not configured",
         }

@@ -52,7 +52,9 @@ _SLACK_LIMIT = 7900     # below 8000
 
 
 class AlertSink(Protocol):
-    def alert(self, message: str) -> None: ...
+    def alert(self, message: str) -> bool | None:
+        """Deliver a message. False means it did not arrive; None means no opinion."""
+        ...
 
 
 # --------------------------------------------------------------------------
@@ -153,8 +155,9 @@ def _chunks(text: str, limit: int) -> list[str]:
 class StderrSink:
     """Always available, never the only sink in production."""
 
-    def alert(self, message: str) -> None:
+    def alert(self, message: str) -> bool | None:
         print(f"[bothy][alert] {message}", file=sys.stderr, flush=True)
+        return None     # a terminal nobody may be watching is not a delivery
 
 
 class DiscordWebhookSink:
@@ -165,13 +168,14 @@ class DiscordWebhookSink:
         self.timeout = timeout
         self.last_error: str | None = None
 
-    def alert(self, message: str) -> None:
+    def alert(self, message: str) -> bool:
         for part in _chunks(message, _DISCORD_LIMIT):
             ok, detail = _post_json(self.url, {"content": part}, timeout=self.timeout)
             if not ok:
                 self.last_error = detail
                 print(f"[bothy][alert-failed][discord] {detail}", file=sys.stderr, flush=True)
-                return
+                return False
+        return True
 
 
 class SlackWebhookSink:
@@ -182,13 +186,14 @@ class SlackWebhookSink:
         self.timeout = timeout
         self.last_error: str | None = None
 
-    def alert(self, message: str) -> None:
+    def alert(self, message: str) -> bool:
         for part in _chunks(message, _SLACK_LIMIT):
             ok, detail = _post_json(self.url, {"text": part}, timeout=self.timeout)
             if not ok:
                 self.last_error = detail
                 print(f"[bothy][alert-failed][slack] {detail}", file=sys.stderr, flush=True)
-                return
+                return False
+        return True
 
 
 class CompositeSink:
@@ -197,12 +202,18 @@ class CompositeSink:
     def __init__(self, *sinks: AlertSink) -> None:
         self.sinks = list(sinks)
 
-    def alert(self, message: str) -> None:
+    def alert(self, message: str) -> bool | None:
+        """True if any sink delivered, False if one tried and none did, else None."""
+        results: list[bool | None] = []
         for sink in self.sinks:
             try:
-                sink.alert(message)
+                results.append(sink.alert(message))
             except Exception as exc:  # noqa: BLE001
                 print(f"[bothy][alert-failed] {type(sink).__name__}: {exc}", file=sys.stderr, flush=True)
+                results.append(False)
+        if any(result is True for result in results):
+            return True
+        return False if any(result is False for result in results) else None
 
 
 class Alerter:
@@ -255,3 +266,12 @@ class Alerter:
     def say(self, message: str) -> None:
         """Unconditional, unsuppressed. For things a human asked for."""
         self.sink.alert(message)
+
+    def deliver(self, message: str) -> bool:
+        """Unconditional, and says whether it arrived.
+
+        For a caller that keeps the thing until somebody has heard it. ``say``
+        cannot serve that caller: it swallows a failed delivery, so the caller
+        would record "told" for a message that went nowhere.
+        """
+        return self.sink.alert(message) is not False

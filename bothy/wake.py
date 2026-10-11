@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import clock, ids, tailnet
+from .drove import ActionError, check_action, resolve_action
 from .ratelimit import RateLimiter
 from .vendor.a2a_reactor.queue import append_event, read_queue, write_queue
 
@@ -165,6 +166,9 @@ class Route:
     public: bool = False
     signature_header: str = "X-Webhook-Signature"
     timestamp_header: str = "X-Webhook-Timestamp"
+    # An action for Drove instead of a prompt. Fixed here, in config. The payload
+    # may supply one value to it ({"payload": "dotted.path"}) and nothing else.
+    drove: dict[str, Any] | None = None
     delivery_headers: tuple[str, ...] = (
         "X-Webhook-Delivery-Id",
         "X-GitHub-Delivery",
@@ -178,6 +182,11 @@ class Route:
             # Refusing at construction means the daemon cannot start with an
             # unsecured door, which is the only time this is cheap to fix.
             raise ValueError(f"route {self.path} has no secret; refusing to listen on an unsigned endpoint")
+        if self.drove is not None:
+            try:
+                check_action(self.drove)
+            except ActionError as exc:
+                raise ValueError(f"route {self.path}: {exc}") from exc
 
     def subject(self, payload: dict[str, Any], fallback: str) -> str:
         if not self.subject_from:
@@ -422,6 +431,14 @@ class _Handler(BaseHTTPRequestHandler):
             "profile": route.profile,
             "processed": False,
         }
+        if route.drove is not None:
+            try:
+                # Beside the payload, never inside it: the payload is the
+                # sender's, and an action must only ever come from our config.
+                event["drove"] = resolve_action(route.drove, payload)
+            except ActionError as exc:
+                self._reply(HTTPStatus.UNPROCESSABLE_ENTITY, {"ok": False, "error": str(exc)})
+                return
 
         try:
             # Durable BEFORE the ack. If this raises, we must not say "accepted".

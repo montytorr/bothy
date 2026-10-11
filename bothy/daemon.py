@@ -48,6 +48,7 @@ from .proc import ProcessRegistry
 from .retention import RetentionPolicy, sweep
 from .runner import Runner
 from .poll import PollState, Poller, Source
+from .drove import AttentionForwarder, DroveCli, DroveRuns, reaction_for
 from .schedule import Job, Schedule, strip_no_reply
 from .vendor.a2a_reactor.lease import LeaseBusy, reactor_lease
 from .ratelimit import RateLimiter
@@ -108,6 +109,25 @@ class Daemon:
         self.poller = Poller(PollState(config.state_dir / "poll.json"))
         self.sources = [Source(**entry) for entry in config.poll_sources]
         self._next_poll: dict[str, float] = {}
+        # Drove is run as a process and answers on its own clock, so it has its
+        # own loop rather than a place in the drain, which holds a lease while a
+        # Codex run is in flight and would put a start behind it.
+        self.drove_cli = DroveCli(binary=config.drove_binary, home=config.drove_home,
+                                  repo=config.drove_repo, timeout=config.drove_start_timeout_seconds)
+        self.drove_runs = DroveRuns(
+            config.state_dir / "drove-runs.json", self.drove_cli, audit, alerter,
+            max_runs=config.drove_max_runs, deadline_seconds=config.drove_run_deadline_seconds,
+            poll_seconds=config.drove_poll_seconds, repo=config.drove_repo, site=config.site,
+        )
+        self.attention: AttentionForwarder | None = None
+        if config.drove_attention_interval_seconds:
+            self.attention = AttentionForwarder(
+                config.state_dir / "drove-attention.json", self.drove_cli,
+                lambda message: alerter.deliver(message), audit, site=config.site, alerter=alerter,
+            )
+        self._next_attention = 0.0
+        self._attention_error = ""
+        self._drove_wanted = threading.Event()
         self.checklist_path = config.state_dir / "checklist.md"
         self.lock = InstanceLock(config.state_dir / "bothy.lock")
         self.ledger = LifecycleLedger(config.state_dir / "lifecycle.json")
@@ -158,6 +178,7 @@ class Daemon:
                   "delivery_key": event.get("delivery_key")},
         )
         self._drain_wanted.set()
+        self._drove_wanted.set()
 
     def _checklist(self) -> str:
         """The standing checklist a heartbeat carries.
@@ -213,6 +234,8 @@ class Daemon:
                 for event in self.store.pending():
                     if self._stopping.is_set():
                         break
+                    if isinstance(event.get("drove"), dict):
+                        continue        # Drove's, and handled by drove_wakes
                     subject = str(event.get("subject") or event["id"])
 
                     if subject in busy_lanes or pool_exhausted:
@@ -269,6 +292,19 @@ class Daemon:
         eventually disagree with the first, and the disagreement would be found
         in production.
         """
+        if job.drove:
+            wake_id = ids_wake_id()
+            self.store.append({
+                "id": wake_id, "received_at": clock.iso(), "route": f"schedule:{job.id}",
+                "subject": job.lane(), "delivery_key": f"job:{job.id}:{wake_id}",
+                "payload": {"job": job.id}, "drove": job.drove, "processed": False,
+            })
+            self.audit.append(kind="schedule", action="fired", subject=job.lane(),
+                              data={"job": job.id, "wake": wake_id, "kind": job.kind,
+                                    "spec": job.spec, "misfires": job.misfires, "drove": True})
+            self._drove_wanted.set()
+            return wake_id
+
         prompt = job.prompt
         if job.heartbeat:
             checklist = self._checklist()
@@ -359,6 +395,81 @@ class Daemon:
                 self.audit.append(kind="poll", action="failed", status="failed",
                                   data={"error": f"{type(exc).__name__}: {exc}"})
             self._stopping.wait(timeout=15.0)
+
+    # ---- Drove ----------------------------------------------------------
+
+    def drove_wakes(self) -> int:
+        """Start what the pending Drove wakes ask for. Returns how many were settled.
+
+        A refusal is settled and recorded rather than retried: Drove said why,
+        and asking again says the same. Only the codes that can clear on their
+        own (herdr not running yet, no free slot) wait, and they wait under the
+        same attempt counter and age limit as every other wake.
+        """
+        handled = 0
+        for event in self.store.pending():
+            raw = event.get("drove")
+            if not isinstance(raw, dict):
+                continue
+            if self._stopping.is_set():
+                break
+            if self._too_old(event) or self._too_many_attempts(event):
+                continue
+            route = str(event.get("route", "?"))
+            result = self.drove_runs.start(raw, wake=event["id"], source=route)
+            if result.transient:
+                self._defer(event, gate=result.code, reason=result.detail)
+                continue
+            self.store.mark(event["id"], processed=True, processed_at=clock.iso(),
+                            outcome=result.status, drove_run=result.run, drove_code=result.code)
+            # Already running is the intended answer to a second trigger, and it
+            # is in the audit; every other refusal is a run somebody expected.
+            if result.status != "started" and result.code != "already_running":
+                self.alerter.incident(
+                    job=f"drove:{route}", severity="warning",
+                    error=f"Drove did not start ({result.code}): {result.detail}",
+                    detail={"subject": str(event.get("subject") or event["id"])},
+                    reaction=reaction_for(result),
+                )
+            handled += 1
+        return handled
+
+    def _attend(self) -> None:
+        """One pass over what Drove says needs a person."""
+        assert self.attention is not None
+        result = self.attention.poll()
+        interval = float(self.config.drove_attention_interval_seconds or 60.0)
+        # Like a poll source: a failing read backs off but is never abandoned.
+        self._next_attention = clock.monotonic() + interval * (4 if result.status == "failed" else 1)
+        if result.status == "failed":
+            self._attention_error = result.detail
+            self.audit.append(kind="drove", action="attention-failed", status="failed", data=result.as_dict())
+            self.alerter.incident(
+                job="drove:attention", error=result.detail, severity="warning",
+                reaction="bothy drove attention shows what it read; drove attention --all --json is the source",
+            )
+        elif self._attention_error:
+            self.alerter.resolved(job="drove:attention", error=self._attention_error)
+            self._attention_error = ""
+
+    def drove_once(self) -> None:
+        """Start, watch and listen once. Each part keeps its own clock."""
+        self.drove_wakes()
+        self.drove_runs.tick()
+        if self.attention is not None and clock.monotonic() >= self._next_attention:
+            self._attend()
+
+    def _drove_loop(self) -> None:
+        while not self._stopping.is_set():
+            try:
+                self.drove_once()
+            except Exception as exc:  # noqa: BLE001 - one bad pass must not end the watch
+                self.audit.append(kind="drove", action="failed", status="failed",
+                                  data={"error": f"{type(exc).__name__}: {exc}"})
+                self.alerter.incident(job="drove", error=str(exc), severity="warning",
+                                      reaction="bothy audit | tail; the loop survived but a pass was lost")
+            self._drove_wanted.wait(timeout=10.0)
+            self._drove_wanted.clear()
 
     def _defer(self, event: dict[str, Any], *, gate: str, reason: str) -> None:
         """Record that a wake waited, and how long it has been waiting.
@@ -520,6 +631,13 @@ class Daemon:
 
     def start(self, *, reap: bool = False) -> None:
         """Acquire the state directory and begin. Raises rather than guessing."""
+        if self.attention is not None and not (self.config.discord_webhook_url
+                                               or self.config.slack_webhook_url):
+            raise RuntimeError(
+                "drove_attention_interval_seconds is set but neither discord_webhook_url nor "
+                "slack_webhook_url is. Items would be read and told to nobody. "
+                "Refusing to start half-connected."
+            )
         self.config.ensure_dirs()
         self.lock.acquire()
 
@@ -627,7 +745,8 @@ class Daemon:
         for target, name in ((self._drain_loop, "bothy-drain"),
                              (self._janitor_loop, "bothy-janitor"),
                              (self._schedule_loop, "bothy-schedule"),
-                             (self._poll_loop, "bothy-poll")):
+                             (self._poll_loop, "bothy-poll"),
+                             (self._drove_loop, "bothy-drove")):
             thread = threading.Thread(target=target, name=name, daemon=True)
             thread.start()
             self._threads.append(thread)
@@ -638,6 +757,7 @@ class Daemon:
                                 "routes": [route.path for route in self.routes],
                                 "public_routes": [r.path for r in self.routes if r.public],
                                 "poll_sources": [s.name for s in self.sources],
+                                "drove_attention": self.attention is not None,
                                 "pool": self.config.pool.max_workers,
                                 "budget_mode": self.config.budget.mode})
         self.beat(state="running")
@@ -650,6 +770,7 @@ class Daemon:
             return
         self._stopping.set()
         self._drain_wanted.set()
+        self._drove_wanted.set()
         if self.discord is not None:
             self.discord.listener.stop()
         if self.slack is not None:

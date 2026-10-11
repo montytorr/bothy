@@ -54,6 +54,7 @@ from typing import Any
 
 from . import clock
 from .cronspec import CronError, CronSpec
+from .drove import ActionError, parse_action
 
 __all__ = ["Job", "Schedule", "NO_REPLY", "strip_no_reply", "ScheduleError"]
 
@@ -97,7 +98,7 @@ class Job:
     id: str
     kind: str                       # at | every | cron
     spec: str                       # ISO instant | seconds | five cron fields
-    prompt: str
+    prompt: str = ""
     subject: str | None = None
     enabled: bool = True
     tz: str = "UTC"
@@ -105,6 +106,8 @@ class Job:
     min_spacing_seconds: float = 60.0
     heartbeat: bool = False                    # append the standing checklist
     profile: str | None = None                 # capability bundle; None = built-ins only
+    # An action for Drove instead of a prompt: no model turn, no Codex. See drove.py.
+    drove: dict[str, Any] | None = None
     last_fired_at: str | None = None
     next_due_at: str | None = None
     misfires: int = 0
@@ -236,6 +239,11 @@ class Schedule:
         """Add or replace a job, validating it now rather than at fire time."""
         job.compute_next()          # raises ScheduleError on a bad spec
         job.zone()
+        if job.drove is not None:
+            try:
+                parse_action(job.drove)     # literal only: a job has no payload to read from
+            except ActionError as exc:
+                raise ScheduleError(f"job {job.id}: {exc}") from exc
         with self._lock:
             data = self._load()
             if job.next_due_at is None:
