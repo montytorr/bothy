@@ -8,7 +8,7 @@
 *Runs Codex under supervision. Remembers in Cairn.*
 *Speaks up when it needs you. Closed to everything but the tailnet.*
 
-`stdlib only` · `no virtualenv` · `no build step` · `~9.5k lines` · `260 tests`
+`stdlib only` · `no virtualenv` · `no build step` · `~9.5k lines` · `271 tests`
 
 </div>
 
@@ -194,6 +194,9 @@ sudo bin/bothy install --serve       # launchd or systemd, + tailscale serve
 bin/bothy funnel                     # the tailscale commands your config implies
 ```
 
+On a Mac you sit at, `bin/bothy install --kind launchagent` installs into your
+own account instead, with no sudo, so it can reach your login session.
+
 One command, no prompts, no TTY, idempotent, non-zero on failure. The exit code
 is a contract — `75` restart me, `78` stop — and the two service managers need
 **opposite** handling of it, which is in [docs/OPERATING.md](docs/OPERATING.md).
@@ -223,7 +226,7 @@ make check     # quiet, non-zero on failure
 make test      # verbose
 ```
 
-**260 tests, standard library `unittest`.** They assert *properties*, and each
+**271 tests, standard library `unittest`.** They assert *properties*, and each
 was demonstrated by hand against the real thing — real Codex, the real GitHub
 API, a real systemd install — **before** being written down. The tests are
 recorded evidence, not a guess at what the code does.

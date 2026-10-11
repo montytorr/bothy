@@ -52,13 +52,22 @@ Every release states its **Breaking Changes** heading even when it is empty.
   for the boot and `ps` start time for the pid fingerprint, and the lifecycle
   ledger reads the same boot id, so a reboot can be told from a crash there too.
   Linux is unchanged.
+- **`bothy install --kind launchagent`**: a per-user LaunchAgent for a Mac you sit
+  at. No sudo, loaded into your `gui/<uid>` domain, so it can reach your herdr
+  server, your Keychain login and `~/.local/bin`, which a system LaunchDaemon
+  cannot. `--dry-run` shows the PATH and interpreter it will write; `uninstall
+  --kind launchagent` removes it. It starts at login, not at boot. The daemon
+  stays the default for an unattended machine.
+- **A schedule alone is a reason to run.** `bothy serve` refused to start with no
+  webhook route and exited 78, which made a cron-only install stop. Routes,
+  scheduled jobs, poll sources and chat each count.
 - `Alerter.deliver` and a delivery result from the webhook sinks, so a caller
   that must be heard can tell a message that arrived from one that did not.
 - **Hash-chained audit log**, verifiable across rotation, joinable by one run id.
 - **Two doors:** tailnet-only routes and public routes on separate ports, with
   tailscaled-verified callers and rate limiting ahead of signature checks.
 - **Headless install** for launchd and systemd, with the 75/78 exit contract.
-- 260 tests, standard library only.
+- 271 tests, standard library only.
 
 ### Breaking Changes
 - None. First release.

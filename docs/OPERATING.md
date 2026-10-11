@@ -151,6 +151,44 @@ and names them. Clear them with:
 bothy reap    # kills leftover process groups and releases their budget
 ```
 
+## On a Mac you sit at: a LaunchAgent
+
+The default macOS install is a **LaunchDaemon**: it starts at boot with nobody
+logged in, which is right for a client's unattended mini and wrong for anything
+that needs your session. A daemon has no GUI session, so it cannot reach the
+herdr server you started, the Claude login in your Keychain, or `~/.local/bin`.
+For a machine you use, install a per-user **LaunchAgent** instead. No sudo:
+
+```bash
+bin/bothy install --kind launchagent --dry-run   # what it will write, with the PATH and interpreter
+bin/bothy install --kind launchagent
+bin/bothy uninstall --kind launchagent           # state and secrets are left alone unless --purge
+```
+
+It writes `~/Library/LaunchAgents/dev.bothy.<site>.plist`, a launcher at
+`$BOTHY_HOME/bothy-run`, a `0600` `$BOTHY_HOME/bothy.env` for secrets and logs to
+`~/Library/Logs/bothy/bothy.log`, and loads itself into `gui/<your uid>`.
+
+- **It starts when you log in, not when the machine boots**, and stops when you
+  log out. A power cut leaves it down until someone logs in.
+- **PATH is the PATH of the shell that ran the installer**, minus directories that
+  do not exist, so `drove`, `herdr`, `node`, `claude` and `cairn` are found. It is
+  printed by `--dry-run` and written into the plist. Pass `--path` to give another.
+  The interpreter is the one that ran the installer, written into the launcher.
+- **Run it from a login that has the session** (a terminal on the Mac, or ssh into
+  an account that is logged in at the console). With no GUI session there is no
+  `gui/<uid>` domain to load into and `launchctl bootstrap` says so.
+- **Run it without sudo.** Under sudo it would load into root's session, which is
+  the account this exists to avoid; it refuses.
+- **No log rotation**: `newsyslog` needs root. The log is a few lines per wake, but
+  look at its size now and then.
+- It does not wait for `tailscaled`. Bothy binds loopback either way; `tailscale
+  serve` is a separate command (`bothy funnel`).
+
+Logs and state are read the same way as under a daemon: `bothy status`,
+`bothy audit`, `tail -f ~/Library/Logs/bothy/bothy.log`, and restart with
+`launchctl kickstart -k gui/$(id -u)/dev.bothy.<site>`.
+
 ## Upgrading
 
 ```bash

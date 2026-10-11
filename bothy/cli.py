@@ -89,6 +89,16 @@ def build_routes(config: Config) -> list[Route]:
     return routes
 
 
+def _has_other_wake_source(config: Config) -> bool:
+    """Whether anything but a webhook route can wake it.
+
+    A daemon that only runs a schedule is a real deployment, and refusing to
+    start it for want of a route made a cron-only install exit 78 and stop.
+    """
+    return bool(config.poll_sources or config.slack_app_token_env or config.discord_bot_token_env
+                or Schedule(config.state_dir / "jobs.json").jobs())
+
+
 def cmd_serve(args: argparse.Namespace, config: Config) -> int:
     """Run the daemon in the foreground, for a real supervisor to own."""
     runner, admission, audit, registry = build(config)
@@ -97,8 +107,9 @@ def cmd_serve(args: argparse.Namespace, config: Config) -> int:
     except ValueError as exc:
         print(f"bothy: {exc}", flush=True)
         return EX_CONFIG
-    if not routes:
-        print("bothy: no routes configured; there would be nothing to wake on", flush=True)
+    if not routes and not _has_other_wake_source(config):
+        print("bothy: no routes, schedule, poll source or chat configured; there would be "
+              "nothing to wake on", flush=True)
         return EX_CONFIG
     daemon = Daemon(
         config, runner=runner, admission=admission, audit=audit, registry=registry,
@@ -545,12 +556,18 @@ def cmd_install(args: argparse.Namespace, config: Config) -> int:
 
     repo = pathlib.Path(__file__).resolve().parent.parent
     target = installer.plan(site=config.site, home=config.home, repo=repo,
-                            user=args.user, kind=args.kind)
+                            user=args.user, kind=args.kind, path=args.path, python=sys.executable)
+    if target.kind == installer.LAUNCHAGENT and _os.geteuid() == 0 and not args.dry_run:
+        # Under sudo it would write root's LaunchAgents and load into root's
+        # session, which is exactly the account that cannot reach what it is for.
+        print("bothy: a launchagent installs into your own account. Run it without sudo.", flush=True)
+        return EX_CONFIG
+    renderers = {installer.LAUNCHD: installer.render_launchd,
+                 installer.LAUNCHAGENT: installer.render_launchagent,
+                 installer.SYSTEMD: installer.render_systemd}
     files = {
         target.wrapper_path: (installer.render_wrapper(target), 0o755),
-        target.unit_path: (
-            installer.render_launchd(target) if target.kind == installer.LAUNCHD
-            else installer.render_systemd(target), 0o644),
+        target.unit_path: (renderers[target.kind](target), 0o644),
     }
     if target.kind == installer.LAUNCHD:
         files[pathlib.Path("/etc/newsyslog.d/bothy.conf")] = (installer.render_newsyslog(target), 0o644)
@@ -564,6 +581,10 @@ def cmd_install(args: argparse.Namespace, config: Config) -> int:
             print(f"  write   {path}  mode {mode:o}")
         print(f"  mkdir   {target.log_dir}")
         print(f"  ensure  {target.env_path}  mode 0600  (secrets; never in the unit)")
+        if target.kind == installer.LAUNCHAGENT:
+            print(f"  python  {target.python}")
+            print(f"  PATH    {target.path}")
+            print(f"  domain  gui/{target.uid}  (your login session; it starts when you log in)")
         for command in commands:
             print(f"  run     {command}")
         print(f"  run     {' '.join(serve)}")
@@ -645,7 +666,10 @@ def cmd_uninstall(args: argparse.Namespace, config: Config) -> int:
     for command in installer.deactivate(target):
         result = _sub.run(command, shell=True, capture_output=True, text=True)  # noqa: S602
         print(f"  {command}  -> {'ok' if result.returncode == 0 else 'skipped'}")
-    for path in (target.unit_path, target.wrapper_path, pathlib.Path("/etc/newsyslog.d/bothy.conf")):
+    leftovers = [target.unit_path, target.wrapper_path]
+    if target.kind == installer.LAUNCHD:
+        leftovers.append(pathlib.Path("/etc/newsyslog.d/bothy.conf"))
+    for path in leftovers:
         try:
             if path.exists():
                 path.unlink()
@@ -731,13 +755,17 @@ def main(argv: list[str] | None = None) -> int:
     install_cmd = subparsers.add_parser("install", help="install as a service; headless and idempotent")
     install_cmd.add_argument("--dry-run", action="store_true", help="print what it would do and stop")
     install_cmd.add_argument("--print-files", action="store_true", help="with --dry-run, show file contents")
-    install_cmd.add_argument("--kind", choices=["launchd", "systemd"], default=None)
+    install_cmd.add_argument("--kind", choices=["launchd", "launchagent", "systemd"], default=None,
+                             help="launchagent installs into your own account, with no sudo, and runs "
+                                  "in your login session")
     install_cmd.add_argument("--user", default=None, help="account the service runs as")
+    install_cmd.add_argument("--path", default=None,
+                             help="launchagent only: the PATH the service gets; defaults to this shell's")
     install_cmd.add_argument("--serve", action="store_true", help="also run 'tailscale serve' now")
     install_cmd.set_defaults(func=cmd_install)
 
     uninstall_cmd = subparsers.add_parser("uninstall", help="remove the service")
-    uninstall_cmd.add_argument("--kind", choices=["launchd", "systemd"], default=None)
+    uninstall_cmd.add_argument("--kind", choices=["launchd", "launchagent", "systemd"], default=None)
     uninstall_cmd.add_argument("--user", default=None)
     uninstall_cmd.add_argument("--purge", action="store_true", help="also remove state and the secrets file")
     uninstall_cmd.set_defaults(func=cmd_uninstall)
