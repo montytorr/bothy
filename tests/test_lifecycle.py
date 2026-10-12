@@ -259,13 +259,13 @@ class ServeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(tempfile.mkdtemp())
 
-    def serve(self) -> int:
+    def serve(self, **settings: object) -> int:
         from bothy.cli import cmd_serve
         from bothy.config import Config
 
         import argparse
 
-        config = Config(home=self.home)
+        config = Config(home=self.home, **settings)
         with mock.patch("bothy.daemon.Daemon.run_forever", return_value=0), \
                 contextlib.redirect_stdout(io.StringIO()):
             return cmd_serve(argparse.Namespace(reap=False), config)
@@ -280,6 +280,18 @@ class ServeTests(unittest.TestCase):
         Schedule(self.home / "state" / "jobs.json").put(
             Job(id="n", kind="cron", spec="0 2 * * *", drove={"action": "plan", "next": "DROVE"}))
         self.assertEqual(self.serve(), 0)
+
+    def test_forwarding_drove_attention_to_a_webhook_alone_is_enough_to_start(self) -> None:
+        self.assertEqual(self.serve(drove_attention_interval_seconds=30.0,
+                                    discord_webhook_url="http://127.0.0.1:1/x"), 0)
+        self.assertEqual(self.serve(drove_attention_interval_seconds=30.0,
+                                    slack_webhook_url="http://127.0.0.1:1/x"), 0)
+
+    def test_attention_with_nowhere_to_tell_it_is_still_nothing_to_wake_on(self) -> None:
+        self.assertEqual(self.serve(drove_attention_interval_seconds=30.0), EX_CONFIG)
+
+    def test_a_webhook_without_attention_is_still_nothing_to_wake_on(self) -> None:
+        self.assertEqual(self.serve(discord_webhook_url="http://127.0.0.1:1/x"), EX_CONFIG)
 
 
 if __name__ == "__main__":

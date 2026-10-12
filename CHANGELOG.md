@@ -56,6 +56,11 @@ Every release states its **Breaking Changes** heading even when it is empty.
   channel-confirm, codex-version-mismatch, usage-limit, gone, question, asking,
   blocked, promote, pane-budget) has its own wording, and a kind Drove adds later
   falls back to the item's own text. Other sinks get the same words as plain text.
+- **A daemon that only forwards Drove's attention starts (BOTHY-21).** With
+  `drove_attention_interval_seconds` and a webhook set and nothing else, it
+  exited 78 ("nothing to wake on") and launchd did not restart it. Forwarding to
+  a webhook now counts as something to do; the interval with no webhook still
+  does not, and an empty config still exits 78.
 - **Bothy's own alerts are drawn the same way.** Jobs failing, a run going down,
   a refused Drove start, a lost loop pass, a dropped Slack or Discord connection
   and the heartbeat go through the same embed and blocks: "Bothy · the cairn

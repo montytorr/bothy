@@ -93,10 +93,14 @@ def _has_other_wake_source(config: Config) -> bool:
     """Whether anything but a webhook route can wake it.
 
     A daemon that only runs a schedule is a real deployment, and refusing to
-    start it for want of a route made a cron-only install exit 78 and stop.
+    start it for want of a route made a cron-only install exit 78 and stop. So
+    did one that only forwards Drove's attention items to a webhook, which is a
+    loop of its own (it needs a webhook to tell, so it counts only with one).
     """
+    forwards_drove = bool(config.drove_attention_interval_seconds
+                          and (config.discord_webhook_url or config.slack_webhook_url))
     return bool(config.poll_sources or config.slack_app_token_env or config.discord_bot_token_env
-                or Schedule(config.state_dir / "jobs.json").jobs())
+                or forwards_drove or Schedule(config.state_dir / "jobs.json").jobs())
 
 
 def cmd_serve(args: argparse.Namespace, config: Config) -> int:
