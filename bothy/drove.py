@@ -312,6 +312,9 @@ def reaction_for(result: StartResult) -> str:
         "herdr-down": "Start herdr on this machine; Drove opens a workspace in it and never starts it.",
         "no-task": "That Cairn task or project has nothing to take; cairn show it.",
         "task-closed": "That Cairn task is closed; Drove will not plan a closed task.",
+        "cairn": ("Drove could not read Cairn from this process, which has no key of its own: "
+                  "pair one for Bothy, set CAIRN_AGENT to its name in bothy.env, restart; "
+                  "cairn show the ref by hand to see Cairn's own error."),
         "no-repo": "Set drove_repo in config.json, or give the action a repo.",
         "not-a-repo": "drove_repo (or the action's repo) is not a git repository.",
         "not-down": "That run still has a live pane. drove roster --run ID.",

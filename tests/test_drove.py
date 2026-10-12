@@ -28,7 +28,7 @@ from bothy.config import Config
 from bothy.daemon import Daemon
 from bothy.drove import (
     MAX_DELIVERY_ATTEMPTS, MAX_SENDS_PER_POLL, UNKNOWN_ALERT_AFTER, ActionError, AttentionForwarder,
-    DroveCli, DroveRuns, check_action, format_item, parse_action, resolve_action,
+    DroveCli, DroveRuns, StartResult, check_action, format_item, parse_action, reaction_for, resolve_action,
 )
 from bothy.pool import Admission, PoolPolicy
 from bothy.proc import ProcessRegistry
@@ -284,6 +284,17 @@ class CliTests(FakeDroveMixin, unittest.TestCase):
         self.assertEqual((records[0]["action"], records[0]["status"]), ("refused", "refused"))
         self.assertEqual(records[0]["data"]["code"], "herdr-down")
         self.assertEqual(self.runs().watching(), [], "nothing is watched for a run that never began")
+
+    def test_a_cairn_refusal_says_the_process_has_no_key_not_run_drove_by_hand(self) -> None:
+        """The first live run failed here: a launchd job has no runtime for Cairn to detect."""
+        self.reply("plan", refusal("cairn", "could not read Cairn task DROVE-110: CAIRN_API_KEY is not set"))
+        result = self.runs().start({"action": "plan", "from_cairn": "DROVE-110"})
+        self.assertEqual((result.status, result.code), ("refused", "cairn"))
+        self.assertFalse(result.transient, "a missing key does not clear by waiting")
+        said = reaction_for(result)
+        self.assertIn("CAIRN_AGENT", said)
+        self.assertIn("bothy.env", said)
+        self.assertNotEqual(said, reaction_for(StartResult("refused", code="unheard-of")))
 
     def test_a_refusal_about_the_request_is_not_transient(self) -> None:
         self.reply("plan", refusal("task-closed"))
