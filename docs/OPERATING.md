@@ -37,7 +37,7 @@ bothy audit --run run_20260918T061249Z_9b9f6971
 | Chat is silent | Allowlists are deny-by-default. Was the speaker listed? |
 | Discord messages arrive empty | The `MESSAGE_CONTENT` privileged intent is not enabled |
 | A poll source went quiet | `bothy poll <name>` runs it once by hand and shows what it saw |
-| A scheduled Drove run did not begin | `bothy audit \| grep drove` — a refusal carries Drove's own code (`herdr-down`, `task-closed`, `no-repo`) |
+| A scheduled Drove run did not begin | `bothy audit \| grep drove` — a refusal carries Drove's own code (`herdr-down`, `task-closed`, `no-repo`, `cairn`: no Cairn key for Bothy, see "Drove runs") |
 | Drove needs a person and chat is silent | `bothy drove attention` shows what Drove says is waiting and what Bothy has done about each |
 
 ## Refusals are not failures
@@ -79,6 +79,36 @@ bothy drove attention                    # what needs a person, and whether chat
 neither `~/.local/bin` nor a Node version manager. The wrapper sources
 `/usr/local/etc/bothy.env`, so a `PATH=...` line there is how a service finds
 them. `bothy doctor` runs `drove --help` and says if it cannot.
+
+**Cairn needs a key of its own for Bothy.** `drove plan --from-cairn` reads the
+task through the `cairn` CLI, which works out which agent it is from the
+environment of an interactive session (Claude Code, Codex). A service has none,
+so the read is refused as `cairn: CAIRN_API_KEY is not set`. Pair a key named
+`bothy`, then tell the CLI to use it. Names only, never a value in a chat or a
+ticket:
+
+1. Once, from a terminal on the machine, as the user Bothy runs as:
+   `cairn setup --url <instance> --runtimes bothy --no-skill --no-hooks --no-jobs --no-herdr`.
+   It prints a `/connect/XXXX-XXXX` link and waits ten minutes.
+2. Open the link in a browser signed in to that instance. The page lists one
+   runtime, `bothy`, and the host; approve it. The key belongs to whoever
+   approves, and shows as `bothy on <host>` under **Your agent keys**
+   (`/settings/keys`), where you revoke it.
+3. It lands in `~/.cairn/instances/<name>/env` as `CAIRN_API_KEY_BOTHY` (mode
+   `0600`; the other keys there are left alone).
+4. In Bothy's `bothy.env` put one line, `CAIRN_AGENT=bothy`. The key itself is
+   not copied there. Restart (`launchctl kickstart -k gui/$(id -u)/dev.bothy.<site>`),
+   because the file is read at start.
+5. Check: `CAIRN_AGENT=bothy cairn show <ref>` prints the task.
+
+Anything Drove then writes to Cairn from a Bothy-started run is filed under
+agent `bothy`. Drove hands a pane its environment as explicit flags and herdr
+starts it, so the variable should not follow the run into its panes; that is read
+from Drove's source and has not been confirmed on a live run, so look at the
+planner pane's `CAIRN_AGENT` the first time. A `cairn` refusal is not retried:
+a missing key does not clear by waiting, and a Cairn that is down reads the same.
+These steps are written from Cairn's source and its `--dry-run`; a pairing has not
+yet been completed here.
 
 **What it does with a run.** A start returns at once with a run id, which Bothy
 writes to `state/drove-runs.json` and the audit. It then reads
