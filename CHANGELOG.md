@@ -45,6 +45,32 @@ Every release states its **Breaking Changes** heading even when it is empty.
   planner (`for: planner`, or `answer.type: planner` on an older Drove) are not
   sent. A crash between the send and its record sends that item again, which
   is documented rather than hidden.
+- **Readable chat alerts for what needs a person (BOTHY-21).** It arrived as raw
+  markdown: shouting markers, run and pane ids first, an ISO timestamp, Drove's
+  internal item id, and no hint which project it was about. Discord now gets an
+  embed and Slack gets blocks, both in one shape: a plain title with the project
+  first ("dispofi-api · the planner stopped"), one sentence, a "What to do"
+  field with the command in a code block, the run id, colour by severity, the
+  time Drove first saw it, and "Bothy on <site>". The item id is no longer
+  shown. Each Drove attention kind (dialog, permission, trust, hook-trust,
+  channel-confirm, codex-version-mismatch, usage-limit, gone, question, asking,
+  blocked, promote, pane-budget) has its own wording, and a kind Drove adds later
+  falls back to the item's own text. Other sinks get the same words as plain text.
+- **Bothy's own alerts are drawn the same way.** Jobs failing, a run going down,
+  a refused Drove start, a lost loop pass, a dropped Slack or Discord connection
+  and the heartbeat go through the same embed and blocks: "Bothy · the cairn
+  poll is failing" (or the project first, for a Drove run), one sentence, a "What
+  to do" field with the command in a code block, the raw error small under
+  "Details". Repeats are still one message.
+- **Every suggested `drove` command names its run.** A person runs it from their
+  own terminal where no `DROVE_RUN` is set, so a command Drove wrote without
+  `--run` gets `--run <id>` added before its first option
+  (`drove send w-api --run <id> --kind answer <answer>`).
+- **A resolved alert edits the original on Discord.** The post asks for the
+  message back (`?wait=true`), its id is kept in `drove-attention.json`, and the
+  resolution PATCHes it to a grey "Resolved" embed instead of posting a second
+  message; if the original was deleted the resolution is posted fresh. Slack's
+  incoming webhooks cannot edit, so a resolution there is a short grey follow-up.
 - **Process groups on macOS.** Liveness, whole-tree kill and orphan reaping read
   `/proc`, which macOS lacks, so on a Mac every group answered "nobody is there":
   a kill reported `already-gone` without signalling anything and a restart could

@@ -156,7 +156,9 @@ class Runner:
                 severity="warning",
                 run_id=run_id,
                 detail={"subject": subject, "asked_at": question.asked_at},
-                reaction=f"bothy audit --run {run_id}",
+                title="an agent asked a question",
+                summary=f"An agent working on {subject} asked a question, and the run carries on without an answer.",
+                reaction="See what it asked:", command=f"bothy audit --run {run_id}",
             )
         except Exception:  # noqa: BLE001
             # The audit entry above is the durable record; a notifier that is
@@ -176,7 +178,9 @@ class Runner:
             if self.alerter is not None:
                 self.alerter.incident(
                     job="audit", error=str(exc), severity="critical",
-                    reaction="Bothy cannot record what it is doing; investigate the disk before trusting the log.",
+                    title="the audit log cannot be written",
+                    summary="Bothy cannot record what it is doing.",
+                    reaction="Investigate the disk before trusting the log.",
                 )
 
     def profile(self, name: str | None) -> Profile | None:
@@ -291,6 +295,8 @@ class Runner:
                 self.alerter.incident(
                     job="budget", error=str(refusal), severity="warning", run_id=run_id,
                     detail={"subject": subject, **{k: v for k, v in refusal.detail.items() if k != "reason"}},
+                    title="a run was held back by the budget",
+                    summary=f"The run for {subject} was refused at the budget gate.",
                     reaction="Raise the cap, wait for the window to reset, or switch auth mode.",
                 )
             return result
@@ -440,6 +446,8 @@ class Runner:
                     severity="critical" if result.status == "failed" else "warning",
                     run_id=run_id,
                     detail={"subject": subject, "cost": f"{result.cost:.4f} {result.unit}"},
-                    reaction=f"bothy audit --run {run_id}",
+                    title="a run failed" if result.status == "failed" else "a run stopped early",
+                    summary=f"The run for {subject} ended {result.status}.",
+                    reaction="See what happened:", command=f"bothy audit --run {run_id}",
                 )
         return result

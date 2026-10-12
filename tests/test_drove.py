@@ -30,6 +30,7 @@ from bothy.drove import (
     MAX_DELIVERY_ATTEMPTS, MAX_SENDS_PER_POLL, UNKNOWN_ALERT_AFTER, ActionError, AttentionForwarder,
     DroveCli, DroveRuns, StartResult, check_action, format_item, parse_action, reaction_for, resolve_action,
 )
+from bothy.notice import text_of
 from bothy.pool import Admission, PoolPolicy
 from bothy.proc import ProcessRegistry
 from bothy.schedule import Job, Schedule, ScheduleError
@@ -98,11 +99,17 @@ class Recorder:
     def __init__(self) -> None:
         self.host = "test-site"
         self.said: list[str] = []
+        self.notices: list[Any] = []
+        self.refs_seen: list[dict[str, str]] = []
         self.incidents: list[dict[str, Any]] = []
         self.delivering = True
 
     def say(self, message: str) -> None:
         self.said.append(message)
+
+    def tell(self, notice: Any) -> None:
+        self.notices.append(notice)
+        self.said.append(text_of(notice))
 
     def incident(self, **kw: Any) -> bool:
         self.incidents.append(kw)
@@ -115,6 +122,13 @@ class Recorder:
         if self.delivering:
             self.said.append(message)
         return self.delivering
+
+    def notify(self, notice: Any, refs: dict[str, str] | None = None) -> tuple[bool, dict[str, str]]:
+        self.refs_seen.append(dict(refs or {}))
+        if self.delivering:
+            self.notices.append(notice)
+            self.said.append(text_of(notice))
+        return self.delivering, ({"discord": f"msg-{len(self.notices)}"} if self.delivering else {})
 
 
 class FakeDroveMixin:
@@ -431,7 +445,7 @@ class RunWatchTests(FakeDroveMixin, unittest.TestCase):
 
 
 def forwarder(case: Any, **kwargs: Any) -> AttentionForwarder:
-    deliver = kwargs.pop("deliver", case.alerts.deliver)
+    deliver = kwargs.pop("deliver", case.alerts.notify)
     return AttentionForwarder(case.dir / "drove-attention.json", case.cli(), deliver, case.audit,
                               site="test-site", alerter=case.alerts, **kwargs)
 
@@ -449,8 +463,24 @@ class AttentionTests(FakeDroveMixin, unittest.TestCase):
         for _ in range(4):
             f.poll()
         self.assertEqual(len(self.sent()), 1)
-        self.assertIn("NEEDS A PERSON", self.sent()[0])
-        self.assertIn("drove-20261011-0200-a1b2:w-api:trust:1", self.sent()[0])
+        self.assertIn("Worker w-api", self.sent()[0])
+        self.assertNotIn("drove-20261011-0200-a1b2:w-api:trust:1", self.sent()[0], "the item id is internal")
+
+    def test_the_message_ref_is_kept_and_the_resolution_is_handed_it_to_edit(self) -> None:
+        self.reply("attention", [snapshot(item()), snapshot(), snapshot()])
+        f = forwarder(self)
+        for _ in range(3):
+            f.poll()
+        self.assertEqual([n.resolved for n in self.alerts.notices], [False, True])
+        self.assertEqual(self.alerts.refs_seen, [{}, {"discord": "msg-1"}], "the resolution carries the original's id")
+        kept = json.loads((self.dir / "drove-attention.json").read_text())
+        self.assertEqual(kept.get("items") or {}, {}, "a resolved item leaves the state")
+
+    def test_the_ref_sits_in_the_state_while_the_item_is_open(self) -> None:
+        self.reply("attention", snapshot(item()))
+        forwarder(self).poll()
+        kept = json.loads((self.dir / "drove-attention.json").read_text())
+        self.assertEqual(kept["items"][item()["id"]]["refs"], {"discord": "msg-1"})
 
     def test_a_restart_tells_nothing_twice(self) -> None:
         """drove attention --follow repeats everything open at start; a snapshot always has it."""
@@ -467,7 +497,7 @@ class AttentionTests(FakeDroveMixin, unittest.TestCase):
         self.assertEqual(len(self.sent()), 1, "one miss is not yet a resolution")
         f.poll()
         self.assertEqual(len(self.sent()), 2)
-        self.assertIn("no longer waiting", self.sent()[1])
+        self.assertIn("No longer waiting", self.sent()[1])
         f.poll()
         self.assertEqual(len(self.sent()), 2)
 
@@ -499,8 +529,8 @@ class AttentionTests(FakeDroveMixin, unittest.TestCase):
                                                        answer={"type": "command", "command": "drove up --run x"})))
         forwarder(self).poll()
         self.assertEqual(len(self.sent()), 1)
-        self.assertIn("gone", self.sent()[0])
-        self.assertIn("`drove up --run x`", self.sent()[0], "the exact command to answer with")
+        self.assertIn("planner stopped", self.sent()[0])
+        self.assertIn("drove up --run x", self.sent()[0], "the exact command to answer with")
 
     def test_items_addressed_to_the_planner_are_not_sent_and_a_missing_field_means_a_person(self) -> None:
         """DROVE-108: `for` names the audience. Older Drove has no such field."""
@@ -515,7 +545,7 @@ class AttentionTests(FakeDroveMixin, unittest.TestCase):
         self.assertEqual(len(self.sent()), 2)
         self.assertNotIn("idle-without-report", text)
         self.assertIn("question", text)
-        self.assertIn("dialog", text, "no `for` at all is a person's, as before")
+        self.assertIn("stuck on a prompt", text, "no `for` at all is a person's, as before")
 
     def test_the_audience_flag_is_not_passed_so_older_drove_still_answers(self) -> None:
         self.reply("attention", snapshot(item()))
@@ -536,7 +566,7 @@ class AttentionTests(FakeDroveMixin, unittest.TestCase):
         """Prefer a duplicate to a person never being told."""
         self.reply("attention", snapshot(item()))
 
-        def die(message: str) -> bool:
+        def die(notice: Any, refs: dict[str, str]) -> tuple[bool, dict[str, str]]:
             raise KeyboardInterrupt
 
         with self.assertRaises(KeyboardInterrupt):
@@ -789,7 +819,7 @@ class DaemonTests(FakeDroveMixin, unittest.TestCase):
         daemon = self.daemon()
         daemon.drove_once()
         self.assertEqual(len(self.alerts.said), 1)
-        self.assertIn("NEEDS A PERSON", self.alerts.said[0])
+        self.assertIn("Worker w-api", self.alerts.said[0])
         self.assertEqual([c["argv"][0] for c in self.calls()], ["plan", "roster", "attention"])
 
     def test_attention_with_nowhere_to_send_it_refuses_to_start(self) -> None:

@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import clock
+from .notice import Notice, text_of
 from .poll import dig
 from .proc import spawn_group
 
@@ -463,7 +464,9 @@ class DroveRuns:
                 self.alerter.incident(
                     job=f"drove:{run}", severity="warning",
                     error=f"cannot read the state of run {run}: {outcome.code or 'no status'} {outcome.error}".strip(),
-                    reaction=f"drove roster --run {run} --json; the run is being kept as watched, not assumed down",
+                    project=_project_of(run, self.site), title="the run's state cannot be read",
+                    summary="Bothy cannot tell whether the Drove run is up; it is still being watched, not assumed down.",
+                    reaction="To look at it yourself:", command=f"drove roster --run {run} --json",
                 )
         self._update(run, changes)
         if deadline_passed:
@@ -490,19 +493,28 @@ class DroveRuns:
         if how == "down":
             said = f"{last.get('seat', '?')} {last.get('kind', 'report')}: {last.get('summary', '')}" if last \
                 else "no report was recorded"
-            self.alerter.say(f"**{self.site}** — Drove run `{run}` is down ({rec.get('target')}). "
-                             f"Last: {_clip(said, 400)}")
+            self.alerter.tell(Notice(
+                title=f"{_project_of(run, self.site)} · the run finished",
+                description=f"The Drove run is down. Last report: {_clip(said, 400)}",
+                severity="info", run=run, site=self.site, at=clock.iso(),
+                facts=(("Target", str(rec.get("target"))),) if rec.get("target") else (),
+            ))
         elif how == "deadline":
             self.alerter.incident(
                 job=f"drove:{run}", severity="warning",
                 error=f"run {run} was still up after {self.deadline_seconds / 3600:.1f}h; "
                       f"Bothy stopped watching it and did not stop it",
-                reaction=f"drove roster --run {run}; drove down --run {run} to stop it",
+                project=_project_of(run, self.site), title="the run is still going",
+                summary=f"The Drove run was still up after {self.deadline_seconds / 3600:.1f}h. "
+                        f"Bothy stopped watching it and did not stop it.",
+                reaction="To look, then to stop it:", command=f"drove roster --run {run}\ndrove down --run {run}",
             )
         else:
             self.alerter.incident(job=f"drove:{run}", severity="warning",
                                   error=f"run {run} is gone from Drove: {detail}",
-                                  reaction="drove roster --run to confirm; its record here is closed")
+                                  project=_project_of(run, self.site), title="the run vanished from Drove",
+                                  summary="Drove no longer knows this run; Bothy's record of it is closed.",
+                                  reaction="To confirm:", command=f"drove roster --run {run}")
 
     def _prune(self) -> None:
         with self.file.lock:
@@ -549,29 +561,103 @@ def _neutralise(text: str) -> str:
     return (text.replace("`", "'").replace("@", "@​").replace("<!", "<​!"))
 
 
-def format_item(site: str, item: dict[str, Any]) -> str:
+_RUN_STAMP = re.compile(r"-\d{8}-\d{4}-[0-9a-f]+$")
+
+# What each kind of Drove attention means to a person, in a sentence. {who} is
+# "The planner" or "Worker w-api". Anything Drove adds later falls back to the
+# item's own text, which is worker-written but still better than silence.
+_KIND_SENTENCE = {
+    "dialog": "{who} is stopped at a prompt that only a person may answer.",
+    "permission": "{who} is waiting for you to approve something.",
+    "trust": "{who} is asking whether to trust the project folder.",
+    "hook-trust": "{who} is asking whether to trust a hook.",
+    "channel-confirm": "{who} is asking you to confirm a channel.",
+    "codex-version-mismatch": "{who} runs a Codex version Drove does not expect.",
+    "usage-limit": "{who} hit its usage limit and has stopped.",
+    "gone": "The planner stopped, so nothing is steering this run.",
+    "question": "{who} has a question for you.",
+    "asking": "{who} has a question for you.",
+    "blocked": "{who} is blocked and needs a decision from you.",
+    "promote": "{who} asks to move to a stronger model.",
+    "pane-budget": "A worker could not start because the run is out of panes.",
+}
+_KIND_TITLE = {
+    "dialog": "{seat} is stuck on a prompt",
+    "permission": "{seat} needs your approval",
+    "trust": "{seat} asks to trust a folder",
+    "hook-trust": "{seat} asks to trust a hook",
+    "channel-confirm": "{seat} needs a channel confirmed",
+    "codex-version-mismatch": "{seat} has the wrong Codex version",
+    "usage-limit": "{seat} hit its usage limit",
+    "gone": "the planner stopped",
+    "question": "a question for you",
+    "asking": "a question for you",
+    "blocked": "{seat} is blocked",
+    "promote": "{seat} wants a stronger model",
+    "pane-budget": "the run is out of panes",
+}
+_KIND_SEVERITY = {"gone": "critical", "question": "info", "asking": "info", "pane-budget": "info"}
+_QUOTED = {"question", "asking", "blocked", "promote"}   # the words are the point
+
+
+def _project_of(run: str, site: str) -> str:
+    """The project a Drove run belongs to, which its id starts with."""
+    name = _RUN_STAMP.sub("", run)
+    return name if name and name != run else site
+
+
+def _with_run(command: str, run: str) -> str:
+    """Name the run in a drove command. A person runs it from their own terminal,
+    where no DROVE_RUN is set, so a command without --run would not find the run.
+    The flag goes before the first other option, as Drove writes it itself."""
+    words = command.split(" ")
+    if not run or words[0] != "drove" or "--run" in words or "--all" in words:
+        return command
+    at = next((i for i, word in enumerate(words) if word.startswith("-")), len(words))
+    return " ".join(words[:at] + ["--run", run] + words[at:])
+
+
+def _who(item: dict[str, Any]) -> str:
+    seat = str(item.get("seat") or "")
+    return "The planner" if seat in {"", "planner"} else f"Worker {seat}"
+
+
+def notice_for(site: str, item: dict[str, Any], *, resolved: bool = False, run_up: bool = True) -> Notice:
+    kind = str(item.get("kind") or "")
+    run = str(item.get("run") or "")
+    who = _who(item)
+    seat = "the planner" if who == "The planner" else str(item.get("seat"))
+    title = f"{_project_of(run, site)} · {_KIND_TITLE.get(kind, 'something needs you').format(seat=seat)}"
+    sentence = _KIND_SENTENCE.get(kind, "{who} needs a person.").format(who=who)
+    said = _neutralise(_clip(str(item.get("text") or ""), TEXT_LIMIT))
+    if said and (kind in _QUOTED or kind not in _KIND_SENTENCE):
+        sentence = f"{sentence}\n> {said}"
+    if resolved:
+        why = "answered or cleared" if run_up else "the run is no longer up"
+        return Notice(title=f"Resolved · {title}", description=f"No longer waiting on a person ({why}).",
+                      run=run or None, site=site, at=clock.iso(), resolved=True)
     answer = item.get("answer") if isinstance(item.get("answer"), dict) else {}
+    command: str | None = None
+    advice: str | None = None
     if answer.get("type") == "command":
-        how = f"`{_neutralise(str(answer.get('command', '')))}`"
+        command = _neutralise(_with_run(str(answer.get("command", "")), run)) or None
     else:
-        pane = f" `{_neutralise(str(answer['pane']))}`" if answer.get("pane") else ""
-        inspect = f" · `{_neutralise(str(answer['inspect']))}`" if answer.get("inspect") else ""
-        how = f"answer it in the pane{pane}{inspect}"
-    return "\n".join([
-        f"!! **NEEDS A PERSON** `{site}` — Drove {_neutralise(str(item.get('kind', '?')))}",
-        f"run `{_neutralise(str(item.get('run', '?')))}` · seat `{_neutralise(str(item.get('seat', '?')))}`"
-        f" · since {_neutralise(str(item.get('since', '?')))}",
-        f"> {_neutralise(_clip(str(item.get('text', '')), TEXT_LIMIT))}",
-        f"→ {how}",
-        f"id `{_neutralise(str(item.get('id', '?')))}`",
-    ])
+        whose = f"{seat}'s" if seat != "the planner" else "the planner's"
+        advice = f"Answer it in {whose} pane."
+        if answer.get("inspect"):
+            advice += " To look first:"
+            command = _neutralise(_with_run(str(answer["inspect"]), run))
+    return Notice(title=title, description=sentence, severity=_KIND_SEVERITY.get(kind, "warning"),
+                  command=command, advice=advice, run=run or None, site=site,
+                  at=str(item["since"]) if item.get("since") else None)
+
+
+def format_item(site: str, item: dict[str, Any]) -> str:
+    return text_of(notice_for(site, item))
 
 
 def format_resolved(site: str, item: dict[str, Any], *, run_up: bool) -> str:
-    why = "answered or cleared" if run_up else "the run is no longer up"
-    return (f"✓ `{site}` — no longer waiting on a person ({why}): "
-            f"{_neutralise(str(item.get('kind', '?')))} · run `{_neutralise(str(item.get('run', '?')))}` · "
-            f"seat `{_neutralise(str(item.get('seat', '?')))}` · id `{_neutralise(str(item.get('id', '?')))}`")
+    return text_of(notice_for(site, item, resolved=True, run_up=run_up))
 
 
 class AttentionForwarder:
@@ -593,7 +679,7 @@ class AttentionForwarder:
     channel to stop reading it.
     """
 
-    def __init__(self, path: str | os.PathLike[str], cli: DroveCli, deliver: Callable[[str], bool],
+    def __init__(self, path: str | os.PathLike[str], cli: DroveCli, deliver: Callable[[Notice, dict[str, str]], tuple[bool, dict[str, str]]],
                  audit: Any, *, site: str = "bothy", alerter: Any = None) -> None:
         self.file = _JsonFile(path)
         self.cli = cli
@@ -663,18 +749,19 @@ class AttentionForwarder:
                     break
                 entry = entries[item_id]
                 if entry["state"] == "new":
-                    message = format_item(self.site, entry["item"])
+                    notice = notice_for(self.site, entry["item"])
                 elif entry["state"] == "closing":
-                    message = format_resolved(self.site, entry["item"],
-                                              run_up=str(entry["item"].get("run")) in runs)
+                    notice = notice_for(self.site, entry["item"], resolved=True,
+                                        run_up=str(entry["item"].get("run")) in runs)
                 else:
                     continue
                 sent += 1
-                delivered = self._deliver(message)
+                delivered, refs = self._deliver(notice, entry.get("refs") or {})
                 entry["attempts"] = int(entry.get("attempts", 0)) + 1
                 if delivered and entry["state"] == "new":
                     entry["state"], entry["attempts"] = "open", 0
                     entry["notified_at"] = clock.iso()
+                    entry["refs"] = refs
                     result.told += 1
                     self.audit.append(kind="drove", action="attention-forwarded", subject=item_id,
                                       data=_brief(entry["item"]))
@@ -689,11 +776,12 @@ class AttentionForwarder:
             result.pending = sum(1 for entry in entries.values() if entry["state"] in {"new", "closing"})
         return result
 
-    def _deliver(self, message: str) -> bool:
+    def _deliver(self, notice: Notice, refs: dict[str, str]) -> tuple[bool, dict[str, str]]:
         try:
-            return bool(self.deliver(message))
+            delivered, kept = self.deliver(notice, refs)
+            return bool(delivered), dict(kept)
         except Exception:  # noqa: BLE001 - delivery must not take the poll down with it
-            return False
+            return False, {}
 
     def _give_up(self, item_id: str, entries: dict[str, dict[str, Any]]) -> None:
         entry = entries[item_id]
@@ -703,8 +791,10 @@ class AttentionForwarder:
         if self.alerter is not None:
             self.alerter.incident(
                 job="drove:attention", severity="critical",
-                error=f"could not deliver {item_id} after {entry['attempts']} attempts",
-                reaction="Check the webhook URL. The item is still open in Drove: drove attention --all",
+                error=f"could not deliver an alert for run {entry['item'].get('run')} after {entry['attempts']} attempts",
+                title="chat cannot be reached",
+                summary="Bothy could not deliver an alert to chat, and gave up.",
+                reaction="Check the webhook URL. The item is still open in Drove:", command="drove attention --all",
             )
         if was == "new":
             entry["state"] = "abandoned"
