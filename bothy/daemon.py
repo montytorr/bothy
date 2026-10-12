@@ -41,6 +41,7 @@ from . import clock
 from .ids import wake_id as ids_wake_id
 from .alert import Alerter
 from .audit import AuditLog
+from .notice import Notice
 from .config import Config
 from .lifecycle import EX_CONFIG, EX_TEMPFAIL, AlreadyRunning, InstanceLock, LifecycleLedger
 from .pool import Admission
@@ -123,7 +124,7 @@ class Daemon:
         if config.drove_attention_interval_seconds:
             self.attention = AttentionForwarder(
                 config.state_dir / "drove-attention.json", self.drove_cli,
-                lambda message: alerter.deliver(message), audit, site=config.site, alerter=alerter,
+                alerter.notify, audit, site=config.site, alerter=alerter,
             )
         self._next_attention = 0.0
         self._attention_error = ""
@@ -273,9 +274,10 @@ class Daemon:
                     elif said and event.get("route") == "discord" and self.discord is not None:
                         self.discord.reply(event, "\n".join(said))
                     elif said and (event.get("payload") or {}).get("heartbeat"):
-                        self.alerter.say(
-                            f"**{self.config.site}** heartbeat — {subject}\n" + "\n".join(said)[:1500]
-                        )
+                        self.alerter.tell(Notice(
+                            title="Bothy · heartbeat", description=f"{subject}\n" + "\n".join(said)[:1500],
+                            severity="info", site=self.config.site, at=clock.iso(),
+                        ))
                     handled += 1
                 return handled
         except LeaseBusy:
@@ -342,7 +344,9 @@ class Daemon:
                 self.audit.append(kind="schedule", action="failed", status="failed",
                                   data={"error": f"{type(exc).__name__}: {exc}"})
                 self.alerter.incident(job="schedule", error=str(exc), severity="warning",
-                                      reaction="bothy schedule list; a job definition is probably bad")
+                                      title="a scheduled job failed",
+                                      summary="A scheduled job could not run; its definition is probably bad.",
+                                      reaction="Check the schedule:", command="bothy schedule list")
             self._stopping.wait(timeout=20.0)
 
     def poll_once(self) -> list[Any]:
@@ -376,11 +380,15 @@ class Daemon:
             if result.status == "failed":
                 self.alerter.incident(
                     job=f"poll:{source.name}", error=result.detail, severity="warning",
-                    reaction=f"bothy poll {source.name} to reproduce it by hand",
+                    title=f"the {source.name} poll is failing",
+                    summary="Bothy could not read that source, and will keep trying.",
+                    reaction="To reproduce it by hand:", command=f"bothy poll {source.name}",
                 )
             elif result.status == "skipped":
                 self.alerter.incident(
                     job=f"poll:{source.name}", error=result.detail, severity="critical",
+                    title=f"the {source.name} poll cannot start",
+                    summary="A credential it needs is missing.",
                     reaction="A missing credential will not fix itself; set the environment variable.",
                 )
             else:
@@ -429,6 +437,8 @@ class Daemon:
                     job=f"drove:{route}", severity="warning",
                     error=f"Drove did not start ({result.code}): {result.detail}",
                     detail={"subject": str(event.get("subject") or event["id"])},
+                    title="Drove did not start",
+                    summary=f"A wake asked Drove for a run and it did not start ({result.code}).",
                     reaction=reaction_for(result),
                 )
             handled += 1
@@ -446,7 +456,9 @@ class Daemon:
             self.audit.append(kind="drove", action="attention-failed", status="failed", data=result.as_dict())
             self.alerter.incident(
                 job="drove:attention", error=result.detail, severity="warning",
-                reaction="bothy drove attention shows what it read; drove attention --all --json is the source",
+                title="Drove's attention list cannot be read",
+                summary="Bothy could not read what needs a person, so nothing new will reach chat.",
+                reaction="To see what it read:", command="bothy drove attention",
             )
         elif self._attention_error:
             self.alerter.resolved(job="drove:attention", error=self._attention_error)
@@ -467,7 +479,9 @@ class Daemon:
                 self.audit.append(kind="drove", action="failed", status="failed",
                                   data={"error": f"{type(exc).__name__}: {exc}"})
                 self.alerter.incident(job="drove", error=str(exc), severity="warning",
-                                      reaction="bothy audit | tail; the loop survived but a pass was lost")
+                                      title="a Drove pass was lost",
+                                      summary="The Drove loop hit an error and carried on without that pass.",
+                                      reaction="The loop survived. To see what happened:", command="bothy audit | tail")
             self._drove_wanted.wait(timeout=10.0)
             self._drove_wanted.clear()
 
@@ -500,7 +514,9 @@ class Daemon:
         self.alerter.incident(
             job=f"wake:{event.get('route', '?')}", error=reason, severity="warning",
             detail={"subject": str(event.get("subject") or event["id"])},
-            reaction="Something is holding that lane, or the pool never recovered. bothy status.",
+            title="a wake is waiting",
+            summary="A wake has been held back and has not started.",
+            reaction="Something is holding that lane, or the pool never recovered.", command="bothy status",
         )
 
     def _too_many_attempts(self, event: dict[str, Any]) -> bool:
@@ -547,7 +563,9 @@ class Daemon:
                 self.audit.append(kind="drain", action="failed", status="failed",
                                   data={"error": f"{type(exc).__name__}: {exc}"})
                 self.alerter.incident(job="drain", error=str(exc), severity="critical",
-                                      reaction="bothy audit | tail; the drain loop survived but a pass was lost")
+                                      title="a queue pass was lost",
+                                      summary="The queue loop hit an error and carried on without that pass.",
+                                      reaction="The loop survived. To see what happened:", command="bothy audit | tail")
 
     def _janitor_loop(self) -> None:
         while not self._stopping.is_set():
@@ -560,7 +578,9 @@ class Daemon:
                                       data=report.as_dict())
                 for problem in report.errors:
                     self.alerter.incident(job="janitor", error=problem, severity="warning",
-                                          reaction="disk or permissions; bothy doctor will say more")
+                                          title="cleanup hit a problem",
+                                          summary="Bothy could not tidy its state directory; this is disk or permissions.",
+                                          reaction="Doctor will say more:", command="bothy doctor")
             except Exception as exc:  # noqa: BLE001
                 self.audit.append(kind="janitor", action="failed", status="failed",
                                   data={"error": f"{type(exc).__name__}: {exc}"})
@@ -593,6 +613,8 @@ class Daemon:
             on_stored=self._drain_wanted.set,
             on_error=lambda message, fatal: self.alerter.incident(
                 job="slack", error=message, severity="critical" if fatal else "warning",
+                title="Slack connection problem",
+                summary="Bothy cannot stay connected to Slack." if fatal else "Slack dropped; Bothy is reconnecting.",
                 reaction="Check the app and bot tokens and the connections:write scope."
                         if fatal else "Transient; it is reconnecting on its own.",
             ),
@@ -623,6 +645,8 @@ class Daemon:
             on_stored=self._drain_wanted.set,
             on_error=lambda message, fatal: self.alerter.incident(
                 job="discord", error=message, severity="critical" if fatal else "warning",
+                title="Discord connection problem",
+                summary="Bothy cannot stay connected to Discord." if fatal else "Discord dropped; Bothy is reconnecting.",
                 reaction="Check the bot token and that the privileged MESSAGE_CONTENT intent is "
                         "enabled in the application settings." if fatal
                         else "Transient; it is reconnecting on its own.",
@@ -662,6 +686,8 @@ class Daemon:
             self.alerter.incident(
                 job="daemon", error=unclean.summary(), severity="warning",
                 detail={"evidence": json.dumps(unclean.evidence)[:400]},
+                title="Bothy restarted after a crash",
+                summary="The last instance did not shut down cleanly.",
                 reaction="If this repeats, check memory pressure and the supervisor's restart budget.",
             )
 

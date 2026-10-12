@@ -129,6 +129,21 @@ people stop reading. An item with no `for` field, from an older Drove, is a
 person's unless its `answer.type` is `planner`. Bothy does not pass
 `--for human`, so it works against either.
 
+**What the message looks like.** On Discord an embed, on Slack blocks, on
+anything else plain text. The title names the project first (read from the run
+id: `dispofi-api · the planner stopped`), one sentence says what happened, and
+"What to do" holds the command in a code block (or says which pane to answer in,
+with a command to look at it first). The run id is below, the colour follows how
+bad it is (red: the planner stopped; blue: a question; amber: the rest), and the
+time is when Drove first saw it. The internal item id is never shown; it is in
+`state/drove-attention.json` and the audit. A resolution edits the Discord
+message to a grey "Resolved" embed instead of adding a second one (the message
+id is kept in that state file; if the message was deleted, a fresh resolution is
+posted). Slack's incoming webhooks cannot edit, so there it is a short follow-up.
+Bothy's own alerts (a job failing, a run going down, a lost loop pass) use the
+same shape, with the raw error small under "Details" and `Bothy` or the project
+leading the title. Every `drove` command in a message carries `--run <id>`.
+
 **Told once, and the one way it is not.** An item is written to
 `state/drove-attention.json` as *to tell* before it is sent and as *told* after.
 A restart tells nothing twice. A crash in the instant between the send and the
