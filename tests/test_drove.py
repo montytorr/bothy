@@ -8,6 +8,7 @@ herdr, Cairn or a network.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import stat
@@ -19,6 +20,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 from bothy import clock
 from bothy.alert import Alerter, CompositeSink, DiscordWebhookSink, StderrSink
@@ -721,6 +723,10 @@ class FakeRunner:
 
 class DaemonTests(FakeDroveMixin, unittest.TestCase):
     def setUp(self) -> None:
+        self.now = clock.utcnow()
+        timer = patch("bothy.clock.utcnow", side_effect=lambda: self.now)
+        timer.start()
+        self.addCleanup(timer.stop)
         self.make_fake()
         self.config = Config(home=Path(tempfile.mkdtemp()), drove_binary=str(self.binary),
                              drove_repo=str(self.repo), drove_poll_seconds=0.0)
@@ -775,6 +781,12 @@ class DaemonTests(FakeDroveMixin, unittest.TestCase):
         self.assertEqual(daemon.drove_wakes(), 0)
         pending = self.store.pending()[0]
         self.assertEqual((pending["attempts"], pending["last_gate"]), (1, "herdr-down"))
+        self.assertEqual(clock.parse(pending["next_attempt_at"]), self.now + dt.timedelta(seconds=4))
+        self.now += dt.timedelta(seconds=3)
+        self.assertEqual(self.daemon().drove_wakes(), 0, "a restart preserves the backoff")
+        self.assertEqual(len(self.calls()), 1, "no Drove command during backoff")
+        self.assertEqual(self.store.pending()[0]["attempts"], 1)
+        self.now += dt.timedelta(seconds=1)
         self.assertEqual(daemon.drove_wakes(), 1)
         self.assertEqual(self.store.pending(), [])
 
@@ -784,6 +796,7 @@ class DaemonTests(FakeDroveMixin, unittest.TestCase):
         daemon = self.daemon(max_wake_attempts=3)
         for _ in range(5):
             daemon.drove_wakes()
+            self.now += dt.timedelta(seconds=64)
         self.assertEqual(self.store.pending(), [])
         self.assertEqual(self.store.all_events()[0]["outcome"], "abandoned")
         self.assertTrue(self.alerts.incidents)

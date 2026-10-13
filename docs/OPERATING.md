@@ -50,7 +50,9 @@ Bothy refuses work deliberately and records why. These are all normal:
 - `profile` — a capability profile that does not exist. It will **not** be retried.
 
 A wake that is refused for capacity too often, or waits too long, is
-**abandoned** with an alert rather than retried forever.
+**abandoned** with an alert rather than retried forever. Retries back off from
+4 seconds to a maximum of 64 seconds; 30 refusals take about 28 minutes of
+retries before abandonment. The six-hour age limit still applies.
 
 ## Drove runs
 
@@ -68,7 +70,7 @@ bothy drove attention                    # what needs a person, and whether chat
 
 - a **herdr server running**. Drove opens a workspace in it and never starts it,
   so with none a start is refused `herdr-down` and **waits**, counted, like any
-  capacity refusal (30 attempts, about five minutes, then abandoned out loud);
+  capacity refusal (30 attempts, about 28 minutes of retries, then abandoned out loud);
 - `drove`, `herdr`, `node` 22.18+, `git`, `cairn` and the planner's agent
   (`claude` or `codex`) on `PATH`, **and signed in**;
 - the repository named by `drove_repo`, with its folder trusted once by hand.

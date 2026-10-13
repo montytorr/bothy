@@ -10,6 +10,9 @@ Every release states its **Breaking Changes** heading even when it is empty.
 ## Unreleased
 
 ### Added
+- **Deferred wake backoff:** capacity and transient Drove refusals retry after
+  4 seconds, doubling to a 64-second cap. Deadlines survive restarts, and new
+  wakes do not consume a waiting wake's attempts.
 - **Wake sources:** signed webhooks, schedules, Slack (Socket Mode), Discord
   (gateway) and polling — all producing wakes on one durable queue and passing
   one admission gate.
