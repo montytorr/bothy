@@ -292,6 +292,8 @@ class Daemon:
                         prompt=self._prompt_for(event),
                         wake_id=event["id"],
                         profile=event.get("profile"),
+                        wall_clock_seconds=event.get("wall_clock_seconds"),
+                        max_tokens=event.get("max_tokens"),
                         untrusted=self._untrusted_source(event),
                     )
                     gate = (result.refusal or {}).get("gate")
@@ -400,6 +402,8 @@ class Daemon:
             "payload": {"prompt": prompt, "job": job.id, "heartbeat": job.heartbeat},
             "prompt": prompt,
             "profile": job.profile,
+            "wall_clock_seconds": job.wall_clock_seconds,
+            "max_tokens": job.max_tokens,
             "processed": False,
         }
         if job.sop:

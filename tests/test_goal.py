@@ -340,6 +340,23 @@ class GoalLoops(unittest.TestCase):
         self.assertIn("could not start", self.event(wake)["goal_feedback"])
         self.sink.incident.assert_called_once()
 
+    def test_lifecycle_limits_and_stop_reasons_survive_goal_retries(self) -> None:
+        for reason in ("token_cap", "wall_clock"):
+            with self.subTest(reason=reason):
+                wake = self.fire(wall_clock_seconds=60, max_tokens=100)
+                self.outcomes = [codex.TurnOutcome("interrupted", error="turn interrupted", stop_reason=reason),
+                                 codex.TurnOutcome("completed", messages=["PASS"])]
+                self.daemon.drain()
+                self.assertIn(f"stop_reason: {reason}", self.event(wake)["goal_feedback"])
+                self.assertEqual(self.event(wake)["wall_clock_seconds"], 60)
+                self.assertEqual(self.event(wake)["max_tokens"], 100)
+                self.advance()
+                self.daemon.drain()
+                self.assertEqual(self.event(wake)["outcome"], "verified")
+                self.assertIn(f"stop_reason: {reason}", self.turns[-1]["text"])
+                self.assertEqual(self.turns[-1]["wall_clock_seconds"], 60)
+                self.assertEqual(self.turns[-1]["max_tokens"], 100)
+
     def test_editing_job_does_not_change_fired_goal(self) -> None:
         wake = self.fire()
         self.daemon.schedule.put(Job(id="j", kind="every", spec="3600",
@@ -401,6 +418,14 @@ class GoalConfiguration(unittest.TestCase):
         self.assertEqual(job.validate, {"command": argv, "timeout_seconds": 9})
         self.assertEqual(job.max_attempts, 2)
         self.assertIn('"timeout_seconds": 9.0', self.cli("list")[1])
+
+    def test_cli_goal_and_lifecycle_flags_work_together(self) -> None:
+        code, _ = self.cli("add", "combined", "--validate-regex", "PASS", "--max-attempts", "2",
+                           "--wall-clock", "90", "--max-tokens", "42")
+        self.assertEqual(code, 0)
+        job = self.schedule.get("combined")
+        self.assertEqual(job.validate, {"output_regex": "PASS"})
+        self.assertEqual((job.max_attempts, job.wall_clock_seconds, job.max_tokens), (2, 90, 42))
 
     def test_cli_refuses_malformed_json(self) -> None:
         self.assertEqual(self.cli("add", "j", "--validate-cmd", "[bad json")[0], 78)
