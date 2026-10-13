@@ -275,6 +275,10 @@ Missing lists are a startup error; an empty list grants no tools.
 
 ## Memory
 
+Cairn is optional. Bothy writes to it only for runs with `--ref` or profiles
+that grant `bothy_note`. An unreachable Cairn is recorded (`claim_failed`,
+`record_failed`) and the run still works. The audit log is always written.
+
 | Key | Default | |
 |---|---|---|
 | `cairn_binary` | `cairn` | The Cairn CLI |
