@@ -191,6 +191,25 @@ are fingerprinted on the error text and suppressed until it changes.
 
 ## Stopping and starting
 
+Stop one live Codex run by its Bothy run id (from `bothy status` or the audit):
+
+```bash
+bothy cancel run_20261013T090000Z_1234abcd
+```
+
+Cancellation writes and fsyncs `state/control/<run_id>.cancel`, then audits the
+request. The runner checks it every 100 ms and sends `turn/interrupt`; a quiet
+worker gets one second to finish before the runner closes its process group,
+settles the reservation and frees the lane. This works for daemon jobs and
+`bothy run`. If the worker is still registered after two seconds, the command
+rechecks its boot and start identity, kills the owned group and settles its
+reservation conservatively, like `reap`. The command reports whether it used a
+clean interrupt or a fallback kill. Unknown or malformed ids fail without signals.
+
+The run's `finished` audit data includes `stop_reason`: `wall_clock`, `token_cap`,
+`budget`, `awaiting_human`, `cancelled`, or `null`. A fallback also records its
+group disposal result. Control files are removed when the run ends.
+
 ```bash
 systemctl restart dev.bothy.<site>       # Linux
 launchctl kickstart -k system/dev.bothy.<site>   # macOS
@@ -273,6 +292,7 @@ $BOTHY_HOME/
     checklist.md        the standing checklist, editable by hand or by the agent
     wakes/wakes.jsonl   the durable queue
     homes/              one disposable CODEX_HOME per run
+    control/            operator controls; cancellation files expire with the run
 /usr/local/etc/bothy.env   secrets, 0600, owned by the service user
 /var/log/bothy/bothy.log   stdout and stderr
 ```

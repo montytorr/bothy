@@ -28,6 +28,7 @@ A run that fails is still a run that completed its bookkeeping.
 from __future__ import annotations
 
 import dataclasses
+import math
 import shutil
 import traceback
 from pathlib import Path
@@ -66,6 +67,7 @@ class RunResult:
     #: and still have these: the work got done around the gap, but somebody
     #: asked and nobody answered, and that should not vanish into a transcript.
     questions: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    stop_reason: codex.StopReason | None = None
 
     @property
     def ok(self) -> bool:
@@ -264,6 +266,7 @@ class Runner:
         wall_clock_seconds: float | None = None,
         wake_id: str | None = None,
         profile: str | None = None,
+        max_tokens: int | None = None,
         untrusted: bool = False,
     ) -> RunResult:
         run_id = ids.run_id()
@@ -323,7 +326,7 @@ class Runner:
 
         try:
             active = self.profile(profile)
-        except KeyError as exc:
+        except (KeyError, ValueError, TypeError) as exc:
             result.status = "refused"
             result.refusal = {"gate": "profile", "reason": str(exc)}
             self._record(kind="run", action="refused", status="refused", run_id=run_id,
@@ -331,10 +334,31 @@ class Runner:
             self.admission.release(run_id, ok=False, actual=0.0)
             return result
 
+        try:
+            limits = self.config.profiles.get(active.name, {}) if active else {}
+            if wall_clock_seconds is None:
+                wall_clock_seconds = limits.get("wall_clock_seconds")
+            if wall_clock_seconds is None:
+                wall_clock_seconds = self.config.wall_clock_seconds
+            if max_tokens is None:
+                max_tokens = limits.get("max_tokens")
+            if max_tokens is None:
+                max_tokens = self.config.max_tokens
+            if not math.isfinite(wall_clock_seconds) or wall_clock_seconds <= 0:
+                raise ValueError("wall_clock_seconds must be positive and finite")
+            if max_tokens is not None and (type(max_tokens) is not int or max_tokens <= 0):
+                raise ValueError("max_tokens must be a positive integer or null")
+        except (KeyError, ValueError, TypeError) as exc:
+            result.status = "refused"
+            result.refusal = {"gate": "limits", "reason": str(exc)}
+            self._record(kind="run", action="refused", status="refused", run_id=run_id,
+                         subject=subject, data=result.refusal)
+            self.admission.release(run_id, ok=False, actual=0.0)
+            return result
+
         registry = self._registry(active, untrusted=untrusted)
         home = self.config.homes_dir / run_id
-        self._seed_home(home)
-        self._write_worker_config(home, active)
+        cancel_path = self.config.control_dir / f"{run_id}.cancel"
         client = codex.CodexClient(
             run_id=run_id,
             codex_home=home,
@@ -356,7 +380,27 @@ class Runner:
                 spent = pricing.cost(Usage.from_app_server(total))
                 self.admission.report(run_id, spent)
 
+        def should_stop() -> codex.StopReason | None:
+            if cancel_path.exists():
+                return "cancelled"
+            if self.config.budget.mode == "api" and spent > admitted.reservation.amount:
+                return "budget"
+            return None
+
+        def was_cancelled() -> bool:
+            # A fallback may already have removed the control file. Its
+            # durable terminal record keeps the cause available to the runner.
+            # any() stops reading as soon as that record is found.
+            return cancel_path.exists() or any(
+                record.get("run_id") == run_id and record.get("action") == "finished"
+                and (record.get("data") or {}).get("fallback")
+                and (record.get("data") or {}).get("stop_reason") == "cancelled"
+                for record in self.audit.records()
+            )
+
         try:
+            self._seed_home(home)
+            self._write_worker_config(home, active)
             client.start()
             self.registry.register(run_id, client.popen, ["codex", "app-server"])
             client.handshake()
@@ -387,11 +431,17 @@ class Runner:
             outcome = client.run_turn(
                 thread_id=thread_id,
                 text=prompt,
-                wall_clock_seconds=wall_clock_seconds or self.config.wall_clock_seconds,
+                wall_clock_seconds=wall_clock_seconds,
+                max_tokens=max_tokens,
                 on_usage=meter,
+                should_stop=should_stop,
             )
             self._observe(outcome)
             result.status = outcome.status
+            result.stop_reason = outcome.stop_reason
+            if result.status != "completed" and result.stop_reason is None and was_cancelled():
+                result.status = "interrupted"
+                result.stop_reason = "cancelled"
             result.messages = outcome.messages
             result.usage = outcome.usage
             result.questions = [q.as_dict() for q in outcome.questions]
@@ -403,14 +453,18 @@ class Runner:
         except Exception as exc:  # noqa: BLE001 - every failure still gets bookkeeping
             result.status = "failed"
             result.error = f"{type(exc).__name__}: {exc}"
-            self._record(kind="run", action="errored", status="failed", run_id=run_id, subject=subject,
+            if was_cancelled():
+                # Cancellation can reap a worker still in handshake/startup,
+                # before run_turn has had the chance to read its control file.
+                result.status = "interrupted"
+                result.stop_reason = "cancelled"
+            self._record(kind="run", action="errored", status=result.status, run_id=run_id, subject=subject,
                          data={"error": result.error, "trace": traceback.format_exc()[-2000:],
                                "stderr": client.stderr_tail[-5:]})
 
         finally:
             # Invariant one: the group always dies.
-            disposal = client.close(grace_seconds=10)
-            self.registry.unregister(run_id)
+            disposal = client.close(grace_seconds=0.25 if result.stop_reason == "cancelled" else 10)
             # Invariant two: the reservation is always settled.
             settled = self.admission.release(run_id, ok=(result.status == "completed"), actual=spent)
             result.finished_at = clock.iso()
@@ -420,6 +474,7 @@ class Runner:
                 run_id=run_id, subject=subject,
                 data={"outcome": result.status, "cost": round(settled, 5), "unit": result.unit,
                       "disposal": disposal, "usage": result.usage, "error": result.error,
+                      "stop_reason": result.stop_reason,
                       # A run that completed with questions outstanding did the
                       # work around a gap somebody flagged. `bothy audit` should
                       # not have to read the transcript to notice.
@@ -428,6 +483,8 @@ class Runner:
             # Per-run homes are disposable; keeping them would grow without bound,
             # and Codex rollouts are the single biggest disk risk on a small box.
             shutil.rmtree(home, ignore_errors=True)
+            cancel_path.unlink(missing_ok=True)
+            self.registry.unregister(run_id)
 
         # --- tell memory, and tell a human if they are needed ---
         if cairn_ref and self.tracker is not None:

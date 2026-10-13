@@ -39,7 +39,7 @@ import queue
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Literal
 
 from . import clock, proc
 from .capability import ToolRegistry
@@ -53,7 +53,10 @@ __all__ = [
     "default_approval",
     "default_question",
     "Question",
+    "StopReason",
 ]
+
+StopReason = Literal["wall_clock", "token_cap", "budget", "awaiting_human", "cancelled"]
 
 
 class CodexError(RuntimeError):
@@ -161,6 +164,7 @@ class TurnOutcome:
     #: with questions outstanding — Bothy cannot block waiting for an answer —
     #: so this is how they survive the run rather than being lost.
     questions: list[Question] = dataclasses.field(default_factory=list)
+    stop_reason: StopReason | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -211,6 +215,8 @@ class CodexClient:
         self._stderr_tail: list[str] = []
         self._closed = threading.Event()
         self._notifications: queue.Queue = queue.Queue()
+        self._stop_reason: StopReason | None = None
+        self._interrupt_lock = threading.Lock()
 
     # ---- lifecycle -----------------------------------------------------
 
@@ -517,6 +523,17 @@ class CodexClient:
             raise CodexError(f"thread/start returned no thread id: {result!r}")
         return str(thread_id)
 
+    def _interrupt(self, reason: StopReason) -> None:
+        """Ask the turn loop to stop, including from a reader callback.
+
+        The loop sends the RPC: waiting for its reply on the reader thread
+        would prevent that very thread from delivering the reply.
+        The first cause wins so a later deadline never hides a human hold.
+        """
+        with self._interrupt_lock:
+            if self._stop_reason is None:
+                self._stop_reason = reason
+
     def run_turn(
         self,
         *,
@@ -525,6 +542,9 @@ class CodexClient:
         wall_clock_seconds: float = 900.0,
         on_usage: Callable[[dict[str, Any]], None] | None = None,
         request_timeout: float = 60.0,
+        max_tokens: int | None = None,
+        should_stop: Callable[[], StopReason | None] | None = None,
+        interrupt_grace_seconds: float = 1.0,
     ) -> TurnOutcome:
         """Run one turn under a wall clock, interrupting it if it overruns.
 
@@ -548,25 +568,40 @@ class CodexClient:
 
         while True:
             remaining = deadline - clock.monotonic()
-            if remaining <= 0 and not interrupted:
+            if not interrupted:
+                reason = should_stop() if should_stop is not None else None
+                if reason is not None:
+                    self._interrupt(reason)
+                if remaining <= 0:
+                    self._interrupt("wall_clock")
+            if self._stop_reason is not None and not interrupted:
                 interrupted = True
                 outcome.status = "interrupted"
-                outcome.error = f"wall clock of {wall_clock_seconds:.0f}s exceeded"
+                outcome.stop_reason = self._stop_reason
+                outcome.error = (f"wall clock of {wall_clock_seconds:.0f}s exceeded"
+                                 if outcome.stop_reason == "wall_clock"
+                                 else f"turn stopped: {outcome.stop_reason}")
+                grace = (min(interrupt_grace_seconds, request_timeout)
+                         if outcome.stop_reason == "cancelled" else min(30.0, request_timeout))
+                deadline = clock.monotonic() + grace
                 try:
                     self.request(
                         "turn/interrupt",
                         {"threadId": thread_id, "turnId": outcome.turn_id},
-                        timeout=min(30.0, request_timeout),
+                        timeout=grace,
                     )
                 except CodexError:
                     # Interrupt is best effort; the caller kills the group next.
                     break
                 # Give the server a moment to emit its terminal event.
-                deadline = clock.monotonic() + 30.0
+                if outcome.stop_reason != "cancelled":
+                    deadline = clock.monotonic() + grace
                 continue
+            if interrupted and remaining <= 0:
+                break
 
             try:
-                method, params = self._notifications.get(timeout=max(0.1, min(remaining, 1.0)))
+                method, params = self._notifications.get(timeout=max(0.001, min(remaining, 0.1)))
             except queue.Empty:
                 if self._closed.is_set():
                     outcome.error = outcome.error or "app-server exited before the turn completed"
@@ -582,6 +617,12 @@ class CodexClient:
                         on_usage(total)
                     except Exception:  # noqa: BLE001 - metering must not end the turn
                         pass
+                token_total = total.get("totalTokens", total.get("total_tokens"))
+                if token_total is None:
+                    token_total = (int(total.get("inputTokens") or total.get("input_tokens") or 0)
+                                   + int(total.get("outputTokens") or total.get("output_tokens") or 0))
+                if max_tokens is not None and int(token_total) >= max_tokens:
+                    self._interrupt("token_cap")
             elif method == "account/rateLimits/updated":
                 outcome.rate_limits = params.get("rateLimits") or params
             elif method == "item/completed":
@@ -600,7 +641,7 @@ class CodexClient:
                 status = str(finished.get("status") or "completed")
                 # A turn we interrupted reports as interrupted; keep our reason.
                 outcome.status = "interrupted" if interrupted else status
-                if finished.get("error"):
+                if finished.get("error") and not interrupted:
                     outcome.error = str(finished["error"])
                 break
 

@@ -19,6 +19,10 @@ Every release states its **Breaking Changes** heading even when it is empty.
   MCP tool allowlists.
 
 ### Added
+- **Lifecycle controls (BOTHY-25):** typed stop reasons on run outcomes and the
+  finished audit, per-job token and wall-clock limits with profile/config
+  fallbacks, API reservation overruns interrupted live, and `bothy cancel`
+  with durable controls and an identity-checked process-group fallback.
 - **Deferred wake backoff:** capacity and transient Drove refusals retry after
   4 seconds, doubling to a 64-second cap. Deadlines survive restarts, and new
   wakes do not consume a waiting wake's attempts.

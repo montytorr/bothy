@@ -18,9 +18,9 @@ from typing import Any
 
 import os
 
-from . import __version__, clock, codex
+from . import __version__, clock, codex, ids, proc
 from .alert import Alerter, CompositeSink, DiscordWebhookSink, SlackWebhookSink, StderrSink
-from .audit import AuditLog, ChainBreak
+from .audit import AuditError, AuditLog, ChainBreak
 from .budget import BudgetLedger
 from .capability import Profile
 from .config import Config, load
@@ -260,7 +260,8 @@ def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
 def cmd_run(args: argparse.Namespace, config: Config) -> int:
     runner, _, _, _ = build(config)
     result = runner.run(subject=args.subject, prompt=args.prompt, cairn_ref=args.ref,
-                        wall_clock_seconds=args.wall_clock, profile=args.profile)
+                        wall_clock_seconds=args.wall_clock, profile=args.profile,
+                        max_tokens=args.max_tokens)
     if args.json:
         print(json.dumps(result.as_dict(), indent=2))
     else:
@@ -338,6 +339,7 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
             id=args.id, kind=args.kind, spec=args.spec, prompt="" if action else args.prompt,
             subject=args.subject, tz=args.tz, heartbeat=args.heartbeat, profile=args.profile,
             drove=action, sop=args.sop,
+            wall_clock_seconds=args.wall_clock, max_tokens=args.max_tokens,
             min_spacing_seconds=args.min_spacing,
             active_hours=[args.active_from, args.active_to] if args.active_from is not None else None,
         ), sops_dir=config.sops_dir)
@@ -761,6 +763,70 @@ def cmd_reap(args: argparse.Namespace, config: Config) -> int:
 # --------------------------------------------------------------------------
 
 
+def cmd_cancel(args: argparse.Namespace, config: Config) -> int:
+    """Request a clean interrupt, then reap an unresponsive owned group."""
+    import time
+
+    run_id = args.run_id
+    if not ids.is_run_id(run_id) or pathlib.Path(run_id).name != run_id:
+        print("bothy: malformed run id", file=sys.stderr)
+        return 1
+    registry = ProcessRegistry(config.registry_path)
+    worker = next((w for w in registry.workers() if w.run_id == run_id), None)
+    if worker is None or not worker.still_ours():
+        print(f"bothy: no live run {run_id}", file=sys.stderr)
+        return 1
+
+    config.control_dir.mkdir(parents=True, exist_ok=True)
+    cancel_path = config.control_dir / f"{run_id}.cancel"
+    audit = AuditLog(config.audit_path)
+    try:
+        with cancel_path.open("w", encoding="utf-8") as handle:
+            handle.write(clock.iso() + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        directory = os.open(config.control_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        audit.append(kind="run", action="cancel_requested", run_id=run_id,
+                     data={"stop_reason": "cancelled"})
+    except (OSError, AuditError) as exc:
+        print(f"bothy: cannot write cancellation: {exc}", file=sys.stderr)
+        return 1
+
+    deadline = clock.monotonic() + 2.0
+    while clock.monotonic() < deadline:
+        if not any(w.run_id == run_id for w in registry.workers()):
+            cancel_path.unlink(missing_ok=True)
+            print(f"{run_id} cancelled (clean interrupt)")
+            return 0
+        time.sleep(0.05)
+
+    # Refresh identity after the grace period. Never signal a stale pid record.
+    current = next((w for w in registry.workers() if w.run_id == run_id), None)
+    if current is not None and current != worker:
+        print(f"bothy: worker identity changed for {run_id}", file=sys.stderr)
+        return 1
+    disposal = (proc.kill_group(worker.pgid, grace_seconds=0.25)
+                if current is not None and current.still_ours() else "already-gone")
+    if disposal == "unkillable":
+        audit.append(kind="worker", action="cancel_failed", status="failed", run_id=run_id,
+                     data={"disposal": disposal, "stop_reason": "cancelled"})
+        print(f"{run_id} cancellation fallback: {disposal}", file=sys.stderr)
+        return 1
+    settled = BudgetLedger(config.budget_path, config.budget).settle_run(run_id)
+    audit.append(kind="run", action="finished", status="interrupted", run_id=run_id,
+                 data={"stop_reason": "cancelled", "fallback": True, "disposal": disposal,
+                       "outcome": "interrupted",
+                       "reservations_released": [r.id for r in settled]})
+    registry.unregister(run_id)
+    cancel_path.unlink(missing_ok=True)
+    print(f"{run_id} cancelled (fallback: {disposal}, released {len(settled)} reservation(s))")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="bothy", description="a small agent harness you can leave somewhere")
     parser.add_argument("--config", default=None, help="path to config.json")
@@ -782,6 +848,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--subject", required=True, help="what this is about; one run per subject at a time")
     run.add_argument("--ref", default=None, help="Cairn task reference to claim and annotate")
     run.add_argument("--wall-clock", type=float, default=None)
+    run.add_argument("--max-tokens", type=int, default=None)
     run.add_argument("--profile", default=None, help="capability profile; omit for Codex built-ins only")
     run.add_argument("--json", action="store_true")
     run.set_defaults(func=cmd_run)
@@ -826,6 +893,10 @@ def main(argv: list[str] | None = None) -> int:
     reap = subparsers.add_parser("reap", help="kill workers a previous instance left behind")
     reap.set_defaults(func=cmd_reap)
 
+    cancel = subparsers.add_parser("cancel", help="interrupt a live Bothy run")
+    cancel.add_argument("run_id")
+    cancel.set_defaults(func=cmd_cancel)
+
     schedule = subparsers.add_parser("schedule", help="jobs that fire without being asked")
     schedule.add_argument("action", choices=["list", "add", "remove"])
     schedule.add_argument("id", nargs="?", default=None)
@@ -836,6 +907,8 @@ def main(argv: list[str] | None = None) -> int:
     schedule.add_argument("--subject", default=None, help="lane to occupy; defaults to job:<id>")
     schedule.add_argument("--tz", default="UTC")
     schedule.add_argument("--profile", default=None, help="capability profile for this job")
+    schedule.add_argument("--wall-clock", type=float, default=None)
+    schedule.add_argument("--max-tokens", type=int, default=None)
     schedule.add_argument("--sop", default=None, metavar="NAME",
                           help="carry the standard operating procedure in <home>/sops/NAME.md")
     schedule.add_argument("--heartbeat", action="store_true",
