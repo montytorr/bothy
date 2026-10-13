@@ -10,6 +10,11 @@ Every release states its **Breaking Changes** heading even when it is empty.
 ## Unreleased
 
 ### Added
+- **SOP jobs:** `bothy schedule add --sop NAME` gives a job a MUST/SHOULD/MAY
+  procedure from `$BOTHY_HOME/sops/NAME.md`, injected into its prompt at fire time
+  with its sha256 on the wake. A missing, empty or oversized (over 16 KB) file is
+  refused (`sop_missing`), audited and alerted rather than truncated. Manage with
+  `bothy sop list|show|set`. Ships `docs/sops/drove-detached-start.md`.
 - **Wake sources:** signed webhooks, schedules, Slack (Socket Mode), Discord
   (gateway) and polling — all producing wakes on one durable queue and passing
   one admission gate.
