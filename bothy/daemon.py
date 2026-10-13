@@ -51,7 +51,7 @@ from .retention import RetentionPolicy, sweep
 from .runner import Runner
 from .poll import PollState, Poller, Source
 from .drove import AttentionForwarder, DroveCli, DroveRuns, reaction_for
-from .schedule import Job, Schedule, strip_no_reply
+from .schedule import Job, Schedule, ScheduleError, read_sop, strip_no_reply
 from .vendor.a2a_reactor.lease import LeaseBusy, reactor_lease
 from .ratelimit import RateLimiter
 from .wake import Route, WakeServer, WakeStore
@@ -311,6 +311,14 @@ class Daemon:
             return wake_id
 
         prompt = job.prompt
+        sop_sha = None
+        if job.sop:
+            try:
+                sop_text, sop_sha = read_sop(self.config.sops_dir, job.sop)
+            except ScheduleError as exc:
+                return self._refuse_sop(job, str(exc))
+            prompt = (f"{prompt}\n\nStandard operating procedure `{job.sop}` "
+                      f"(MUST = required; SHOULD = unless you say why; MAY = optional):\n{sop_text}")
         if job.heartbeat:
             checklist = self._checklist()
             if checklist:
@@ -328,10 +336,36 @@ class Daemon:
             "profile": job.profile,
             "processed": False,
         }
+        if job.sop:
+            event["sop"] = job.sop
+            event["sop_sha256"] = sop_sha
         self.store.append(event)
         self.audit.append(kind="schedule", action="fired", subject=job.lane(),
                           data={"job": job.id, "wake": wake_id, "kind": job.kind,
                                 "spec": job.spec, "misfires": job.misfires})
+        return wake_id
+
+    def _refuse_sop(self, job: Job, error: str) -> str:
+        """A job whose SOP cannot be read must not run without it, and must not raise.
+
+        Raising would leave the job due and refire it every 20 seconds, so the
+        refusal is recorded as an already-processed wake and the caller moves on.
+        """
+        wake_id = ids_wake_id()
+        now = clock.iso()
+        self.store.append({
+            "id": wake_id, "received_at": now, "route": f"schedule:{job.id}",
+            "subject": job.lane(), "delivery_key": f"job:{job.id}:{wake_id}",
+            "payload": {"job": job.id}, "sop": job.sop, "processed": True,
+            "processed_at": now, "outcome": "refused", "gate": "sop_missing", "reason": error,
+        })
+        self.audit.append(kind="schedule", action="refused", subject=job.lane(), status="refused",
+                          data={"job": job.id, "wake": wake_id, "gate": "sop_missing",
+                                "sop": job.sop, "error": error})
+        self.alerter.incident(job=f"sop:{job.id}", error=error, severity="warning",
+                              title=f"job {job.id} did not run",
+                              summary=f"Its standard operating procedure `{job.sop}` is missing, empty or too large.",
+                              reaction="Restore or replace the SOP:", command=f"bothy sop show {job.sop}")
         return wake_id
 
     def _schedule_loop(self) -> None:

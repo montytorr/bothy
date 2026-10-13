@@ -165,6 +165,14 @@ the machine, not from Bothy's budget. `drove_max_runs` (default 1) is the cap.
 an item reaching a real channel. Everything above is tested against a stand-in
 for `drove` that speaks the shapes in Drove's README.
 
+## A job that did not run: `sop_missing`
+
+A job with `--sop NAME` whose file has gone missing, is empty or is over 16 KB
+does not run. Its wake is recorded as processed (`refused`, gate `sop_missing`),
+an alert says which SOP, and the job waits for its next time as usual. Fix it
+with `bothy sop show NAME` and `bothy sop set NAME FILE`; nothing needs
+restarting.
+
 ## Things that need a human
 
 | Alert | What it means |
@@ -251,6 +259,7 @@ and unit; it leaves your config, state and secrets alone.
 $BOTHY_HOME/
   config.json           settings; never secrets
   audit.jsonl           hash-chained record, rotated with the chain intact
+  sops/                 standard operating procedures (<name>.md), see `bothy sop`
   state/
     heartbeat.json      watch this from outside
     lifecycle.json      proves whether the last stop was clean
