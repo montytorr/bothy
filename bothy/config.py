@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,7 @@ class Config:
     workspace: Path = dataclasses.field(default_factory=Path.cwd)
     sandbox: str = "readOnly"
     approval_policy: str = "never"
+    question_hold_seconds: float = 0.0
     wall_clock_seconds: float = 900.0
     max_tokens: int | None = None
     # Optional observation export. Credentials belong in the OTEL environment.
@@ -220,6 +222,38 @@ class Config:
                         f"{server!r} without an mcp_tools list; list the allowed tools explicitly"
                     )
 
+    def validate_hold(self, wall_clock_seconds: float | None = None) -> None:
+        hold = self.question_hold_seconds
+        if isinstance(hold, bool) or not isinstance(hold, (int, float)) or not math.isfinite(hold) or hold < 0:
+            raise ValueError("question_hold_seconds must be finite and non-negative")
+        if hold == 0:
+            return
+        wall = self.wall_clock_seconds if wall_clock_seconds is None else wall_clock_seconds
+        if (isinstance(wall, bool) or not isinstance(wall, (int, float)) or not math.isfinite(wall)
+                or wall <= 0 or hold + wall >= self.budget.reservation_ttl_seconds):
+            raise ValueError("question hold plus wall clock must be under reservation_ttl_seconds")
+
+    def validate_holds(self) -> None:
+        self.validate_hold()
+        if self.question_hold_seconds == 0:
+            return
+        for profile in self.profiles.values():
+            if profile.get("wall_clock_seconds") is not None:
+                self.validate_hold(profile["wall_clock_seconds"])
+        for entry in [*self.routes, *self.poll_sources]:
+            if entry.get("wall_clock_seconds") is not None:
+                self.validate_hold(entry["wall_clock_seconds"])
+        path = self.state_dir / "jobs.json"
+        if path.exists():
+            try:
+                jobs = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise ValueError(f"cannot validate held job limits in {path}: {exc}") from exc
+            if isinstance(jobs, dict):
+                for job in jobs.values():
+                    if isinstance(job, dict) and job.get("wall_clock_seconds") is not None:
+                        self.validate_hold(job["wall_clock_seconds"])
+
     def as_dict(self) -> dict[str, Any]:
         """Serialisable form. Secrets are shown as presence, never as values."""
         return {
@@ -230,6 +264,7 @@ class Config:
             "sandbox": self.sandbox,
             "approval_policy": self.approval_policy,
             "wall_clock_seconds": self.wall_clock_seconds,
+            "question_hold_seconds": self.question_hold_seconds,
             "max_tokens": self.max_tokens,
             "otlp_endpoint": self.otlp_endpoint,
             "pool": dataclasses.asdict(self.pool),
@@ -322,5 +357,6 @@ def load(path: str | os.PathLike[str] | None = None, **overrides: Any) -> Config
             setattr(config, key, value)
 
     config.validate_profiles()
+    config.validate_holds()
     config.validate_public_profiles()
     return config

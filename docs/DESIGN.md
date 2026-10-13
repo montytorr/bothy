@@ -86,6 +86,12 @@ tests for durable resumption the architecture did not have. If work must survive
 a restart it lives *outside* the restartable process. If you only offer
 prevention, the fence protecting live work must be bounded (rule 4).
 
+Bothy chose prevention: Codex threads are ephemeral and each run's CODEX_HOME
+is deleted. An optional bounded human hold (off by default) lets chat or the
+CLI answer a live question or confirmation. It extends the run wall clock only
+up to a total configured cap below the budget reservation TTL. Expiry and
+shutdown decline outstanding requests; no restart or durable resume is offered.
+
 ## 9. Exit code 0 is not proof of work.
 
 Consume the input only on a **verified effect**. A credential-blocked worker

@@ -262,7 +262,7 @@ def cmd_run(args: argparse.Namespace, config: Config) -> int:
     runner, _, _, _ = build(config)
     result = runner.run(subject=args.subject, prompt=args.prompt, cairn_ref=args.ref,
                         wall_clock_seconds=args.wall_clock, profile=args.profile,
-                        max_tokens=args.max_tokens)
+                        max_tokens=args.max_tokens, foreground=True)
     if args.json:
         print(json.dumps(result.as_dict(), indent=2))
     else:
@@ -798,6 +798,28 @@ def cmd_reap(args: argparse.Namespace, config: Config) -> int:
 # --------------------------------------------------------------------------
 
 
+def cmd_answer(args: argparse.Namespace, config: Config) -> int:
+    from .interrupts import control_transaction, live_pending, valid_id, write_control
+
+    if not valid_id(args.interrupt_id):
+        print("bothy: invalid interrupt id (expected int_ followed by 32 lowercase hex digits)", file=sys.stderr)
+        return 2
+    config.ensure_dirs()
+    try:
+        with control_transaction(config.control_dir):
+            if not live_pending(config.control_dir, args.interrupt_id):
+                (config.control_dir / f"{args.interrupt_id}.answer").unlink(missing_ok=True)
+                (config.control_dir / f"{args.interrupt_id}.pending").unlink(missing_ok=True)
+                print(f"bothy: {args.interrupt_id} is not a live announced question", file=sys.stderr)
+                return 1
+            write_control(config.control_dir, f"{args.interrupt_id}.answer", {"text": args.text, "actor": "cli"})
+    except OSError as exc:
+        print(f"bothy: cannot write answer: {exc}", file=sys.stderr)
+        return 1
+    print(f"{args.interrupt_id}: answer recorded")
+    return 0
+
+
 def cmd_cancel(args: argparse.Namespace, config: Config) -> int:
     """Request a clean interrupt, then reap an unresponsive owned group."""
     import time
@@ -933,6 +955,11 @@ def main(argv: list[str] | None = None) -> int:
 
     reap = subparsers.add_parser("reap", help="kill workers a previous instance left behind")
     reap.set_defaults(func=cmd_reap)
+
+    answer = subparsers.add_parser("answer", help="answer a currently held question or approval")
+    answer.add_argument("interrupt_id")
+    answer.add_argument("text")
+    answer.set_defaults(func=cmd_answer)
 
     cancel = subparsers.add_parser("cancel", help="interrupt a live Bothy run")
     cancel.add_argument("run_id")

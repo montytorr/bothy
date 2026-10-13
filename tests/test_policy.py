@@ -124,7 +124,7 @@ class VerdictTests(RunnerCase):
         self.assertEqual(answer.decision, "accept")
         self.assertEqual(self.records()[0]["action"], "proceed")
 
-    def test_a_guide_reason_reaches_the_wire_payload(self) -> None:
+    def test_a_codex_guide_reason_stays_in_the_audit(self) -> None:
         reason = "Draft the message in the task note instead; a person sends it."
         c = codex.CodexClient(run_id="r", codex_home="/tmp/bothy-test-home",
                               approval=self.approval(self.profile(rule("guide", reason=reason))))
@@ -132,7 +132,8 @@ class VerdictTests(RunnerCase):
         c._send = sent.append  # type: ignore[assignment]
         c._handle_server_request({"id": 9, "method": "item/mcpToolCall/requestApproval",
                                   "params": approval_request()})
-        self.assertEqual(sent, [{"id": 9, "result": {"decision": "decline", "reason": reason}}])
+        self.assertEqual(sent, [{"id": 9, "result": {"decision": "decline"}}])
+        self.assertEqual(self.records()[0]["data"]["reason"], reason)
         self.assertEqual(self.records()[0]["action"], "guide")
 
     def test_a_tool_with_no_rule_is_declined_by_default_and_audited(self) -> None:
@@ -158,9 +159,9 @@ class VerdictTests(RunnerCase):
                               approval=self.approval(self.profile()))
         sent: list[dict[str, Any]] = []
         c._send = sent.append  # type: ignore[assignment]
-        c._handle_server_request({"id": 3, "method": "mcpServer/elicitation/request", "params": approval_request()})
+        c._handle_server_request({"id": 3, "method": "some/unknown/request", "params": approval_request()})
         self.assertEqual(sent[0]["error"]["code"], -32601)
-        self.assertEqual(self.records()[0]["data"]["method"], "mcpServer/elicitation/request")
+        self.assertEqual(self.records()[0]["data"]["method"], "some/unknown/request")
 
     def test_a_failing_policy_declines_on_the_wire(self) -> None:
         def broken(method: str, params: dict[str, Any]) -> codex.ApprovalDecision:
@@ -250,7 +251,17 @@ class HostedToolTests(RunnerCase):
         ran: list[str] = []
         self.ran = ran
         base = ToolRegistry([DynamicTool("bothy_note", "d", {}, lambda a: ran.append("x") or "ok")])
-        return base.gated(self.runner._tool_gate("run_1", "ACME-1", active))
+        c = codex.CodexClient(run_id="run_1", codex_home="unused", tools=base,
+                              tool_approval=lambda params: self.approval(active)(policy.HOSTED_METHOD, params))
+        sent = []
+        c._send = sent.append
+        class Calls:
+            def call(self, name, arguments):
+                c._handle_server_request({"id": 1, "method": "item/tool/call", "params": {
+                    "threadId": "thread", "turnId": "turn", "callId": "call", "tool": name, "arguments": arguments}})
+                response = sent[-1]["result"]
+                return response["success"], response["contentItems"][0]["text"]
+        return Calls()
 
     def test_a_hosted_tool_rule_declines_and_the_handler_never_runs(self) -> None:
         active = Profile.from_dict("p", {"tools": ["bothy_note"], "approvals": [

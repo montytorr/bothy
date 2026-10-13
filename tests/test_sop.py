@@ -6,6 +6,7 @@ import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from bothy.audit import AuditLog
@@ -41,7 +42,7 @@ class SopTests(unittest.TestCase):
         self.schedule = Schedule(self.config.state_dir / "jobs.json")
         self.sink = Sink()
         self.daemon = Daemon(
-            self.config, runner=object(),
+            self.config, runner=SimpleNamespace(),
             admission=Admission(PoolPolicy(), BudgetLedger(self.config.budget_path, BudgetPolicy(mode="api"))),
             audit=AuditLog(self.config.audit_path), registry=ProcessRegistry(self.config.registry_path),
             alerter=self.sink, routes=[Route(path="/x", secret="s")],

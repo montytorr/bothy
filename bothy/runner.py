@@ -29,6 +29,9 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+import hashlib
+import json
+import sys
 import math
 import shutil
 import traceback
@@ -40,10 +43,12 @@ from .alert import Alerter
 from .capability import Profile, ToolRegistry, builtin_tools, render_config_toml
 from .audit import AuditError, AuditLog
 from .budget import PRICING, Usage
+from .interrupts import Entry, InterruptBoard
 from .config import Config
 from .pool import Admission, Refused
 from .proc import ProcessRegistry
 from .tracker import CairnTracker, CairnUnavailable
+from .wake import fence_untrusted
 from .trace import build_trace, post_trace, span_fields, summarize_items
 
 __all__ = ["Runner", "RunResult"]
@@ -91,6 +96,9 @@ class Runner:
         registry: ProcessRegistry,
         tracker: CairnTracker | None = None,
         alerter: Alerter | None = None,
+        interrupt_board: InterruptBoard | None = None,
+        post_question: Callable[[dict[str, Any], str], list[str]] | None = None,
+        stopping: Callable[[], bool] | None = None,
     ) -> None:
         self.config = config
         self.admission = admission
@@ -98,6 +106,9 @@ class Runner:
         self.registry = registry
         self.tracker = tracker
         self.alerter = alerter
+        self.interrupt_board = interrupt_board or InterruptBoard(audit)
+        self.post_question = post_question
+        self.stopping = stopping or (lambda: False)
         self._last_used_percent: float | None = None
         self._last_resets_at: str | None = None
         self.checklist_path = config.state_dir / "checklist.md"
@@ -144,11 +155,12 @@ class Runner:
         posting to Discord fails.
         """
         self._record(
-            kind="run", action="question", status="pending",
+            kind="run", action="question", status="refused" if question.secret else "pending",
             run_id=run_id, subject=subject,
-            data={"prompt": question.prompt, "method": question.method, "asked_at": question.asked_at},
+            data={"prompt": question.prompt, "method": question.method, "asked_at": question.asked_at,
+                  **({"reason": "isSecret question declined; cannot collect secrets through chat"} if question.secret else {})},
         )
-        if self.alerter is None:
+        if question.secret or self.alerter is None:
             return
         try:
             self.alerter.incident(
@@ -224,21 +236,20 @@ class Runner:
                                                    reason="the decision could not be audited")
             else:
                 self._record(**fields)
-        if decision.status == "awaiting_human":
-            self._awaiting_human(run_id, subject, decision)
-        if decision.gated and not decision.proceeds:
+        if decision.gated and not decision.proceeds and not (
+                decision.status == "awaiting_human" and self.config.question_hold_seconds > 0):
             self._approval_declined(run_id, subject, decision)
         return decision
 
-    def _awaiting_human(self, run_id: str, subject: str, decision: policy.ApprovalDecision) -> None:
-        """SEAM for BOTHY-31: a ``confirm`` rule has declined the call pending a human.
+    def _awaiting_human(self, run_id: str, subject: str,
+                        decision: policy.ApprovalDecision) -> codex.ApprovalDecision:
+        """Hand the RPC to the client hold; its notifier posts on another thread.
 
-        Today this is only the audit record (``status="awaiting_human"``) the
-        caller already wrote. BOTHY-31 puts the chat hold here: ask the person,
-        and write the ``interrupt``/``answered`` record that policy.py documents
-        so the next attempt proceeds. It may stop the turn with the client's
-        ``_interrupt("awaiting_human")``; this method deliberately does not.
+        The reader must remain free to read turn/interrupt. With a zero hold the
+        client answers this decline immediately, retaining the existing policy.
         """
+        return codex.ApprovalDecision("decline", reason=decision.reason, hold=True,
+                                     server=decision.server, tool=decision.tool)
 
     def _approval_declined(self, run_id: str, subject: str, decision: policy.ApprovalDecision) -> None:
         """A tool pinned to ask for approval was refused. It used to be declined in silence."""
@@ -267,25 +278,12 @@ class Runner:
 
         def approve(method: str, params: dict[str, Any]) -> codex.ApprovalDecision:
             decision = self._decide_approval(method, params, run_id=run_id, subject=subject, active=active,
-                                             counter=counter)
-            return codex.ApprovalDecision("accept" if decision.proceeds else "decline", reason=decision.reason)
+                                             counter=counter, audit_unmatched=method != policy.HOSTED_METHOD)
+            if decision.status == "awaiting_human":
+                return self._awaiting_human(run_id, subject, decision)
+            return codex.ApprovalDecision("accept" if decision.proceeds else "decline", reason=decision.reason,
+                                         server=decision.server, tool=decision.tool)
         return approve
-
-    def _tool_gate(self, run_id: str, subject: str, active: Profile | None,
-                   counter: Iterator[int] | None = None) -> Callable[[str, Any], str | None]:
-        """Gate for Bothy-hosted tools: a decline reason, or None to let the call run.
-
-        Only a matching rule is audited here; BOTHY-26 records every hosted
-        call as ``kind="tool"`` and a second record per call would be noise.
-        """
-        counter = counter if counter is not None else itertools.count(1)
-
-        def gate(name: str, arguments: Any) -> str | None:
-            decision = self._decide_approval("item/tool/call", {"tool": name, "arguments": arguments},
-                                             run_id=run_id, subject=subject, active=active,
-                                             audit_unmatched=False, counter=counter)
-            return None if decision.proceeds else (decision.reason or f"{name} was declined by policy")
-        return gate
 
     def profile(self, name: str | None) -> Profile | None:
         """Resolve a named capability bundle, or None for built-ins only."""
@@ -379,6 +377,8 @@ class Runner:
         profile: str | None = None,
         max_tokens: int | None = None,
         untrusted: bool = False,
+        reply_to: dict[str, Any] | None = None,
+        foreground: bool = False,
     ) -> RunResult:
         run_id = ids.run_id()
         started = clock.iso()
@@ -464,6 +464,7 @@ class Runner:
                 max_tokens = active.max_tokens
             if max_tokens is None:
                 max_tokens = self.config.max_tokens
+            self.config.validate_hold(wall_clock_seconds)
             if not math.isfinite(wall_clock_seconds) or wall_clock_seconds <= 0:
                 raise ValueError("wall_clock_seconds must be positive and finite")
             if max_tokens is not None and (type(max_tokens) is not int or max_tokens <= 0):
@@ -476,8 +477,7 @@ class Runner:
             return finish_refused()
 
         approval_numbers = itertools.count(1)
-        registry = self._registry(active, untrusted=untrusted).gated(
-            self._tool_gate(run_id, subject, active, approval_numbers))
+        registry = self._registry(active, untrusted=untrusted)
         approval_handler = self._approval_handler(run_id, subject, active, approval_numbers)
         home = self.config.homes_dir / run_id
         cancel_path = self.config.control_dir / f"{run_id}.cancel"
@@ -507,6 +507,69 @@ class Runner:
                          data={**call, "turn_id": call.get("turn_id") or turn_id,
                                "thread_id": call.get("thread_id") or thread_id})
 
+        interrupt_ids: set[str] = set()
+
+        def interrupt_answered(pending: codex.PendingInterrupt, text: str, actor: str) -> bool:
+            decision = ("approve" if text.strip().lower() in {"approve", "yes"} else "decline") \
+                if pending.kind == "approval" else "answer"
+            try:
+                self.audit.append(kind="interrupt", action="answered", status="ok", actor=actor,
+                                  run_id=run_id, subject=subject,
+                                  span=span_fields(run_id, pending.id, parent="turn:1", start=pending.asked_at, end=clock.iso(), status="ok"),
+                                  data=({"decision": decision, "server": pending.server, "tool": pending.tool}
+                                        if pending.kind == "approval" else
+                                        {"interrupt_id": pending.id, "decision": decision, "text": text[:2000],
+                                         "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}))
+            except AuditError as exc:
+                self._audit_unwritable(exc)
+                return False
+            return True
+
+        def interrupt_resolved(pending: codex.PendingInterrupt, state: str) -> None:
+            self.interrupt_board.remove(pending.id)
+            if state != "answered":
+                self._record(kind="interrupt", action=state, status="refused", run_id=run_id, subject=subject,
+                             span=span_fields(run_id, pending.id, parent="turn:1", start=pending.asked_at, end=clock.iso(), status="refused"),
+                             data={"interrupt_id": pending.id, "decision": "decline"})
+
+        def interrupt_asked(pending: codex.PendingInterrupt) -> bool:
+            self._record(kind="interrupt", action="asked", status="pending", run_id=run_id, subject=subject,
+                         span=span_fields(run_id, pending.id, parent="turn:1", start=pending.asked_at),
+                         data={"interrupt_id": pending.id, "prompt": pending.prompt, "kind": pending.kind,
+                               "server": pending.server, "tool": pending.tool})
+            text = (f"Bothy needs an answer ({pending.id}, up to {self.config.question_hold_seconds:g}s):\n"
+                    f"{pending.prompt[:1500]}\n")
+            if pending.kind == "approval":
+                arguments = pending.params.get("arguments")
+                if arguments is None:
+                    for container in ("_meta", "item", "invocation", "call", "toolCall"):
+                        nested = pending.params.get(container)
+                        if isinstance(nested, dict):
+                            arguments = nested.get("arguments", nested.get("args"))
+                            if arguments is not None:
+                                break
+                summary = json.dumps(arguments, ensure_ascii=False, default=str) if arguments is not None else "Arguments not provided by Codex."
+                text += "Tool arguments:\n" + fence_untrusted(summary, limit=300) + "\n"
+                text += "Reply approve or yes to approve; anything else declines.\n"
+            text += f"Reply here or run: bothy answer {pending.id} -- '<text>'"
+            refs = []
+            if self.post_question and reply_to:
+                try:
+                    refs = self.post_question(reply_to, text)
+                except Exception:  # noqa: BLE001 - a failed post cannot activate a hold
+                    pass
+            if not refs and not foreground:
+                return False
+            if foreground:
+                # A terminal is a reply channel only for explicit bothy run.
+                # stderr keeps --json output valid while the CLI hint is visible.
+                print(text, file=sys.stderr, flush=True)
+            def register() -> None:
+                interrupt_ids.add(pending.id)
+                self.interrupt_board.register(Entry(pending.id, pending.deadline, run_id, subject, reply_to or {},
+                    lambda text, actor: client.answer(pending.id, text, actor), refs=set(refs)))
+            return client.activate_interrupt(pending, register)
+
         client = codex.CodexClient(
             run_id=run_id,
             codex_home=home,
@@ -514,11 +577,18 @@ class Runner:
             on_event=on_event,
             approval=approval_handler,
             on_tool_call=tool_called,
+            tool_approval=lambda params: approval_handler(policy.HOSTED_METHOD, params),
             # Tell a human WHILE the run is still going. Alerting at the end
             # would be the same silence with extra steps — by then the turn has
             # already carried on without the answer.
             on_question=lambda question: self._question_asked(run_id, subject, question),
             tools=registry,
+            question_hold_seconds=self.config.question_hold_seconds,
+            reply_channel=foreground or bool(reply_to and self.post_question),
+            control_dir=self.config.control_dir,
+            on_interrupt=interrupt_asked,
+            on_answer=interrupt_answered,
+            on_resolved=interrupt_resolved,
         )
         spent = 0.0
         pricing = PRICING.get(self.config.budget.model_pricing, PRICING["default"])
@@ -531,7 +601,7 @@ class Runner:
                 self.admission.report(run_id, spent)
 
         def should_stop() -> codex.StopReason | None:
-            if cancel_path.exists():
+            if cancel_path.exists() or (self.stopping() and client.interrupts):
                 return "cancelled"
             if self.config.budget.mode == "api" and spent > admitted.reservation.amount:
                 return "budget"
@@ -635,6 +705,9 @@ class Runner:
         finally:
             # Invariant one: the group always dies.
             disposal = client.close(grace_seconds=0.25 if result.stop_reason == "cancelled" else 10)
+            for interrupt_id in tuple(interrupt_ids):
+                self.interrupt_board.remove(interrupt_id)
+                (self.config.control_dir / f"{interrupt_id}.answer").unlink(missing_ok=True)
             # Invariant two: the reservation is always settled.
             settled = self.admission.release(run_id, ok=(result.status == "completed"), actual=spent)
             result.finished_at = clock.iso()
@@ -650,7 +723,7 @@ class Runner:
                       # A run that completed with questions outstanding did the
                       # work around a gap somebody flagged. `bothy audit` should
                       # not have to read the transcript to notice.
-                      "questions_unanswered": len(result.questions)},
+                      "questions_unanswered": sum(not q.get("answered", False) for q in result.questions)},
             )
             # Per-run homes are disposable; keeping them would grow without bound,
             # and Codex rollouts are the single biggest disk risk on a small box.
