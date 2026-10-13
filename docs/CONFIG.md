@@ -18,6 +18,28 @@ that holds it, and the value is read at startup from a `0600` file.
 | `home` | `~/.bothy` | State directory |
 | `workspace` | cwd | Where workers run |
 
+## Scheduled jobs
+
+Jobs live in `state/jobs.json` and are written with `bothy schedule add`
+(flags in OPERATING.md). Every field, with its default:
+
+| Field | Default | |
+|---|---|---|
+| `id`, `kind`, `spec` | required | `kind` is `at`, `every` or `cron`; `spec` an ISO instant, seconds or five cron fields |
+| `prompt` | `""` | |
+| `subject` | `null` | The lane; `schedule add` uses `job:<id>` |
+| `enabled` | `true` | |
+| `tz` | `UTC` | |
+| `active_hours` | `null` | `[start, end)` in the job's timezone |
+| `min_spacing_seconds` | `60.0` | |
+| `heartbeat` | `false` | Append the standing checklist (fenced as untrusted) |
+| `profile` | `null` | Capability profile; none means built-ins only |
+| `drove` | `null` | A Drove action instead of a prompt (see Drove) |
+| `sop` | `null` | See the next section |
+| `validate`, `max_attempts` | `null`, `1` | See Scheduled goals |
+| `wall_clock_seconds`, `max_tokens` | `null` | Per-job limits; unset falls back to the profile, then the worker |
+| `last_fired_at`, `next_due_at`, `misfires` | | Bookkeeping Bothy maintains |
+
 ## Standard operating procedures
 
 A scheduled job can carry a procedure written in MUST / SHOULD / MAY form:
@@ -94,14 +116,10 @@ known config, profile and stored job wall clock must be strictly below
 run-specific overrides are checked before starting a worker. The environment
 key is `BOTHY_QUESTION_HOLD_SECONDS`. For example, `300` allows a five-minute
 hold; actual waiting extends the wall clock by at most 300 seconds across all
-questions in that run. At most 16 requests may be held concurrently, and
-notification workers are capped at two across runs. A chat hold activates only
-after a successful thread post; notification attempts expire within five seconds.
-A foreground `bothy run` can instead activate a hold by printing the CLI answer
-hint. Background webhook/poll/job runs with no chat origin decline immediately;
-a failed chat post also declines without waiting for the full hold. With `0`, questions and confirmations decline immediately.
-The daemon drain is serial: a held run delays other model wakes, which is why
-the default is zero. Threads and worker homes remain disposable.
+questions in that run. With `0`, questions and confirmations decline
+immediately. The daemon drain is serial: a held run delays other model wakes,
+which is why the default is zero. How a hold is answered, and its other limits,
+are in OPERATING.md ("Answering a held question or approval").
 
 ## Trace export
 
@@ -125,9 +143,18 @@ The same endpoint can be overridden by `BOTHY_OTLP_ENDPOINT`.
 | Key | Default | |
 |---|---|---|
 | `pool.max_workers` | `2` | Not 1: a pool that only ever runs one job is untested concurrency |
+| `pool.min_workers` | `1` | Floor the self-healing pool shrinks to |
+| `pool.recompute_seconds` | `30.0` | How often the pool size is recomputed from recent outcomes |
+| `pool.window_seconds` | `900.0` | How far back recent outcomes count |
+| `pool.recent_samples` | `20` | Outcomes kept in the window |
+| `pool.min_samples` | `4` | Fewer outcomes than this never change the size |
+| `pool.grow_below_ratio` | `0.01` | Failure ratio below which the pool may grow |
+| `pool.shrink_above_ratio` | `0.05` | Failure ratio above which it shrinks |
+| `pool.collapse_above_ratio` | `0.50` | Failure ratio above which it falls to one worker and probes |
 | `budget.mode` | `subscription` | or `api` |
 | `budget.per_run_usd` | `2.0` | The **worst case**, reserved at admission |
 | `budget.per_day_usd` | `25.0` | |
+| `budget.model_pricing` | `default` | Which price table converts usage to dollars (`api` mode) |
 | `budget.per_run_percent` | `2.0` | Subscription mode |
 | `budget.ceiling_percent` | `85.0` | Of the rate-limit window |
 | `budget.reservation_ttl_seconds` | `3600` | A crashed run's reservation expires |
@@ -164,13 +191,22 @@ racing.
 | `discord_allow_from[]` | `[]` | **Deny by default.** Empty refuses to start |
 | `discord_channels[]` | `[]` | Empty means any channel the bot can see |
 | `discord_message_content` | `true` | A privileged intent; without it messages arrive empty |
+| `slack_profile` / `discord_profile` | `null` | Capability profile for runs woken from that chat; none means Codex built-ins only |
+| `slack_ack_emoji` | `eyes` | Reaction Bothy adds to a Slack message it accepted |
 
 ## Capability
 
 | Key | Default | |
 |---|---|---|
-| `profiles{}` | `{}` | Named bundles: `mcp_servers`, `mcp_tools`, `mcp_ask`, `approvals`, `tools`, `skill_roots`, `sandbox`, `model`, `max_tokens`, `wall_clock_seconds` |
+| `profiles{}` | `{}` | Named bundles; see the profile keys below |
 | `default_profile` | `null` | A job naming none gets **nothing** beyond Codex's built-ins |
+
+Profile keys, each defaulting to nothing granted: `mcp_servers` `{}`, `mcp_tools`
+`{}`, `mcp_ask` `{}`, `approvals` `[]`, `tools` `[]`, `skill_roots` `[]`,
+`allow_from_untrusted` `false`, `sandbox` / `model` / `approval_policy` (`null`:
+the config-wide value), `developer_instructions` `null`, `config` `{}` (extra
+Codex config, written verbatim) and the run limits `max_tokens` /
+`wall_clock_seconds` (`null`: fall through to the config-wide ones).
 
 `mcp_tools` scopes which of a server's tools are enabled; `mcp_ask` pins
 individual ones to `approval_mode = always`. Naming a tool in `mcp_ask` that is
@@ -223,8 +259,8 @@ still required. If the log cannot be read, the call is **denied**. An answer
 collected by the bounded chat hold or `bothy answer` writes that record.
 
 Unknown keys are refused at load, in the config and in every profile, naming the
-key. `max_tokens` and `wall_clock_seconds` are profile keys too: per-profile
-limits that apply between a run's own limit and the config-wide one.
+key, and a config error exits 78. This is a change from 0.1.0, which dropped
+them silently: run `bothy doctor` before restarting after an upgrade.
 
 Webhook and polling runs cannot use `bothy_checklist_update` or `bothy_note`,
 even when their profile lists those tools. These writes persist into later
@@ -236,6 +272,14 @@ digests in the audit log, and heartbeat checklists are fenced as untrusted data.
 A profile used by a public route must give every `mcp_servers` entry an explicit
 list in `mcp_tools`, including when the route inherits `default_profile`.
 Missing lists are a startup error; an empty list grants no tools.
+
+## Memory
+
+| Key | Default | |
+|---|---|---|
+| `cairn_binary` | `cairn` | The Cairn CLI |
+| `cairn_agent` | `bothy` | The agent name Bothy files notes under |
+| `cairn_project` | `null` | Limits Bothy's Cairn task lookups to this project key |
 
 ## Alerting
 
