@@ -177,6 +177,27 @@ class Config:
         for path in (self.home, self.state_dir, self.wake_dir, self.homes_dir):
             path.mkdir(parents=True, exist_ok=True)
 
+    def validate_public_profiles(self, routes: list[Any] | None = None) -> None:
+        """Public input must never reach an MCP server with an implicit grant."""
+        from .capability import Profile
+
+        for route in self.routes if routes is None else routes:
+            entry = route if isinstance(route, dict) else vars(route)
+            if not entry.get("public"):
+                continue
+            name = entry.get("profile") or self.default_profile
+            if not name:
+                continue
+            if name not in self.profiles:
+                raise ValueError(f"public route {entry.get('path')}: no capability profile called {name!r}")
+            profile = Profile.from_dict(name, self.profiles[name])
+            for server in profile.mcp_servers:
+                if not isinstance(profile.mcp_tools.get(server), list):
+                    raise ValueError(
+                        f"public route {entry.get('path')}: profile {name} grants MCP server "
+                        f"{server!r} without an mcp_tools list; list the allowed tools explicitly"
+                    )
+
     def as_dict(self) -> dict[str, Any]:
         """Serialisable form. Secrets are shown as presence, never as values."""
         return {
@@ -268,4 +289,5 @@ def load(path: str | os.PathLike[str] | None = None, **overrides: Any) -> Config
         if hasattr(config, key):
             setattr(config, key, value)
 
+    config.validate_public_profiles()
     return config

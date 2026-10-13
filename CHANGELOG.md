@@ -9,6 +9,15 @@ Every release states its **Breaking Changes** heading even when it is empty.
 
 ## Unreleased
 
+### Security
+
+- **Prompt injection protection (BOTHY-23):** webhook payloads cannot replace
+  the prompt; payloads, poll items and heartbeat checklists use fresh nonce
+  fences with explicit truncation notices. Webhook and poll runs lose shared
+  memory writes unless their profile sets `allow_from_untrusted: true`;
+  checklist writes record SHA-256 digests, and public routes require explicit
+  MCP tool allowlists.
+
 ### Added
 - **Wake sources:** signed webhooks, schedules, Slack (Socket Mode), Discord
   (gateway) and polling — all producing wakes on one durable queue and passing

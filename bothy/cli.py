@@ -433,11 +433,13 @@ def cmd_drove(args: argparse.Namespace, config: Config) -> int:
 
 def cmd_checklist(args: argparse.Namespace, config: Config) -> int:
     """Show or replace the standing checklist a heartbeat carries."""
+    from .capability import write_checklist
+
     config.ensure_dirs()
     path = config.state_dir / "checklist.md"
     if args.set is not None:
         text = sys.stdin.read() if args.set == "-" else args.set
-        path.write_text(text.strip() + "\n", encoding="utf-8")
+        write_checklist(path, text, AuditLog(config.audit_path))
         print(f"checklist written to {path} ({len(text.strip())} chars)")
         return 0
     if not path.exists():
