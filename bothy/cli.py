@@ -13,6 +13,7 @@ import argparse
 import json
 import pathlib
 import sys
+import tempfile
 from typing import Any
 
 import os
@@ -30,7 +31,7 @@ from .wake import Route
 from .pool import Admission
 from .proc import ProcessRegistry
 from .runner import Runner
-from .schedule import Job, Schedule, ScheduleError
+from .schedule import SOP_MAX_BYTES, Job, Schedule, ScheduleError, read_sop, resolve_sop
 from .tracker import CairnTracker
 
 __all__ = ["main", "build"]
@@ -312,6 +313,8 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
                 flags.append("heartbeat")
             if job.profile:
                 flags.append(job.profile)
+            if job.sop:
+                flags.append(f"sop {job.sop}")
             if job.drove:
                 flags.append("drove " + " ".join(f"{k}={v}" for k, v in job.drove.items() if k != "action"))
             if not job.enabled:
@@ -334,10 +337,10 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
         job = schedule.put(Job(
             id=args.id, kind=args.kind, spec=args.spec, prompt="" if action else args.prompt,
             subject=args.subject, tz=args.tz, heartbeat=args.heartbeat, profile=args.profile,
-            drove=action,
+            drove=action, sop=args.sop,
             min_spacing_seconds=args.min_spacing,
             active_hours=[args.active_from, args.active_to] if args.active_from is not None else None,
-        ))
+        ), sops_dir=config.sops_dir)
     except ScheduleError as exc:
         # Validated now, at the moment a human can fix it, rather than at 3am
         # when it was supposed to fire.
@@ -446,6 +449,37 @@ def cmd_checklist(args: argparse.Namespace, config: Config) -> int:
         print(f"no checklist yet — write one with: bothy checklist --set - < notes.md\n({path})")
         return 0
     print(path.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def cmd_sop(args: argparse.Namespace, config: Config) -> int:
+    """List, show or write the standard operating procedures jobs can carry."""
+    if args.action == "list":
+        names = sorted(path.stem for path in config.sops_dir.glob("*.md")) if config.sops_dir.is_dir() else []
+        print("\n".join(f"  {name}" for name in names) if names else "no SOPs yet")
+        return 0
+    if not args.name:
+        print(f"bothy: sop {args.action} needs a name", flush=True)
+        return EX_CONFIG
+    try:
+        path = resolve_sop(config.sops_dir, args.name)
+        if args.action == "show":
+            print(read_sop(config.sops_dir, args.name)[0])
+            return 0
+        text = (sys.stdin.read() if args.source in (None, "-") else pathlib.Path(args.source).read_text(encoding="utf-8"))
+        text = text.strip()
+        if not text or len(text.encode("utf-8")) > SOP_MAX_BYTES:
+            raise ScheduleError(f"sop {args.name!r} must be 1 to {SOP_MAX_BYTES} bytes")
+    except (ScheduleError, OSError) as exc:
+        print(f"bothy: {exc}", flush=True)
+        return EX_CONFIG
+    config.sops_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=config.sops_dir, suffix=".tmp", delete=False) as handle:
+        handle.write(text + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(handle.name, path)
+    print(f"sop {args.name} written to {path} ({len(text)} chars)")
     return 0
 
 
@@ -802,6 +836,8 @@ def main(argv: list[str] | None = None) -> int:
     schedule.add_argument("--subject", default=None, help="lane to occupy; defaults to job:<id>")
     schedule.add_argument("--tz", default="UTC")
     schedule.add_argument("--profile", default=None, help="capability profile for this job")
+    schedule.add_argument("--sop", default=None, metavar="NAME",
+                          help="carry the standard operating procedure in <home>/sops/NAME.md")
     schedule.add_argument("--heartbeat", action="store_true",
                           help="carry the standing checklist and honour NO_REPLY")
     drove_what = schedule.add_mutually_exclusive_group()
@@ -832,6 +868,12 @@ def main(argv: list[str] | None = None) -> int:
     checklist = subparsers.add_parser("checklist", help="the standing checklist a heartbeat carries")
     checklist.add_argument("--set", default=None, help="replace it; '-' reads stdin")
     checklist.set_defaults(func=cmd_checklist)
+
+    sop = subparsers.add_parser("sop", help="standard operating procedures a job can carry")
+    sop.add_argument("action", choices=["list", "show", "set"])
+    sop.add_argument("name", nargs="?", default=None)
+    sop.add_argument("source", nargs="?", default=None, help="set: a file path; omit or '-' for stdin")
+    sop.set_defaults(func=cmd_sop)
 
     serve = subparsers.add_parser("serve", help="run the daemon in the foreground")
     serve.add_argument("--reap", action="store_true",

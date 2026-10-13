@@ -30,6 +30,7 @@ a dead man's switch has to be held by someone still alive.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import json
 import os
 import signal
@@ -50,7 +51,7 @@ from .retention import RetentionPolicy, sweep
 from .runner import Runner
 from .poll import PollState, Poller, Source
 from .drove import AttentionForwarder, DroveCli, DroveRuns, reaction_for
-from .schedule import Job, Schedule, strip_no_reply
+from .schedule import Job, Schedule, ScheduleError, read_sop, strip_no_reply
 from .vendor.a2a_reactor.lease import LeaseBusy, reactor_lease
 from .ratelimit import RateLimiter
 from .wake import Route, WakeServer, WakeStore, fence_untrusted
@@ -245,12 +246,14 @@ class Daemon:
                         continue        # Drove's, and handled by drove_wakes
                     subject = str(event.get("subject") or event["id"])
 
+                    if self._too_old(event) or self._too_many_attempts(event):
+                        continue
+                    if self._retry_delay(event) > 0:
+                        continue
+
                     if subject in busy_lanes or pool_exhausted:
                         self._defer(event, gate="lane_busy" if subject in busy_lanes else "pool_full",
                                     reason="skipped: capacity already known exhausted this pass")
-                        continue
-
-                    if self._too_old(event) or self._too_many_attempts(event):
                         continue
 
                     result = self.runner.run(
@@ -315,6 +318,14 @@ class Daemon:
             return wake_id
 
         prompt = job.prompt
+        sop_sha = None
+        if job.sop:
+            try:
+                sop_text, sop_sha = read_sop(self.config.sops_dir, job.sop)
+            except ScheduleError as exc:
+                return self._refuse_sop(job, str(exc))
+            prompt = (f"{prompt}\n\nStandard operating procedure `{job.sop}` "
+                      f"(MUST = required; SHOULD = unless you say why; MAY = optional):\n{sop_text}")
         if job.heartbeat:
             checklist = self._checklist()
             if checklist:
@@ -333,10 +344,36 @@ class Daemon:
             "profile": job.profile,
             "processed": False,
         }
+        if job.sop:
+            event["sop"] = job.sop
+            event["sop_sha256"] = sop_sha
         self.store.append(event)
         self.audit.append(kind="schedule", action="fired", subject=job.lane(),
                           data={"job": job.id, "wake": wake_id, "kind": job.kind,
                                 "spec": job.spec, "misfires": job.misfires})
+        return wake_id
+
+    def _refuse_sop(self, job: Job, error: str) -> str:
+        """A job whose SOP cannot be read must not run without it, and must not raise.
+
+        Raising would leave the job due and refire it every 20 seconds, so the
+        refusal is recorded as an already-processed wake and the caller moves on.
+        """
+        wake_id = ids_wake_id()
+        now = clock.iso()
+        self.store.append({
+            "id": wake_id, "received_at": now, "route": f"schedule:{job.id}",
+            "subject": job.lane(), "delivery_key": f"job:{job.id}:{wake_id}",
+            "payload": {"job": job.id}, "sop": job.sop, "processed": True,
+            "processed_at": now, "outcome": "refused", "gate": "sop_missing", "reason": error,
+        })
+        self.audit.append(kind="schedule", action="refused", subject=job.lane(), status="refused",
+                          data={"job": job.id, "wake": wake_id, "gate": "sop_missing",
+                                "sop": job.sop, "error": error})
+        self.alerter.incident(job=f"sop:{job.id}", error=error, severity="warning",
+                              title=f"job {job.id} did not run",
+                              summary=f"Its standard operating procedure `{job.sop}` is missing, empty or too large.",
+                              reaction="Restore or replace the SOP:", command=f"bothy sop show {job.sop}")
         return wake_id
 
     def _schedule_loop(self) -> None:
@@ -431,6 +468,8 @@ class Daemon:
                 break
             if self._too_old(event) or self._too_many_attempts(event):
                 continue
+            if self._retry_delay(event) > 0:
+                continue
             route = str(event.get("route", "?"))
             result = self.drove_runs.start(raw, wake=event["id"], source=route)
             if result.transient:
@@ -501,14 +540,32 @@ class Daemon:
         to look.
         """
         attempts = int(event.get("attempts", 0)) + 1
+        now = clock.utcnow()
+        gap = min(64, 4 * 2 ** min(attempts - 1, 4))
         fields: dict[str, Any] = {
             "attempts": attempts,
             "last_gate": gate,
-            "last_deferred_at": clock.iso(),
+            "last_deferred_at": clock.iso(now),
+            "next_attempt_at": clock.iso(now + dt.timedelta(seconds=gap)),
         }
         if not event.get("waiting_since"):
             fields["waiting_since"] = event.get("received_at") or clock.iso()
         self.store.mark(event["id"], **fields)
+
+    def _retry_delay(self, event: dict[str, Any]) -> float:
+        """Seconds until this wake is eligible, bounded across a clock jump."""
+        value = event.get("next_attempt_at")
+        if not value:
+            return 0.0
+        now = clock.utcnow()
+        try:
+            delay = (clock.parse(str(value)) - now).total_seconds()
+        except (ValueError, TypeError):
+            return 0.0
+        if delay > 64:
+            self.store.mark(event["id"], next_attempt_at=clock.iso(now + dt.timedelta(seconds=64)))
+            return 64.0
+        return max(0.0, delay)
 
     def _abandon(self, event: dict[str, Any], *, reason: str) -> None:
         """Give up on a wake, visibly. Never silently."""
@@ -561,7 +618,14 @@ class Daemon:
             # Woken by a wake, and also on a timer as a catch-up — one path is
             # the trigger, the other is the recovery, and both go through the
             # same lease so only one of them ever runs.
-            self._drain_wanted.wait(timeout=15.0)
+            timeout = 15.0
+            for event in self.store.pending():
+                if isinstance(event.get("drove"), dict):
+                    continue
+                delay = self._retry_delay(event)
+                if delay > 0:
+                    timeout = min(timeout, delay)
+            self._drain_wanted.wait(timeout=timeout)
             self._drain_wanted.clear()
             if self._stopping.is_set():
                 break

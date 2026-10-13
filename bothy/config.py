@@ -148,6 +148,11 @@ class Config:
         return self.home / "state"
 
     @property
+    def sops_dir(self) -> Path:
+        """Standard operating procedures: trusted text, outside the workspace."""
+        return self.home / "sops"
+
+    @property
     def audit_path(self) -> Path:
         return self.home / "audit.jsonl"
 
