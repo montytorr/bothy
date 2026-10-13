@@ -296,18 +296,26 @@ class ControlsTests(unittest.TestCase):
 
     def test_job_limits_survive_storage_and_the_wake_wire_format(self) -> None:
         schedule = Schedule(self.config.state_dir / "jobs.json")
-        schedule.put(Job("limited", "every", "60", wall_clock_seconds=45, max_tokens=1000))
+        self.config.sops_dir.mkdir()
+        (self.config.sops_dir / "limited.md").write_text("MUST: inspect the queued task")
+        schedule.put(Job("limited", "every", "60", wall_clock_seconds=45, max_tokens=1000,
+                         sop="limited"), sops_dir=self.config.sops_dir)
         job = schedule.get("limited")
         daemon = Daemon(self.config, runner=self.runner, admission=self.admission, audit=self.audit,
                         registry=self.registry, alerter=None, routes=[])
         daemon.fire(job)
         event = WakeStore(self.config.wake_dir).pending()[0]
         self.assertEqual((event["wall_clock_seconds"], event["max_tokens"]), (45, 1000))
+        self.assertEqual(event["sop"], "limited")
+        self.assertEqual(len(event["sop_sha256"]), 64)
+        self.assertIn("MUST: inspect the queued task", event["prompt"])
         with mock.patch.object(self.runner, "run", return_value=SimpleNamespace(
                 status="completed", refusal=None, messages=[], run_id=self.run_id)) as run:
             daemon.drain()
         self.assertEqual(run.call_args.kwargs["max_tokens"], 1000)
         self.assertEqual(run.call_args.kwargs["wall_clock_seconds"], 45)
+        self.assertEqual(run.call_args.kwargs["prompt"], event["prompt"])
+        self.assertFalse(run.call_args.kwargs["untrusted"])
         self.assertIsNone(Job.from_dict({"id": "legacy", "kind": "every", "spec": "60"}).max_tokens)
 
     def test_cli_schedule_limit_flags_are_persisted(self) -> None:
@@ -331,6 +339,14 @@ class ControlsTests(unittest.TestCase):
                 code = main(["--config", str(self.config_path), "schedule", "add", "invalid", flag, value])
                 self.assertNotEqual(code, 0)
                 self.assertIsNone(Schedule(self.config.state_dir / "jobs.json").get("invalid"))
+
+    def test_taint_and_token_cap_both_reach_the_runner_after_merge(self) -> None:
+        with mock.patch.object(self.runner, "_registry", wraps=self.runner._registry) as registry:
+            result = self.harness(self.client(usage={"totalTokens": 1200}, complete=True),
+                                  max_tokens=1000, untrusted=True)
+        registry.assert_called_once_with(None, untrusted=True)
+        self.assertEqual(result.stop_reason, "token_cap")
+        self.assert_freed()
 
 
 if __name__ == "__main__":

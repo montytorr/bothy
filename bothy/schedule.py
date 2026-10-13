@@ -48,6 +48,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import tempfile
 import threading
 from pathlib import Path
@@ -92,6 +93,42 @@ def strip_no_reply(messages: list[str]) -> list[str]:
     return kept
 
 
+SOP_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+SOP_MAX_BYTES = 16 * 1024
+
+
+def resolve_sop(sops_dir: Path, name: str) -> Path:
+    """The file a SOP name points at, which must stay inside ``sops_dir``.
+
+    Resolving first is what defeats a symlink pointing out of the directory.
+    """
+    if not isinstance(name, str) or not SOP_NAME.match(name):
+        raise ScheduleError(f"sop {name!r} is not a bare name (lowercase letters, digits, hyphens)")
+    root = sops_dir.resolve()
+    path = (sops_dir / f"{name}.md").resolve()
+    if path.parent != root:
+        raise ScheduleError(f"sop {name!r} resolves outside {sops_dir}")
+    return path
+
+
+def read_sop(sops_dir: Path, name: str) -> tuple[str, str]:
+    """The text and sha256 of a SOP. Missing, empty or oversized is an error, never a truncation."""
+    path = resolve_sop(sops_dir, name)
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise ScheduleError(f"sop {name!r} cannot be read: {exc.strerror or exc}") from exc
+    if len(raw) > SOP_MAX_BYTES:
+        raise ScheduleError(f"sop {name!r} is {len(raw)} bytes, over the {SOP_MAX_BYTES} limit")
+    try:
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise ScheduleError(f"sop {name!r} is not UTF-8") from exc
+    if not text:
+        raise ScheduleError(f"sop {name!r} is empty")
+    return text, hashlib.sha256(raw).hexdigest()
+
+
 @dataclasses.dataclass
 class Job:
     """One scheduled thing."""
@@ -109,6 +146,7 @@ class Job:
     profile: str | None = None                 # capability bundle; None = built-ins only
     # An action for Drove instead of a prompt: no model turn, no Codex. See drove.py.
     drove: dict[str, Any] | None = None
+    sop: str | None = None                     # a bare name; resolved to <home>/sops/<name>.md
     last_fired_at: str | None = None
     next_due_at: str | None = None
     misfires: int = 0
@@ -238,7 +276,7 @@ class Schedule:
         raw = self._load().get(job_id)
         return Job.from_dict(raw) if raw else None
 
-    def put(self, job: Job) -> Job:
+    def put(self, job: Job, *, sops_dir: Path | None = None) -> Job:
         """Add or replace a job, validating it now rather than at fire time."""
         if job.max_tokens is not None and (type(job.max_tokens) is not int or job.max_tokens <= 0):
             raise ScheduleError(f"job {job.id}: max_tokens must be a positive integer or null")
@@ -249,6 +287,11 @@ class Schedule:
                 valid = False
             if not valid:
                 raise ScheduleError(f"job {job.id}: wall_clock_seconds must be positive and finite")
+        if job.sop is not None:
+            if sops_dir is not None:
+                read_sop(sops_dir, job.sop)         # missing, empty or oversized refuses
+            elif not isinstance(job.sop, str) or not SOP_NAME.match(job.sop):
+                raise ScheduleError(f"job {job.id}: sop {job.sop!r} is not a bare name")
         job.compute_next()          # raises ScheduleError on a bad spec
         job.zone()
         if job.drove is not None:

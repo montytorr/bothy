@@ -235,6 +235,9 @@ class Poller:
 
     def poll(self, source: Source) -> tuple[PollResult, list[dict[str, Any]]]:
         """Poll one source. Returns the outcome and any wakes to enqueue."""
+        # wake imports Drove, which uses dig from this module.
+        from .wake import fence_untrusted
+
         entry = self.state.get(source.name)
         result = PollResult(source=source.name, status="ok")
         try:
@@ -298,9 +301,10 @@ class Poller:
                 "route": f"poll:{source.name}",
                 "subject": source.subject(item, wake_id),
                 "delivery_key": f"poll:{source.name}:{item_id}",
-                "payload": {"item": item, "source": source.name,
-                            **({"prompt": source.prompt_template.format(item=json.dumps(item, indent=1)[:4000])}
-                               if source.prompt_template else {})},
+                "payload": {"item": item, "source": source.name},
+                **({"prompt": source.prompt_template.format(
+                    item=fence_untrusted(json.dumps(item, indent=1), limit=4000))}
+                   if source.prompt_template else {}),
                 "profile": source.profile,
                 "processed": False,
             })

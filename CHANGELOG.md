@@ -9,11 +9,28 @@ Every release states its **Breaking Changes** heading even when it is empty.
 
 ## Unreleased
 
+### Security
+
+- **Prompt injection protection (BOTHY-23):** webhook payloads cannot replace
+  the prompt; payloads, poll items and heartbeat checklists use fresh nonce
+  fences with explicit truncation notices. Webhook and poll runs lose shared
+  memory writes unless their profile sets `allow_from_untrusted: true`;
+  checklist writes record SHA-256 digests, and public routes require explicit
+  MCP tool allowlists.
+
 ### Added
 - **Lifecycle controls (BOTHY-25):** typed stop reasons on run outcomes and the
   finished audit, per-job token and wall-clock limits with profile/config
   fallbacks, API reservation overruns interrupted live, and `bothy cancel`
   with durable controls and an identity-checked process-group fallback.
+- **Deferred wake backoff:** capacity and transient Drove refusals retry after
+  4 seconds, doubling to a 64-second cap. Deadlines survive restarts, and new
+  wakes do not consume a waiting wake's attempts.
+- **SOP jobs:** `bothy schedule add --sop NAME` gives a job a MUST/SHOULD/MAY
+  procedure from `$BOTHY_HOME/sops/NAME.md`, injected into its prompt at fire time
+  with its sha256 on the wake. A missing, empty or oversized (over 16 KB) file is
+  refused (`sop_missing`), audited and alerted rather than truncated. Manage with
+  `bothy sop list|show|set`. Ships `docs/sops/drove-detached-start.md`.
 - **Wake sources:** signed webhooks, schedules, Slack (Socket Mode), Discord
   (gateway) and polling — all producing wakes on one durable queue and passing
   one admission gate.

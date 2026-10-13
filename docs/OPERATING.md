@@ -50,7 +50,9 @@ Bothy refuses work deliberately and records why. These are all normal:
 - `profile` — a capability profile that does not exist. It will **not** be retried.
 
 A wake that is refused for capacity too often, or waits too long, is
-**abandoned** with an alert rather than retried forever.
+**abandoned** with an alert rather than retried forever. Retries back off from
+4 seconds to a maximum of 64 seconds; 30 refusals take about 28 minutes of
+retries before abandonment. The six-hour age limit still applies.
 
 ## Drove runs
 
@@ -68,7 +70,7 @@ bothy drove attention                    # what needs a person, and whether chat
 
 - a **herdr server running**. Drove opens a workspace in it and never starts it,
   so with none a start is refused `herdr-down` and **waits**, counted, like any
-  capacity refusal (30 attempts, about five minutes, then abandoned out loud);
+  capacity refusal (30 attempts, about 28 minutes of retries, then abandoned out loud);
 - `drove`, `herdr`, `node` 22.18+, `git`, `cairn` and the planner's agent
   (`claude` or `codex`) on `PATH`, **and signed in**;
 - the repository named by `drove_repo`, with its folder trusted once by hand.
@@ -162,6 +164,14 @@ the machine, not from Bothy's budget. `drove_max_runs` (default 1) is the cap.
 **Not yet proven live:** a run started by Bothy's own cron on a real herdr, and
 an item reaching a real channel. Everything above is tested against a stand-in
 for `drove` that speaks the shapes in Drove's README.
+
+## A job that did not run: `sop_missing`
+
+A job with `--sop NAME` whose file has gone missing, is empty or is over 16 KB
+does not run. Its wake is recorded as processed (`refused`, gate `sop_missing`),
+an alert says which SOP, and the job waits for its next time as usual. Fix it
+with `bothy sop show NAME` and `bothy sop set NAME FILE`; nothing needs
+restarting.
 
 ## Things that need a human
 
@@ -268,6 +278,7 @@ and unit; it leaves your config, state and secrets alone.
 $BOTHY_HOME/
   config.json           settings; never secrets
   audit.jsonl           hash-chained record, rotated with the chain intact
+  sops/                 standard operating procedures (<name>.md), see `bothy sop`
   state/
     heartbeat.json      watch this from outside
     lifecycle.json      proves whether the last stop was clean

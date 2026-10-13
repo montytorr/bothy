@@ -197,7 +197,7 @@ class Runner:
             raise KeyError(f"no capability profile called {chosen!r}")
         return Profile.from_dict(chosen, raw)
 
-    def _registry(self, profile: Profile | None) -> ToolRegistry:
+    def _registry(self, profile: Profile | None, *, untrusted: bool = False) -> ToolRegistry:
         """The dynamic tools this run may call, hosted inside Bothy."""
         tracker = self.tracker
 
@@ -211,12 +211,14 @@ class Runner:
 
         everything = builtin_tools(
             checklist_path=self.checklist_path,
+            audit=self.audit,
             note=note if tracker is not None else None,
             status=lambda: self.admission.snapshot(),
         )
         if profile is None or not profile.tools:
             return ToolRegistry()
-        return everything.select(profile.tools)
+        return everything.select(profile.tools, untrusted=untrusted,
+                                 allow_from_untrusted=profile.allow_from_untrusted)
 
     def _seed_home(self, home: Path) -> None:
         """Give an isolated worker home the credentials it needs.
@@ -265,6 +267,7 @@ class Runner:
         wake_id: str | None = None,
         profile: str | None = None,
         max_tokens: int | None = None,
+        untrusted: bool = False,
     ) -> RunResult:
         run_id = ids.run_id()
         started = clock.iso()
@@ -353,7 +356,7 @@ class Runner:
             self.admission.release(run_id, ok=False, actual=0.0)
             return result
 
-        registry = self._registry(active)
+        registry = self._registry(active, untrusted=untrusted)
         home = self.config.homes_dir / run_id
         cancel_path = self.config.control_dir / f"{run_id}.cancel"
         client = codex.CodexClient(

@@ -35,11 +35,17 @@ the heartbeat design always assumed and nothing previously implemented.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-__all__ = ["Profile", "DynamicTool", "ToolRegistry", "builtin_tools", "render_config_toml"]
+from .audit import AuditLog
+
+__all__ = ["Profile", "DynamicTool", "ToolRegistry", "builtin_tools", "render_config_toml",
+           "write_checklist"]
 
 
 # --------------------------------------------------------------------------
@@ -67,6 +73,7 @@ class Profile:
     mcp_ask: dict[str, list[str]] = dataclasses.field(default_factory=dict)
     skill_roots: list[str] = dataclasses.field(default_factory=list)
     tools: list[str] = dataclasses.field(default_factory=list)
+    allow_from_untrusted: bool = False
     sandbox: str | None = None
     model: str | None = None
     approval_policy: str | None = None
@@ -93,6 +100,10 @@ class Profile:
         approval" and unintentionally *enables* send. Silently dropping the gate
         would be worse. So it is refused and the author says what they meant.
         """
+        if not isinstance(self.allow_from_untrusted, bool):
+            raise ValueError(f"profile {self.name}: allow_from_untrusted must be true or false")
+        if not isinstance(self.mcp_tools, dict):
+            raise ValueError(f"profile {self.name}: mcp_tools must map server names to tool lists")
         for server, ask in self.mcp_ask.items():
             if server not in self.mcp_servers:
                 raise ValueError(
@@ -124,7 +135,7 @@ class Profile:
             ask = self.mcp_ask.get(server) or []
             # Naming the tools, not just the server: "mcp: gmail" reads as
             # harmless and may include `send`.
-            scope = ", ".join(allowed) if allowed else "ALL TOOLS"
+            scope = ", ".join(allowed) if allowed else ("NO TOOLS" if allowed == [] else "ALL TOOLS")
             bits.append(f"mcp {server}({scope})" + (f" ask:{','.join(ask)}" if ask else ""))
         if self.tools:
             bits.append("tools: " + ", ".join(self.tools))
@@ -193,7 +204,7 @@ def render_config_toml(profile: Profile | None, *, extra: dict[str, Any] | None 
                 if isinstance(value, dict) or key in {"enabled_tools", "tools"}:
                     continue
                 lines.append(f"{key} = {_toml_value(value)}")
-            if allowed:
+            if allowed is not None:
                 # Least privilege, rendered rather than remembered. Without this
                 # a profile that wanted one read-only tool gets every tool the
                 # server happens to expose, including whatever it adds next.
@@ -239,14 +250,17 @@ class ToolRegistry:
     def add(self, tool: DynamicTool) -> None:
         self._tools[tool.name] = tool
 
-    def select(self, names: list[str]) -> "ToolRegistry":
+    def select(self, names: list[str], *, untrusted: bool = False,
+               allow_from_untrusted: bool = False) -> "ToolRegistry":
         """A registry holding only the named tools. Unknown names are ignored.
 
         Ignored rather than rejected because a profile naming a tool that a
         future version renamed should degrade to less capability, never to a
         run that refuses to start.
         """
-        return ToolRegistry([self._tools[name] for name in names if name in self._tools])
+        blocked = {"bothy_checklist_update", "bothy_note"} if untrusted and not allow_from_untrusted else set()
+        return ToolRegistry([self._tools[name] for name in names
+                             if name in self._tools and name not in blocked])
 
     def specs(self) -> list[dict[str, Any]]:
         return [tool.spec() for tool in self._tools.values()]
@@ -275,9 +289,37 @@ class ToolRegistry:
             return False, f"{name} failed: {type(exc).__name__}: {exc}"
 
 
+def write_checklist(path: Path, text: str, audit: AuditLog) -> None:
+    """Record the old and new contents' hashes for every checklist writer."""
+    try:
+        before = path.read_bytes()
+    except FileNotFoundError:
+        before = b""
+    after = (text.strip() + "\n").encode("utf-8")
+    hashes = {"before_sha256": hashlib.sha256(before).hexdigest(),
+              "after_sha256": hashlib.sha256(after).hexdigest()}
+    # Record intent before touching shared memory; a failed audit denies the write.
+    audit.append(kind="checklist", action="replace", status="pending", data=hashes)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("wb", dir=path.parent, prefix=path.name,
+                                         suffix=".tmp", delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(after)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    audit.append(kind="checklist", action="replaced", data=hashes)
+
+
 def builtin_tools(
     *,
     checklist_path: Path,
+    audit: AuditLog,
     note: Callable[[str, str], bool] | None = None,
     status: Callable[[], dict[str, Any]] | None = None,
 ) -> ToolRegistry:
@@ -295,12 +337,11 @@ def builtin_tools(
         except OSError:
             return "(no checklist yet)"
 
-    def write_checklist(args: dict[str, Any]) -> str:
+    def update_checklist(args: dict[str, Any]) -> str:
         text = str(args.get("checklist") or "").strip()
         if not text:
             return "refused: an empty checklist would silently disable every future heartbeat"
-        checklist_path.parent.mkdir(parents=True, exist_ok=True)
-        checklist_path.write_text(text + "\n", encoding="utf-8")
+        write_checklist(checklist_path, text, audit)
         return f"checklist replaced, {len(text)} characters"
 
     registry.add(DynamicTool(
@@ -321,7 +362,7 @@ def builtin_tools(
             "properties": {"checklist": {"type": "string", "description": "the complete new checklist"}},
             "required": ["checklist"],
         },
-        handler=write_checklist,
+        handler=update_checklist,
     ))
 
     if note is not None:
