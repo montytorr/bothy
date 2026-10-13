@@ -806,8 +806,20 @@ def cmd_answer(args: argparse.Namespace, config: Config) -> int:
         return 2
     config.ensure_dirs()
     try:
+        pending_path = config.control_dir / f"{args.interrupt_id}.pending"
+        try:
+            announced = pending_path.read_text(encoding="utf-8")
+        except OSError:
+            announced = ""
+        # Identity probes may invoke ps. Do not make the supervision tick wait
+        # on them while it removes a marker during shutdown.
+        live = live_pending(config.control_dir, args.interrupt_id)
         with control_transaction(config.control_dir):
-            if not live_pending(config.control_dir, args.interrupt_id):
+            try:
+                current = pending_path.read_text(encoding="utf-8")
+            except OSError:
+                current = ""
+            if not live or not current or current != announced or clock.monotonic() >= float(json.loads(current)["deadline"]):
                 (config.control_dir / f"{args.interrupt_id}.answer").unlink(missing_ok=True)
                 (config.control_dir / f"{args.interrupt_id}.pending").unlink(missing_ok=True)
                 print(f"bothy: {args.interrupt_id} is not a live announced question", file=sys.stderr)

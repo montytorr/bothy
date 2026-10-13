@@ -458,6 +458,41 @@ class HoldLimits(unittest.TestCase):
             self.assertFalse((config.control_dir / (identifier + ".pending")).exists())
 
 
+    def test_cli_identity_probe_cannot_block_shutdown_decline_or_leave_stale_answer(self):
+        config = Config(home=self.home)
+        config.ensure_dirs()
+        c = codex.CodexClient(run_id="r", codex_home="unused", question_hold_seconds=300, reply_channel=True,
+                              control_dir=config.control_dir, on_interrupt=lambda p: True)
+        c._send = mock.Mock()
+        c._handle_server_request({"id": 7, "method": "item/tool/requestUserInput", "params": QUESTION})
+        pending = next(iter(c.interrupts.values()))
+        c.activate_interrupt(pending)
+        entered, release = threading.Event(), threading.Event()
+        results = []
+        def probe(*args):
+            entered.set()
+            release.wait(timeout=1)
+            return True
+        def answer():
+            with contextlib.redirect_stderr(io.StringIO()):
+                results.append(cmd_answer(argparse.Namespace(interrupt_id=pending.id, text="late"), config))
+        with mock.patch("bothy.interrupts.live_pending", side_effect=probe):
+            worker = REAL_THREAD(target=answer, daemon=True)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(timeout=0.5))
+                stopped = threading.Event()
+                stop = REAL_THREAD(target=lambda: (c._tick_interrupts(stopping=True), stopped.set()), daemon=True)
+                stop.start()
+                self.assertTrue(stopped.wait(timeout=0.3), "CLI process probe held the control lock")
+                c._send.assert_called_once()
+                stop.join(timeout=0.5)
+            finally:
+                release.set()
+                worker.join(timeout=0.5)
+        self.assertEqual(results, [1])
+        self.assertEqual(list(config.control_dir.glob("*.answer")), [])
+
     def test_cli_double_dash_keeps_leading_dash_answer_text(self):
         from bothy.cli import main
         config = Config(home=self.home)
