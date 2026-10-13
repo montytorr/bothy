@@ -95,6 +95,8 @@ class Config:
     approval_policy: str = "never"
     wall_clock_seconds: float = 900.0
     max_tokens: int | None = None
+    # Optional observation export. Credentials belong in the OTEL environment.
+    otlp_endpoint: str | None = None
     # concurrency and money
     pool: PoolPolicy = dataclasses.field(default_factory=PoolPolicy)
     budget: BudgetPolicy = dataclasses.field(default_factory=BudgetPolicy)
@@ -220,6 +222,7 @@ class Config:
             "approval_policy": self.approval_policy,
             "wall_clock_seconds": self.wall_clock_seconds,
             "max_tokens": self.max_tokens,
+            "otlp_endpoint": self.otlp_endpoint,
             "pool": dataclasses.asdict(self.pool),
             "budget": dataclasses.asdict(self.budget),
             "codex_credentials": "present" if (self.codex_credentials_dir / "auth.json").exists() else "MISSING",

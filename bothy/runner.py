@@ -43,6 +43,7 @@ from .config import Config
 from .pool import Admission, Refused
 from .proc import ProcessRegistry
 from .tracker import CairnTracker, CairnUnavailable
+from .trace import build_trace, post_trace, span_fields, summarize_items
 
 __all__ = ["Runner", "RunResult"]
 
@@ -197,6 +198,15 @@ class Runner:
             raise KeyError(f"no capability profile called {chosen!r}")
         return Profile.from_dict(chosen, raw)
 
+    def _export_trace(self, run_id: str, subject: str) -> None:
+        if not self.config.otlp_endpoint:
+            return
+        try:
+            post_trace(lambda: build_trace(self.audit, run_id), self.config.otlp_endpoint)
+        except Exception as exc:  # noqa: BLE001 - export cannot change the run's outcome
+            self._record(kind="export", action="failed", status="failed", run_id=run_id, subject=subject,
+                         data={"error": type(exc).__name__, "deadline_seconds": 2, "retry": False})
+
     def _registry(self, profile: Profile | None, *, untrusted: bool = False) -> ToolRegistry:
         """The dynamic tools this run may call, hosted inside Bothy."""
         tracker = self.tracker
@@ -307,9 +317,20 @@ class Runner:
                 )
             return result
 
+        run_start = admitted.admitted_at
         self._record(kind="run", action="admitted", run_id=run_id, subject=subject,
+                     span=span_fields(run_id, "run", start=run_start),
                      data={"reservation": admitted.reservation.id, "amount": admitted.reservation.amount,
                            "unit": admitted.reservation.unit, "wake_id": wake_id})
+
+        def finish_refused() -> RunResult:
+            self.admission.release(run_id, ok=False, actual=0.0)
+            result.finished_at = clock.iso()
+            self._record(kind="run", action="finished", status="refused", run_id=run_id, subject=subject,
+                         span=span_fields(run_id, "run", start=run_start, end=result.finished_at, status="refused"),
+                         data={"outcome": "refused", "refusal": result.refusal, "usage": {}, "stop_reason": None})
+            self._export_trace(run_id, subject)
+            return result
 
         # --- claim the task, so the ledger shows the work while it happens ---
         if cairn_ref and self.tracker is not None:
@@ -331,8 +352,7 @@ class Runner:
             result.refusal = {"gate": "profile", "reason": str(exc)}
             self._record(kind="run", action="refused", status="refused", run_id=run_id,
                          subject=subject, data=result.refusal)
-            self.admission.release(run_id, ok=False, actual=0.0)
-            return result
+            return finish_refused()
 
         try:
             limits = self.config.profiles.get(active.name, {}) if active else {}
@@ -353,17 +373,43 @@ class Runner:
             result.refusal = {"gate": "limits", "reason": str(exc)}
             self._record(kind="run", action="refused", status="refused", run_id=run_id,
                          subject=subject, data=result.refusal)
-            self.admission.release(run_id, ok=False, actual=0.0)
-            return result
+            return finish_refused()
 
         registry = self._registry(active, untrusted=untrusted)
         home = self.config.homes_dir / run_id
         cancel_path = self.config.control_dir / f"{run_id}.cancel"
+        turn_start: str | None = None
+        turn_id: str | None = None
+        thread_id: str | None = None
+        turn_recorded = False
+
+        def turn_started(known_id: str | None) -> None:
+            nonlocal turn_id, turn_recorded
+            turn_id = known_id or turn_id
+            if turn_recorded or turn_start is None:
+                return
+            turn_recorded = True
+            self._record(kind="turn", action="started", status="pending", run_id=run_id, subject=subject,
+                         span=span_fields(run_id, "turn:1", parent="run", start=turn_start),
+                         data={"turn_id": turn_id, "thread_id": thread_id})
+
+        def on_event(method: str, params: dict[str, Any]) -> None:
+            if method == "turn/started":
+                turn_started((params.get("turn") or {}).get("id"))
+
+        def tool_called(call: dict[str, Any]) -> None:
+            self._record(kind="tool", action="called", status=call["status"], run_id=run_id, subject=subject,
+                         span=span_fields(run_id, f"tool:{call['call_id']}", parent="turn:1",
+                                          start=call["start"], end=call["end"], status=call["status"]),
+                         data={**call, "turn_id": call.get("turn_id") or turn_id,
+                               "thread_id": call.get("thread_id") or thread_id})
+
         client = codex.CodexClient(
             run_id=run_id,
             codex_home=home,
             binary=self.config.codex_binary,
-            on_event=lambda method, params: None,
+            on_event=on_event,
+            on_tool_call=tool_called,
             # Tell a human WHILE the run is still going. Alerting at the end
             # would be the same silence with extra steps — by then the turn has
             # already carried on without the answer.
@@ -428,14 +474,34 @@ class Runner:
                                "tools": registry.names(),
                                "mcp": sorted(active.mcp_servers) if active else []})
 
-            outcome = client.run_turn(
-                thread_id=thread_id,
-                text=prompt,
-                wall_clock_seconds=wall_clock_seconds,
-                max_tokens=max_tokens,
-                on_usage=meter,
-                should_stop=should_stop,
-            )
+            turn_start = clock.iso()
+            try:
+                outcome = client.run_turn(
+                    thread_id=thread_id,
+                    text=prompt,
+                    wall_clock_seconds=wall_clock_seconds,
+                    max_tokens=max_tokens,
+                    on_usage=meter,
+                    should_stop=should_stop,
+                    on_started=turn_started,
+                )
+            except Exception as exc:
+                turn_started(turn_id)
+                self._record(kind="turn", action="finished", status="failed", run_id=run_id, subject=subject,
+                             span=span_fields(run_id, "turn:1", parent="run", start=turn_start,
+                                              end=clock.iso(), status="failed"),
+                             data={"turn_id": turn_id, "thread_id": thread_id, "status": "failed",
+                                   "stop_reason": None, "error": str(exc), "error_code": type(exc).__name__,
+                                   "usage": {}, "items": []})
+                raise
+            turn_started(outcome.turn_id)
+            self._record(kind="turn", action="finished", status=outcome.status, run_id=run_id, subject=subject,
+                         span=span_fields(run_id, "turn:1", parent="run", start=turn_start,
+                                          end=clock.iso(), status=outcome.status),
+                         data={"turn_id": outcome.turn_id, "thread_id": thread_id, "status": outcome.status,
+                               "stop_reason": outcome.stop_reason, "error": outcome.error,
+                               "error_code": outcome.error_code, "usage": outcome.usage,
+                               "items": summarize_items(outcome.items)})
             self._observe(outcome)
             result.status = outcome.status
             result.stop_reason = outcome.stop_reason
@@ -472,6 +538,8 @@ class Runner:
                 kind="run", action="finished",
                 status="ok" if result.status == "completed" else result.status,
                 run_id=run_id, subject=subject,
+                span=span_fields(run_id, "run", start=run_start, end=result.finished_at,
+                                 status=result.status),
                 data={"outcome": result.status, "cost": round(settled, 5), "unit": result.unit,
                       "disposal": disposal, "usage": result.usage, "error": result.error,
                       "stop_reason": result.stop_reason,
@@ -485,6 +553,8 @@ class Runner:
             shutil.rmtree(home, ignore_errors=True)
             cancel_path.unlink(missing_ok=True)
             self.registry.unregister(run_id)
+
+        self._export_trace(run_id, subject)
 
         # --- tell memory, and tell a human if they are needed ---
         if cairn_ref and self.tracker is not None:

@@ -33,6 +33,7 @@ from .proc import ProcessRegistry
 from .runner import Runner
 from .schedule import SOP_MAX_BYTES, Job, Schedule, ScheduleError, read_sop, resolve_sop
 from .tracker import CairnTracker
+from .trace import build_trace, post_trace, render_trace
 
 __all__ = ["main", "build"]
 
@@ -284,7 +285,7 @@ def cmd_audit(args: argparse.Namespace, config: Config) -> int:
         except ChainBreak as exc:
             print(f"CHAIN BROKEN at record {exc.sequence} in {exc.path}", file=sys.stderr)
             return 1
-    for record in audit.records():
+    for record in audit.all_records() if args.run else audit.records():
         if args.run and record.get("run_id") != args.run:
             continue
         if args.json:
@@ -292,6 +293,22 @@ def cmd_audit(args: argparse.Namespace, config: Config) -> int:
         else:
             print(f"{record['ts']}  {record['kind']:8} {record['action']:16} {record['status']:8} "
                   f"{record.get('subject') or '-':24} {record.get('run_id') or '-'}")
+    return 0
+
+
+def cmd_trace(args: argparse.Namespace, config: Config) -> int:
+    trace = build_trace(AuditLog(config.audit_path), args.run_id)
+    spans = trace["resourceSpans"][0]["scopeSpans"][0]["spans"]
+    if not spans:
+        print(f"no recorded run: {args.run_id}", file=sys.stderr)
+        return 1
+    if args.otlp:
+        try:
+            post_trace(trace, args.otlp)
+        except Exception as exc:  # noqa: BLE001 - predictable CLI failure without credentials in output
+            print(f"OTLP export failed: {type(exc).__name__}", file=sys.stderr)
+            return 1
+    print(json.dumps(trace, indent=2) if args.json else render_trace(trace))
     return 0
 
 
@@ -858,6 +875,12 @@ def main(argv: list[str] | None = None) -> int:
     audit.add_argument("--verify", action="store_true", help="check the hash chain")
     audit.add_argument("--json", action="store_true")
     audit.set_defaults(func=cmd_audit)
+
+    trace = subparsers.add_parser("trace", help="a run as an OpenTelemetry span tree")
+    trace.add_argument("run_id")
+    trace.add_argument("--json", action="store_true", help="OTLP/JSON")
+    trace.add_argument("--otlp", metavar="URL", help="export once, with a two-second deadline")
+    trace.set_defaults(func=cmd_trace)
 
     install_cmd = subparsers.add_parser("install", help="install as a service; headless and idempotent")
     install_cmd.add_argument("--dry-run", action="store_true", help="print what it would do and stop")

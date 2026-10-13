@@ -19,6 +19,11 @@ Every release states its **Breaking Changes** heading even when it is empty.
   MCP tool allowlists.
 
 ### Added
+- **Run traces (BOTHY-26):** hash-chained run, turn and hosted-tool spans,
+  bounded Codex item summaries, and `bothy trace ID [--json] [--otlp URL]` in
+  Drove's OTLP/JSON shape. Trace and `audit --run` include rotated segments;
+  optional `otlp_endpoint` export drops failures after two seconds, without
+  holding the run's reservation or retrying.
 - **Lifecycle controls (BOTHY-25):** typed stop reasons on run outcomes and the
   finished audit, per-job token and wall-clock limits with profile/config
   fallbacks, API reservation overruns interrupted live, and `bothy cancel`
