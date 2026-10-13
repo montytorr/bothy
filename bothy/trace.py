@@ -109,7 +109,7 @@ def build_trace(records: Iterable[dict[str, Any]] | AuditLog | str | Path, run_i
     groups: dict[str, list[dict[str, Any]]] = {}
     for record in own:
         fields = record.get("span")
-        if fields and record.get("kind") in {"run", "turn", "tool"}:
+        if fields and record.get("kind") in {"run", "turn", "tool", "approval"}:
             groups.setdefault(fields["span_id"], []).append(record)
     admitted = next((r for r in own if r.get("kind") == "run" and r.get("action") == "admitted"), None)
     finished = next((r for r in reversed(own) if r.get("kind") == "run" and r.get("action") == "finished"), None)
@@ -121,17 +121,21 @@ def build_trace(records: Iterable[dict[str, Any]] | AuditLog | str | Path, run_i
         groups.setdefault(fallback["span"]["span_id"], []).append(fallback)
 
     spans = []
-    for group in sorted(groups.values(), key=lambda group: {"run": 0, "turn": 1, "tool": 2}[group[0]["kind"]]):
+    for group in sorted(groups.values(), key=lambda group: {"run": 0, "turn": 1, "tool": 2, "approval": 2}[group[0]["kind"]]):
         first, last = group[0], group[-1]
         fields = last["span"]
         data = {key: value for record in group for key, value in (record.get("data") or {}).items()}
         kind = first["kind"]
         name = (f"run {run_id}" if kind == "run" else
-                f"turn {data.get('turn_id') or '1'}" if kind == "turn" else f"tool {data.get('tool') or first['action']}")
+                f"turn {data.get('turn_id') or '1'}" if kind == "turn" else
+                f"approval {data.get('server') or '?'}.{data.get('tool') or '?'}" if kind == "approval" else
+                f"tool {data.get('tool') or first['action']}")
         start = first["span"]["start"]
         end = fields.get("end") or (finished or own[-1])["ts"]
         attrs = {"bothy.run": run_id, "bothy.subject": first.get("subject"),
                  **{f"bothy.{key}": value for key, value in data.items() if key != "usage"}}
+        if kind == "approval":
+            attrs["bothy.verdict"] = first["action"]
         if "usage" in data:
             attrs.update(_usage(data["usage"]))
         made = {"traceId": fields["trace_id"], "spanId": fields["span_id"], "name": name, "kind": 1,
@@ -142,15 +146,6 @@ def build_trace(records: Iterable[dict[str, Any]] | AuditLog | str | Path, run_i
         if fields.get("parent_span_id"):
             made["parentSpanId"] = fields["parent_span_id"]
         spans.append(made)
-    # Approval decisions are owned by policy. Their attached span supplies an
-    # event destination, never another span with the same identity.
-    by_id = {span["spanId"]: span for span in spans}
-    for record in own:
-        if record.get("kind") == "approval":
-            parent = by_id.get((record.get("span") or {}).get("span_id")) or by_id.get(_id(run_id, "run", 16))
-            if parent:
-                parent["events"].append({"name": f"approval/{record['action']}", "timeUnixNano": _nano(record["ts"]),
-                                         "attributes": _attributes(record.get("data") or {})})
     return {"resourceSpans": [{"resource": {"attributes": _attributes({"service.name": "bothy"})},
                                "scopeSpans": [{"scope": {"name": "bothy"}, "spans": spans}]}]}
 

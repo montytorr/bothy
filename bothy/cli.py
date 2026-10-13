@@ -1003,7 +1003,13 @@ def main(argv: list[str] | None = None) -> int:
     serve.set_defaults(func=cmd_serve)
 
     args = parser.parse_args(argv)
-    config = load(args.config)
+    try:
+        config = load(args.config)
+    except ValueError as exc:
+        # A config that does not load cannot be fixed by a restart: 78 tells the
+        # service manager to stop, and the message names the key at fault.
+        print(f"bothy: {exc}", file=sys.stderr)
+        return EX_CONFIG
     return int(args.func(args, config))
 
 

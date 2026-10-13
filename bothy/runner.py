@@ -28,13 +28,14 @@ A run that fails is still a run that completed its bookkeeping.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import math
 import shutil
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 
-from . import clock, codex, ids
+from . import clock, codex, ids, policy
 from .alert import Alerter
 from .capability import Profile, ToolRegistry, builtin_tools, render_config_toml
 from .audit import AuditError, AuditLog
@@ -178,13 +179,113 @@ class Runner:
         try:
             self.audit.append(**fields)
         except AuditError as exc:
-            if self.alerter is not None:
-                self.alerter.incident(
-                    job="audit", error=str(exc), severity="critical",
-                    title="the audit log cannot be written",
-                    summary="Bothy cannot record what it is doing.",
-                    reaction="Investigate the disk before trusting the log.",
-                )
+            self._audit_unwritable(exc)
+
+    def _audit_unwritable(self, exc: AuditError) -> None:
+        if self.alerter is not None:
+            self.alerter.incident(
+                job="audit", error=str(exc), severity="critical",
+                title="the audit log cannot be written",
+                summary="Bothy cannot record what it is doing.",
+                reaction="Investigate the disk before trusting the log.",
+            )
+
+    # ---- approvals ------------------------------------------------------
+
+    def _decide_approval(self, method: str, params: dict[str, Any], *, run_id: str, subject: str,
+                         active: Profile | None, audit_unmatched: bool = True,
+                         counter: Iterator[int] | None = None) -> policy.ApprovalDecision:
+        """Evaluate one request, record the decision, and make sure a person hears a gated refusal.
+
+        Each recorded decision is a span under the turn, numbered by ``counter``
+        (one per run, so ids stay unique and a replay of the log is stable).
+        """
+        started = clock.iso()
+        facts = policy.Facts(
+            rules=active.rules() if active else (),
+            mcp_ask={server: list(tools) for server, tools in (active.mcp_ask if active else {}).items()},
+            audit=self.audit,
+        )
+        decision = policy.evaluate(method, params, facts)
+        if audit_unmatched or decision.rule != "default":
+            span = span_fields(run_id, f"approval:{next(counter) if counter is not None else 1}",
+                               parent="turn:1", start=started, end=clock.iso(), status=decision.status)
+            fields = dict(kind="approval", action=decision.audit_action, status=decision.status,
+                          run_id=run_id, subject=subject, span=span, data=decision.audit_data())
+            if decision.proceeds:
+                # A call that goes ahead must leave a record first (DESIGN rule
+                # 16). A decline can safely go through _record, which degrades
+                # loudly; an unaudited proceed cannot.
+                try:
+                    self.audit.append(**fields)
+                except AuditError as exc:
+                    self._audit_unwritable(exc)
+                    decision = dataclasses.replace(decision, verdict="deny", status="refused",
+                                                   reason="the decision could not be audited")
+            else:
+                self._record(**fields)
+        if decision.status == "awaiting_human":
+            self._awaiting_human(run_id, subject, decision)
+        if decision.gated and not decision.proceeds:
+            self._approval_declined(run_id, subject, decision)
+        return decision
+
+    def _awaiting_human(self, run_id: str, subject: str, decision: policy.ApprovalDecision) -> None:
+        """SEAM for BOTHY-31: a ``confirm`` rule has declined the call pending a human.
+
+        Today this is only the audit record (``status="awaiting_human"``) the
+        caller already wrote. BOTHY-31 puts the chat hold here: ask the person,
+        and write the ``interrupt``/``answered`` record that policy.py documents
+        so the next attempt proceeds. It may stop the turn with the client's
+        ``_interrupt("awaiting_human")``; this method deliberately does not.
+        """
+
+    def _approval_declined(self, run_id: str, subject: str, decision: policy.ApprovalDecision) -> None:
+        """A tool pinned to ask for approval was refused. It used to be declined in silence."""
+        if self.alerter is None:
+            return
+        try:
+            self.alerter.incident(
+                job=f"run:{subject}",
+                error=f"{decision.server}.{decision.tool} was declined ({decision.verdict}): {decision.reason}"[:300],
+                severity="warning",
+                run_id=run_id,
+                detail={"subject": subject, **decision.audit_data()},
+                title="an agent was refused a gated tool",
+                summary=f"An agent working on {subject} asked to use {decision.server}.{decision.tool} "
+                        f"and the policy declined it ({decision.rule}).",
+                reaction="See the decision:", command=f"bothy audit --run {run_id}",
+            )
+        except Exception:  # noqa: BLE001
+            # The audit record is the durable one; a notifier that is down must
+            # not turn a refusal into a failed run.
+            pass
+
+    def _approval_handler(self, run_id: str, subject: str, active: Profile | None,
+                          counter: Iterator[int] | None = None) -> Callable[[str, dict[str, Any]], codex.ApprovalDecision]:
+        counter = counter if counter is not None else itertools.count(1)
+
+        def approve(method: str, params: dict[str, Any]) -> codex.ApprovalDecision:
+            decision = self._decide_approval(method, params, run_id=run_id, subject=subject, active=active,
+                                             counter=counter)
+            return codex.ApprovalDecision("accept" if decision.proceeds else "decline", reason=decision.reason)
+        return approve
+
+    def _tool_gate(self, run_id: str, subject: str, active: Profile | None,
+                   counter: Iterator[int] | None = None) -> Callable[[str, Any], str | None]:
+        """Gate for Bothy-hosted tools: a decline reason, or None to let the call run.
+
+        Only a matching rule is audited here; BOTHY-26 records every hosted
+        call as ``kind="tool"`` and a second record per call would be noise.
+        """
+        counter = counter if counter is not None else itertools.count(1)
+
+        def gate(name: str, arguments: Any) -> str | None:
+            decision = self._decide_approval("item/tool/call", {"tool": name, "arguments": arguments},
+                                             run_id=run_id, subject=subject, active=active,
+                                             audit_unmatched=False, counter=counter)
+            return None if decision.proceeds else (decision.reason or f"{name} was declined by policy")
+        return gate
 
     def profile(self, name: str | None) -> Profile | None:
         """Resolve a named capability bundle, or None for built-ins only."""
@@ -355,13 +456,12 @@ class Runner:
             return finish_refused()
 
         try:
-            limits = self.config.profiles.get(active.name, {}) if active else {}
-            if wall_clock_seconds is None:
-                wall_clock_seconds = limits.get("wall_clock_seconds")
+            if wall_clock_seconds is None and active is not None:
+                wall_clock_seconds = active.wall_clock_seconds
             if wall_clock_seconds is None:
                 wall_clock_seconds = self.config.wall_clock_seconds
-            if max_tokens is None:
-                max_tokens = limits.get("max_tokens")
+            if max_tokens is None and active is not None:
+                max_tokens = active.max_tokens
             if max_tokens is None:
                 max_tokens = self.config.max_tokens
             if not math.isfinite(wall_clock_seconds) or wall_clock_seconds <= 0:
@@ -375,7 +475,10 @@ class Runner:
                          subject=subject, data=result.refusal)
             return finish_refused()
 
-        registry = self._registry(active, untrusted=untrusted)
+        approval_numbers = itertools.count(1)
+        registry = self._registry(active, untrusted=untrusted).gated(
+            self._tool_gate(run_id, subject, active, approval_numbers))
+        approval_handler = self._approval_handler(run_id, subject, active, approval_numbers)
         home = self.config.homes_dir / run_id
         cancel_path = self.config.control_dir / f"{run_id}.cancel"
         turn_start: str | None = None
@@ -409,6 +512,7 @@ class Runner:
             codex_home=home,
             binary=self.config.codex_binary,
             on_event=on_event,
+            approval=approval_handler,
             on_tool_call=tool_called,
             # Tell a human WHILE the run is still going. Alerting at the end
             # would be the same silence with extra steps — by then the turn has
