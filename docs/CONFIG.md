@@ -26,8 +26,16 @@ that holds it, and the value is read at startup from a `0600` file.
 | `sandbox` | `readOnly` | The actual boundary. Widen deliberately |
 | `approval_policy` | `never` | *Do not stop to ask* — not *allow anything* |
 | `wall_clock_seconds` | `900` | Enforced with `turn/interrupt`, on a monotonic clock |
+| `max_tokens` | `null` | Interrupt when cumulative input + output tokens reach the cap |
 | `codex_credentials_dir` | `~/.codex` | Where `auth.json` is copied from |
 | `codex_inherit_config` | `false` | Inheriting the host's config makes a client behave unlike your test |
+
+Jobs can set `max_tokens` and `wall_clock_seconds`; unset values fall back to
+the named profile's values, then these worker defaults. `bothy run` and
+`bothy schedule add` accept `--max-tokens N` and `--wall-clock SECONDS`.
+Token limits must be positive integers; wall clocks must be positive and finite.
+Usage arrives in updates, so a token cap can overshoot by an update. API runs
+also interrupt when their metered spend exceeds the reservation made at admission.
 
 ## Concurrency and money
 

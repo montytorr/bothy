@@ -46,6 +46,7 @@ import dataclasses
 import datetime as _dt
 import hashlib
 import json
+import math
 import os
 import tempfile
 import threading
@@ -111,6 +112,8 @@ class Job:
     last_fired_at: str | None = None
     next_due_at: str | None = None
     misfires: int = 0
+    wall_clock_seconds: float | None = None
+    max_tokens: int | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -237,6 +240,15 @@ class Schedule:
 
     def put(self, job: Job) -> Job:
         """Add or replace a job, validating it now rather than at fire time."""
+        if job.max_tokens is not None and (type(job.max_tokens) is not int or job.max_tokens <= 0):
+            raise ScheduleError(f"job {job.id}: max_tokens must be a positive integer or null")
+        if job.wall_clock_seconds is not None:
+            try:
+                valid = math.isfinite(job.wall_clock_seconds) and job.wall_clock_seconds > 0
+            except TypeError:
+                valid = False
+            if not valid:
+                raise ScheduleError(f"job {job.id}: wall_clock_seconds must be positive and finite")
         job.compute_next()          # raises ScheduleError on a bad spec
         job.zone()
         if job.drove is not None:

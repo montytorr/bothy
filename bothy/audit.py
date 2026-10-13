@@ -24,6 +24,7 @@ unauditable harness at a client site should get quieter, not carry on.
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -79,6 +80,7 @@ class AuditLog:
         self.max_bytes = max_bytes
         self._lock = threading.Lock()
         self._tip: tuple[int, str] | None = None
+        self._tip_stat: tuple[int, int] | None = None
 
     # ---- reading -------------------------------------------------------
 
@@ -104,14 +106,60 @@ class AuditLog:
 
     def tip(self) -> tuple[int, str]:
         """The last sequence number and hash, for chaining the next record."""
-        if self._tip is not None:
+        try:
+            stat = self.path.stat()
+            signature = (stat.st_ino, stat.st_size)
+        except FileNotFoundError:
+            signature = None
+        if self._tip is not None and self._tip_stat == signature:
             return self._tip
+        if signature is None or signature[1] == 0:
+            self._tip = (0, GENESIS)
+        else:
+            self._tip = self._tail_tip()
+        if self._tip is not None:
+            self._tip_stat = signature
+            return self._tip
+        # A damaged or unfamiliar tail retains the old tolerant reader's
+        # behaviour. Ordinary appends only read the final complete record.
         sequence, previous = 0, GENESIS
         for record in self.records():
             sequence = int(record.get("seq", sequence))
             previous = str(record.get("hash", previous))
         self._tip = (sequence, previous)
+        self._tip_stat = signature
         return self._tip
+
+    def _tail_tip(self) -> tuple[int, str] | None:
+        with self.path.open("rb") as handle:
+            position = handle.seek(0, os.SEEK_END)
+            tail = b""
+            while position > 0:
+                size = min(position, 4096)
+                position -= size
+                handle.seek(position)
+                tail = handle.read(size) + tail
+                end = tail.rfind(b"\n")
+                if end < 0:
+                    continue
+                complete = tail[:end].rstrip(b"\r\n")
+                start = complete.rfind(b"\n") + 1
+                if start == 0 and position > 0:
+                    continue  # the beginning of the record is in the previous chunk
+                try:
+                    record = json.loads(complete[start:])
+                    if (isinstance(record, dict) and type(record.get("seq")) is int
+                            and isinstance(record.get("hash"), str)):
+                        return record["seq"], record["hash"]
+                except (ValueError, UnicodeDecodeError):
+                    pass
+                return None
+        return None
+
+    def _cache_tip(self, record: dict[str, Any]) -> None:
+        stat = self.path.stat()
+        self._tip = (record["seq"], record["hash"])
+        self._tip_stat = (stat.st_ino, stat.st_size)
 
     def verify(self) -> int:
         """Walk the chain. Return the count verified, or raise ChainBreak.
@@ -162,6 +210,24 @@ class AuditLog:
 
     # ---- writing -------------------------------------------------------
 
+    @contextlib.contextmanager
+    def _transaction(self):
+        """Keep CLI controls and runner records on one chain, including rotation."""
+        with self._lock:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.with_suffix(self.path.suffix + ".lock").open("a") as handle:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                    try:
+                        # tip() checks inode and size while this lock protects
+                        # the read-tail -> append -> fsync transaction.
+                        yield
+                    finally:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError as exc:
+                self._tip = None
+                raise AuditError(f"could not write to {self.path}: {exc}") from exc
+
     def append(
         self,
         *,
@@ -180,7 +246,7 @@ class AuditLog:
         is ok, failed or refused — refusals are first-class, because "did not
         start, and why" is the question an operator actually asks.
         """
-        with self._lock:
+        with self._transaction():
             sequence, previous = self.tip()
             record: dict[str, Any] = {
                 "seq": sequence + 1,
@@ -208,7 +274,7 @@ class AuditLog:
             except OSError as exc:
                 self._tip = None  # our idea of the tip is no longer trustworthy
                 raise AuditError(f"could not append to {self.path}: {exc}") from exc
-            self._tip = (record["seq"], record["hash"])
+            self._cache_tip(record)
             return record
 
     def rotate(self, *, keep: int = 8) -> Path | None:
@@ -219,7 +285,7 @@ class AuditLog:
         its predecessor and that predecessor's final hash, so ``verify`` can
         check each segment alone and confirm the segments join.
         """
-        with self._lock:
+        with self._transaction():
             if not self.path.exists() or self.path.stat().st_size == 0:
                 return None
             sequence, previous = self.tip()
@@ -246,7 +312,7 @@ class AuditLog:
                 handle.write(line)
                 handle.flush()
                 os.fsync(handle.fileno())
-            self._tip = (record["seq"], record["hash"])
+            self._cache_tip(record)
 
             segments = sorted(self.path.parent.glob(f"{self.path.stem}-*{self.path.suffix}"))
             for stale in segments[:-keep] if keep > 0 else segments:

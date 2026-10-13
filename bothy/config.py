@@ -94,6 +94,7 @@ class Config:
     sandbox: str = "readOnly"
     approval_policy: str = "never"
     wall_clock_seconds: float = 900.0
+    max_tokens: int | None = None
     # concurrency and money
     pool: PoolPolicy = dataclasses.field(default_factory=PoolPolicy)
     budget: BudgetPolicy = dataclasses.field(default_factory=BudgetPolicy)
@@ -173,8 +174,13 @@ class Config:
         """
         return self.state_dir / "homes"
 
+    @property
+    def control_dir(self) -> Path:
+        """Durable operator controls, shared by daemon and one-shot runs."""
+        return self.state_dir / "control"
+
     def ensure_dirs(self) -> None:
-        for path in (self.home, self.state_dir, self.wake_dir, self.homes_dir):
+        for path in (self.home, self.state_dir, self.wake_dir, self.homes_dir, self.control_dir):
             path.mkdir(parents=True, exist_ok=True)
 
     def as_dict(self) -> dict[str, Any]:
@@ -187,6 +193,7 @@ class Config:
             "sandbox": self.sandbox,
             "approval_policy": self.approval_policy,
             "wall_clock_seconds": self.wall_clock_seconds,
+            "max_tokens": self.max_tokens,
             "pool": dataclasses.asdict(self.pool),
             "budget": dataclasses.asdict(self.budget),
             "codex_credentials": "present" if (self.codex_credentials_dir / "auth.json").exists() else "MISSING",

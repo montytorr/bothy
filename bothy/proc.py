@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import errno
+import fcntl
 import json
 import os
 import signal
@@ -320,6 +321,16 @@ class ProcessRegistry:
     def __init__(self, path: str | os.PathLike[str]) -> None:
         self.path = Path(path)
 
+    @contextlib.contextmanager
+    def _transaction(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.with_suffix(self.path.suffix + ".lock").open("a") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def _load(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
             return {}
@@ -355,15 +366,17 @@ class ProcessRegistry:
             start_ticks=_start_time(popen.pid),
             boot_id=boot_id(),
         )
-        data = self._load()
-        data[run_id] = worker.as_dict()
-        self._save(data)
+        with self._transaction():
+            data = self._load()
+            data[run_id] = worker.as_dict()
+            self._save(data)
         return worker
 
     def unregister(self, run_id: str) -> None:
-        data = self._load()
-        if data.pop(run_id, None) is not None:
-            self._save(data)
+        with self._transaction():
+            data = self._load()
+            if data.pop(run_id, None) is not None:
+                self._save(data)
 
     def workers(self) -> list[Worker]:
         return [Worker.from_dict(raw) for raw in self._load().values()]

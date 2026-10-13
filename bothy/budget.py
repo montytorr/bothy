@@ -41,6 +41,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import datetime as _dt
+import fcntl
 import json
 import os
 import tempfile
@@ -250,6 +251,18 @@ class BudgetLedger:
 
     # ---- persistence ---------------------------------------------------
 
+    @contextlib.contextmanager
+    def _transaction(self):
+        """Serialize CLI recovery and the runner's report/settle writes."""
+        with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.with_suffix(self.path.suffix + ".lock").open("a") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     def _load(self) -> dict[str, Any]:
         if not self.path.exists():
             return {"day": clock.utcnow().strftime("%Y-%m-%d"), "accrued": 0.0, "reservations": {}}
@@ -314,7 +327,7 @@ class BudgetLedger:
         would double-count. In api mode we are the only one counting.
         """
         want = self.policy.per_run() if amount is None else float(amount)
-        with self._lock:
+        with self._transaction():
             state = self._roll_day(self._load())
             self._drop_expired(state)
 
@@ -361,7 +374,7 @@ class BudgetLedger:
         an overrun immediately squeezes admission for everyone else rather than
         being discovered at settle time.
         """
-        with self._lock:
+        with self._transaction():
             state = self._load()
             raw = state["reservations"].get(reservation_id)
             if raw is None:
@@ -379,7 +392,7 @@ class BudgetLedger:
         Codex's own counter already moved — but the reservation is still
         released so the slot frees immediately rather than at TTL.
         """
-        with self._lock:
+        with self._transaction():
             state = self._roll_day(self._load())
             raw = state["reservations"].pop(reservation_id, None)
             if raw is None:
@@ -404,7 +417,7 @@ class BudgetLedger:
         reported — because the run died mid-flight and the money it had already
         spent is not coming back.
         """
-        with self._lock:
+        with self._transaction():
             state = self._roll_day(self._load())
             settled: list[Reservation] = []
             for key, raw in list(state["reservations"].items()):
@@ -437,7 +450,7 @@ class BudgetLedger:
 
     def expire_stale(self) -> list[Reservation]:
         """Public sweep, for the daemon's janitor to call on a timer."""
-        with self._lock:
+        with self._transaction():
             state = self._roll_day(self._load())
             expired = self._drop_expired(state)
             if expired:

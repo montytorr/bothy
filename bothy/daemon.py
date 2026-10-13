@@ -252,6 +252,8 @@ class Daemon:
                         prompt=self._prompt_for(event),
                         wake_id=event["id"],
                         profile=event.get("profile"),
+                        wall_clock_seconds=event.get("wall_clock_seconds"),
+                        max_tokens=event.get("max_tokens"),
                     )
                     gate = (result.refusal or {}).get("gate")
                     if result.status == "refused" and gate in self.CAPACITY_GATES:
@@ -323,6 +325,8 @@ class Daemon:
             "delivery_key": f"job:{job.id}:{wake_id}",
             "payload": {"prompt": prompt, "job": job.id, "heartbeat": job.heartbeat},
             "profile": job.profile,
+            "wall_clock_seconds": job.wall_clock_seconds,
+            "max_tokens": job.max_tokens,
             "processed": False,
         }
         self.store.append(event)

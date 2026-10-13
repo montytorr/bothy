@@ -10,6 +10,10 @@ Every release states its **Breaking Changes** heading even when it is empty.
 ## Unreleased
 
 ### Added
+- **Lifecycle controls (BOTHY-25):** typed stop reasons on run outcomes and the
+  finished audit, per-job token and wall-clock limits with profile/config
+  fallbacks, API reservation overruns interrupted live, and `bothy cancel`
+  with durable controls and an identity-checked process-group fallback.
 - **Wake sources:** signed webhooks, schedules, Slack (Socket Mode), Discord
   (gateway) and polling — all producing wakes on one durable queue and passing
   one admission gate.
