@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock, patch
 
 from bothy import clock
 from bothy.audit import AuditLog
@@ -45,6 +46,10 @@ def completed(subject: str) -> RunResult:
 
 class QueueTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.now = clock.utcnow()
+        timer = patch("bothy.clock.utcnow", side_effect=lambda: self.now)
+        timer.start()
+        self.addCleanup(timer.stop)
         self.config = Config(home=Path(tempfile.mkdtemp()))
         self.config.ensure_dirs()
         self.audit = AuditLog(self.config.audit_path)
@@ -91,6 +96,90 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(pending[0]["attempts"], 1)
         self.assertEqual(pending[0]["last_gate"], "lane_busy")
 
+    def test_a_deferred_wake_waits_four_seconds_even_after_restart(self) -> None:
+        self.enqueue("w1", "alpha")
+        self.daemon(lambda s: refused(s)).drain()
+        self.now += dt.timedelta(seconds=3)
+        daemon = self.daemon(lambda s: completed(s))
+        daemon.drain()
+        self.assertEqual(daemon.fake_runner.calls, [])  # type: ignore[attr-defined]
+        pending = self.store.pending()[0]
+        self.assertEqual(pending["attempts"], 1)
+        self.assertEqual(clock.parse(pending["next_attempt_at"]), self.now + dt.timedelta(seconds=1))
+
+    def test_a_past_retry_deadline_allows_admission(self) -> None:
+        self.enqueue("w1", "alpha", attempts=1,
+                     next_attempt_at=clock.iso(self.now - dt.timedelta(seconds=1)))
+        daemon = self.daemon(lambda s: completed(s))
+        self.assertEqual(daemon.drain(), 1)
+        self.assertEqual(daemon.fake_runner.calls, ["alpha"])  # type: ignore[attr-defined]
+
+    def test_backoff_doubles_and_the_sixth_gap_is_capped_at_64_seconds(self) -> None:
+        self.enqueue("w1", "alpha")
+        daemon = self.daemon(lambda s: refused(s))
+        for attempts, gap in enumerate((4, 8, 16, 32, 64, 64), start=1):
+            daemon.drain()
+            pending = self.store.pending()[0]
+            self.assertEqual(pending["attempts"], attempts)
+            deadline = clock.parse(pending["next_attempt_at"])
+            self.assertEqual((deadline - self.now).total_seconds(), gap)
+            self.now = deadline
+
+    def test_ten_arriving_wakes_do_not_consume_a_waiting_wakes_attempts(self) -> None:
+        self.enqueue("w1", "alpha")
+        daemon = self.daemon(lambda s: refused(s))
+        daemon.drain()
+        for index in range(10):
+            self.enqueue(f"new{index}", "alpha")
+            daemon.drain()
+        waiting = next(e for e in self.store.pending() if e["id"] == "w1")
+        self.assertEqual(waiting["attempts"], 1)
+        self.assertEqual(len(daemon.fake_runner.calls), 11)  # type: ignore[attr-defined]
+
+    def test_waiting_wake_is_skipped_before_the_busy_lane_shortcut(self) -> None:
+        self.enqueue("busy", "alpha")
+        self.enqueue("waiting", "alpha", attempts=1,
+                     next_attempt_at=clock.iso(self.now + dt.timedelta(seconds=4)))
+        self.daemon(lambda s: refused(s)).drain()
+        waiting = next(e for e in self.store.pending() if e["id"] == "waiting")
+        self.assertEqual(waiting["attempts"], 1)
+
+    def test_a_clock_jump_clamps_and_persists_the_retry_deadline(self) -> None:
+        self.enqueue("w1", "alpha", attempts=1,
+                     next_attempt_at=clock.iso(self.now + dt.timedelta(hours=1)))
+        daemon = self.daemon(lambda s: completed(s))
+        daemon.drain()
+        pending = self.store.pending()[0]
+        self.assertEqual(clock.parse(pending["next_attempt_at"]), self.now + dt.timedelta(seconds=64))
+        self.now += dt.timedelta(seconds=63)
+        daemon.drain()
+        self.assertEqual(daemon.fake_runner.calls, [])  # type: ignore[attr-defined]
+        self.now += dt.timedelta(seconds=1)
+        self.assertEqual(daemon.drain(), 1)
+
+    def test_age_limit_applies_even_during_backoff(self) -> None:
+        self.enqueue("w1", "alpha", waiting_since=clock.iso(self.now - dt.timedelta(hours=7)),
+                     next_attempt_at=clock.iso(self.now + dt.timedelta(seconds=64)))
+        daemon = self.daemon(lambda s: completed(s))
+        daemon.drain()
+        self.assertEqual(self.store.pending(), [])
+        self.assertEqual(self.store.all_events()[0]["outcome"], "abandoned")
+
+    def test_drain_wait_uses_the_earliest_retry_with_a_15_second_cap(self) -> None:
+        for gaps, expected in (((8, 4), 4.0), ((32, 64), 15.0), ((), 15.0)):
+            with self.subTest(gaps=gaps):
+                for event in self.store.pending():
+                    self.store.mark(event["id"], processed=True)
+                for index, gap in enumerate(gaps):
+                    self.enqueue(f"wait{expected}_{index}", "alpha",
+                                 next_attempt_at=clock.iso(self.now + dt.timedelta(seconds=gap)))
+                daemon = self.daemon(lambda s: completed(s))
+                wanted = Mock()
+                wanted.wait.side_effect = lambda **kw: daemon._stopping.set()
+                daemon._drain_wanted = wanted
+                daemon._drain_loop()
+                wanted.wait.assert_called_once_with(timeout=expected)
+
     def test_a_busy_lane_is_attempted_once_per_pass_not_once_per_wake(self) -> None:
         """Ten wakes for one busy subject must not pay for ten admissions."""
         for index in range(5):
@@ -116,6 +205,7 @@ class QueueTests(unittest.TestCase):
     def test_it_runs_once_the_lane_frees(self) -> None:
         self.enqueue("w1", "alpha")
         self.daemon(lambda s: refused(s)).drain()
+        self.now += dt.timedelta(seconds=4)
         self.daemon(lambda s: completed(s)).drain()
         self.assertEqual(self.store.pending(), [])
 
@@ -125,6 +215,7 @@ class QueueTests(unittest.TestCase):
         daemon = self.daemon(lambda s: refused(s), max_wake_attempts=3)
         for _ in range(5):
             daemon.drain()
+            self.now += dt.timedelta(seconds=64)
         self.assertEqual(self.store.pending(), [])
         abandoned = [e for e in self.store.all_events() if e.get("outcome") == "abandoned"]
         self.assertEqual(len(abandoned), 1)

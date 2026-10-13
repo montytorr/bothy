@@ -30,6 +30,7 @@ a dead man's switch has to be held by someone still alive.
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import json
 import os
 import signal
@@ -239,12 +240,14 @@ class Daemon:
                         continue        # Drove's, and handled by drove_wakes
                     subject = str(event.get("subject") or event["id"])
 
+                    if self._too_old(event) or self._too_many_attempts(event):
+                        continue
+                    if self._retry_delay(event) > 0:
+                        continue
+
                     if subject in busy_lanes or pool_exhausted:
                         self._defer(event, gate="lane_busy" if subject in busy_lanes else "pool_full",
                                     reason="skipped: capacity already known exhausted this pass")
-                        continue
-
-                    if self._too_old(event) or self._too_many_attempts(event):
                         continue
 
                     result = self.runner.run(
@@ -457,6 +460,8 @@ class Daemon:
                 break
             if self._too_old(event) or self._too_many_attempts(event):
                 continue
+            if self._retry_delay(event) > 0:
+                continue
             route = str(event.get("route", "?"))
             result = self.drove_runs.start(raw, wake=event["id"], source=route)
             if result.transient:
@@ -527,14 +532,32 @@ class Daemon:
         to look.
         """
         attempts = int(event.get("attempts", 0)) + 1
+        now = clock.utcnow()
+        gap = min(64, 4 * 2 ** min(attempts - 1, 4))
         fields: dict[str, Any] = {
             "attempts": attempts,
             "last_gate": gate,
-            "last_deferred_at": clock.iso(),
+            "last_deferred_at": clock.iso(now),
+            "next_attempt_at": clock.iso(now + dt.timedelta(seconds=gap)),
         }
         if not event.get("waiting_since"):
             fields["waiting_since"] = event.get("received_at") or clock.iso()
         self.store.mark(event["id"], **fields)
+
+    def _retry_delay(self, event: dict[str, Any]) -> float:
+        """Seconds until this wake is eligible, bounded across a clock jump."""
+        value = event.get("next_attempt_at")
+        if not value:
+            return 0.0
+        now = clock.utcnow()
+        try:
+            delay = (clock.parse(str(value)) - now).total_seconds()
+        except (ValueError, TypeError):
+            return 0.0
+        if delay > 64:
+            self.store.mark(event["id"], next_attempt_at=clock.iso(now + dt.timedelta(seconds=64)))
+            return 64.0
+        return max(0.0, delay)
 
     def _abandon(self, event: dict[str, Any], *, reason: str) -> None:
         """Give up on a wake, visibly. Never silently."""
@@ -587,7 +610,14 @@ class Daemon:
             # Woken by a wake, and also on a timer as a catch-up — one path is
             # the trigger, the other is the recovery, and both go through the
             # same lease so only one of them ever runs.
-            self._drain_wanted.wait(timeout=15.0)
+            timeout = 15.0
+            for event in self.store.pending():
+                if isinstance(event.get("drove"), dict):
+                    continue
+                delay = self._retry_delay(event)
+                if delay > 0:
+                    timeout = min(timeout, delay)
+            self._drain_wanted.wait(timeout=timeout)
             self._drain_wanted.clear()
             if self._stopping.is_set():
                 break
