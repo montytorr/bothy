@@ -189,6 +189,7 @@ class CodexClient:
         on_event: Callable[[str, dict[str, Any]], None] | None = None,
         approval: Callable[[str, dict[str, Any]], ApprovalDecision] = default_approval,
         on_question: Callable[[Question], None] = default_question,
+        on_tool_call: Callable[[dict[str, Any]], None] | None = None,
         tools: "ToolRegistry | None" = None,
     ) -> None:
         self.run_id = run_id
@@ -200,6 +201,7 @@ class CodexClient:
         self._on_event = on_event or (lambda method, params: None)
         self._approval = approval
         self._on_question = on_question
+        self._on_tool_call = on_tool_call
         #: Every question asked this run, in order. Read by run_turn onto the
         #: outcome so they reach the audit log and the operator.
         self.questions: list[Question] = []
@@ -308,6 +310,8 @@ class CodexClient:
                 self._handle_server_request(message)
             elif "method" in message:
                 params = message.get("params") or {}
+                if message["method"] in {"item/started", "item/completed"}:
+                    params = {**params, "observed_at": clock.iso()}
                 self._notifications.put((message["method"], params))
                 try:
                     self._on_event(message["method"], params)
@@ -411,10 +415,23 @@ class CodexClient:
         tool bug into a lost run.
         """
         name = str(params.get("tool") or "")
+        started = clock.iso()
         if self._tools is None:
             ok, text = False, f"{name} is not available to this run"
         else:
             ok, text = self._tools.call(name, params.get("arguments"))
+        if self._on_tool_call is not None:
+            arguments = params.get("arguments")
+            try:
+                self._on_tool_call({
+                    "call_id": str(message["id"]), "tool": name,
+                    "turn_id": params.get("turnId"), "thread_id": params.get("threadId"),
+                    "arguments": (arguments if isinstance(arguments, str) else
+                                  json.dumps(arguments, ensure_ascii=False, default=str))[:500],
+                    "start": started, "end": clock.iso(), "status": "ok" if ok else "failed",
+                })
+            except Exception:  # noqa: BLE001 - an observer must not strand a tool reply
+                pass
         self._send({
             "id": message["id"],
             "result": {"success": ok, "contentItems": [{"type": "inputText", "text": text}]},
@@ -559,6 +576,7 @@ class CodexClient:
         max_tokens: int | None = None,
         should_stop: Callable[[], StopReason | None] | None = None,
         interrupt_grace_seconds: float = 1.0,
+        on_started: Callable[[str | None], None] | None = None,
     ) -> TurnOutcome:
         """Run one turn under a wall clock, interrupting it if it overruns.
 
@@ -576,6 +594,9 @@ class CodexClient:
                                timeout=request_timeout)
         turn = started.get("turn") or {}
         outcome.turn_id = turn.get("id")
+        if on_started is not None:
+            on_started(outcome.turn_id)
+        item_starts: dict[str, str] = {}
 
         deadline = clock.monotonic() + wall_clock_seconds
         interrupted = False
@@ -639,9 +660,16 @@ class CodexClient:
                     self._interrupt("token_cap")
             elif method == "account/rateLimits/updated":
                 outcome.rate_limits = params.get("rateLimits") or params
-            elif method == "item/completed":
+            elif method == "item/started":
                 item = params.get("item") or {}
-                outcome.items.append(item)
+                if len(item_starts) < 200:
+                    item_starts[str(item.get("id"))] = params.get("observed_at") or clock.iso()
+            elif method == "item/completed":
+                item = dict(params.get("item") or {})
+                item["end"] = params.get("observed_at") or clock.iso()
+                item["start"] = item_starts.pop(str(item.get("id")), item["end"])
+                if len(outcome.items) < 200:
+                    outcome.items.append(item)
                 if item.get("type") in {"agentMessage", "agent_message"}:
                     text_value = item.get("text")
                     if text_value:

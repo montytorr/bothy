@@ -28,11 +28,12 @@ A run that fails is still a run that completed its bookkeeping.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import math
 import shutil
 import traceback
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from . import clock, codex, ids, policy
 from .alert import Alerter
@@ -43,6 +44,7 @@ from .config import Config
 from .pool import Admission, Refused
 from .proc import ProcessRegistry
 from .tracker import CairnTracker, CairnUnavailable
+from .trace import build_trace, post_trace, span_fields, summarize_items
 
 __all__ = ["Runner", "RunResult"]
 
@@ -191,8 +193,14 @@ class Runner:
     # ---- approvals ------------------------------------------------------
 
     def _decide_approval(self, method: str, params: dict[str, Any], *, run_id: str, subject: str,
-                         active: Profile | None, audit_unmatched: bool = True) -> policy.ApprovalDecision:
-        """Evaluate one request, record the decision, and make sure a person hears a gated refusal."""
+                         active: Profile | None, audit_unmatched: bool = True,
+                         counter: Iterator[int] | None = None) -> policy.ApprovalDecision:
+        """Evaluate one request, record the decision, and make sure a person hears a gated refusal.
+
+        Each recorded decision is a span under the turn, numbered by ``counter``
+        (one per run, so ids stay unique and a replay of the log is stable).
+        """
+        started = clock.iso()
         facts = policy.Facts(
             rules=active.rules() if active else (),
             mcp_ask={server: list(tools) for server, tools in (active.mcp_ask if active else {}).items()},
@@ -200,8 +208,10 @@ class Runner:
         )
         decision = policy.evaluate(method, params, facts)
         if audit_unmatched or decision.rule != "default":
+            span = span_fields(run_id, f"approval:{next(counter) if counter is not None else 1}",
+                               parent="turn:1", start=started, end=clock.iso(), status=decision.status)
             fields = dict(kind="approval", action=decision.audit_action, status=decision.status,
-                          run_id=run_id, subject=subject, data=decision.audit_data())
+                          run_id=run_id, subject=subject, span=span, data=decision.audit_data())
             if decision.proceeds:
                 # A call that goes ahead must leave a record first (DESIGN rule
                 # 16). A decline can safely go through _record, which degrades
@@ -251,22 +261,29 @@ class Runner:
             # not turn a refusal into a failed run.
             pass
 
-    def _approval_handler(self, run_id: str, subject: str, active: Profile | None) -> Callable[[str, dict[str, Any]], codex.ApprovalDecision]:
+    def _approval_handler(self, run_id: str, subject: str, active: Profile | None,
+                          counter: Iterator[int] | None = None) -> Callable[[str, dict[str, Any]], codex.ApprovalDecision]:
+        counter = counter if counter is not None else itertools.count(1)
+
         def approve(method: str, params: dict[str, Any]) -> codex.ApprovalDecision:
-            decision = self._decide_approval(method, params, run_id=run_id, subject=subject, active=active)
+            decision = self._decide_approval(method, params, run_id=run_id, subject=subject, active=active,
+                                             counter=counter)
             return codex.ApprovalDecision("accept" if decision.proceeds else "decline", reason=decision.reason)
         return approve
 
-    def _tool_gate(self, run_id: str, subject: str, active: Profile | None) -> Callable[[str, Any], str | None]:
+    def _tool_gate(self, run_id: str, subject: str, active: Profile | None,
+                   counter: Iterator[int] | None = None) -> Callable[[str, Any], str | None]:
         """Gate for Bothy-hosted tools: a decline reason, or None to let the call run.
 
         Only a matching rule is audited here; BOTHY-26 records every hosted
         call as ``kind="tool"`` and a second record per call would be noise.
         """
+        counter = counter if counter is not None else itertools.count(1)
+
         def gate(name: str, arguments: Any) -> str | None:
             decision = self._decide_approval("item/tool/call", {"tool": name, "arguments": arguments},
                                              run_id=run_id, subject=subject, active=active,
-                                             audit_unmatched=False)
+                                             audit_unmatched=False, counter=counter)
             return None if decision.proceeds else (decision.reason or f"{name} was declined by policy")
         return gate
 
@@ -281,6 +298,15 @@ class Runner:
             # silent downgrade to full privilege or to none.
             raise KeyError(f"no capability profile called {chosen!r}")
         return Profile.from_dict(chosen, raw)
+
+    def _export_trace(self, run_id: str, subject: str) -> None:
+        if not self.config.otlp_endpoint:
+            return
+        try:
+            post_trace(lambda: build_trace(self.audit, run_id), self.config.otlp_endpoint)
+        except Exception as exc:  # noqa: BLE001 - export cannot change the run's outcome
+            self._record(kind="export", action="failed", status="failed", run_id=run_id, subject=subject,
+                         data={"error": type(exc).__name__, "deadline_seconds": 2, "retry": False})
 
     def _registry(self, profile: Profile | None, *, untrusted: bool = False) -> ToolRegistry:
         """The dynamic tools this run may call, hosted inside Bothy."""
@@ -392,9 +418,20 @@ class Runner:
                 )
             return result
 
+        run_start = admitted.admitted_at
         self._record(kind="run", action="admitted", run_id=run_id, subject=subject,
+                     span=span_fields(run_id, "run", start=run_start),
                      data={"reservation": admitted.reservation.id, "amount": admitted.reservation.amount,
                            "unit": admitted.reservation.unit, "wake_id": wake_id})
+
+        def finish_refused() -> RunResult:
+            self.admission.release(run_id, ok=False, actual=0.0)
+            result.finished_at = clock.iso()
+            self._record(kind="run", action="finished", status="refused", run_id=run_id, subject=subject,
+                         span=span_fields(run_id, "run", start=run_start, end=result.finished_at, status="refused"),
+                         data={"outcome": "refused", "refusal": result.refusal, "usage": {}, "stop_reason": None})
+            self._export_trace(run_id, subject)
+            return result
 
         # --- claim the task, so the ledger shows the work while it happens ---
         if cairn_ref and self.tracker is not None:
@@ -416,8 +453,7 @@ class Runner:
             result.refusal = {"gate": "profile", "reason": str(exc)}
             self._record(kind="run", action="refused", status="refused", run_id=run_id,
                          subject=subject, data=result.refusal)
-            self.admission.release(run_id, ok=False, actual=0.0)
-            return result
+            return finish_refused()
 
         try:
             if wall_clock_seconds is None and active is not None:
@@ -437,19 +473,47 @@ class Runner:
             result.refusal = {"gate": "limits", "reason": str(exc)}
             self._record(kind="run", action="refused", status="refused", run_id=run_id,
                          subject=subject, data=result.refusal)
-            self.admission.release(run_id, ok=False, actual=0.0)
-            return result
+            return finish_refused()
 
+        approval_numbers = itertools.count(1)
         registry = self._registry(active, untrusted=untrusted).gated(
-            self._tool_gate(run_id, subject, active))
+            self._tool_gate(run_id, subject, active, approval_numbers))
+        approval_handler = self._approval_handler(run_id, subject, active, approval_numbers)
         home = self.config.homes_dir / run_id
         cancel_path = self.config.control_dir / f"{run_id}.cancel"
+        turn_start: str | None = None
+        turn_id: str | None = None
+        thread_id: str | None = None
+        turn_recorded = False
+
+        def turn_started(known_id: str | None) -> None:
+            nonlocal turn_id, turn_recorded
+            turn_id = known_id or turn_id
+            if turn_recorded or turn_start is None:
+                return
+            turn_recorded = True
+            self._record(kind="turn", action="started", status="pending", run_id=run_id, subject=subject,
+                         span=span_fields(run_id, "turn:1", parent="run", start=turn_start),
+                         data={"turn_id": turn_id, "thread_id": thread_id})
+
+        def on_event(method: str, params: dict[str, Any]) -> None:
+            if method == "turn/started":
+                turn_started((params.get("turn") or {}).get("id"))
+
+        def tool_called(call: dict[str, Any]) -> None:
+            self._record(kind="tool", action="called", status=call["status"], run_id=run_id, subject=subject,
+                         span=span_fields(run_id, f"tool:{call['call_id']}", parent="turn:1",
+                                          start=call["start"], end=call["end"], status=call["status"]),
+                         data={**call, "turn_id": call.get("turn_id") or turn_id,
+                               "thread_id": call.get("thread_id") or thread_id})
+
         client = codex.CodexClient(
             run_id=run_id,
             codex_home=home,
             binary=self.config.codex_binary,
-            on_event=lambda method, params: None,
-            approval=self._approval_handler(run_id, subject, active),
+            on_event=on_event,
+            approval=approval_handler,
+            on_tool_call=tool_called,
             # Tell a human WHILE the run is still going. Alerting at the end
             # would be the same silence with extra steps — by then the turn has
             # already carried on without the answer.
@@ -514,14 +578,34 @@ class Runner:
                                "tools": registry.names(),
                                "mcp": sorted(active.mcp_servers) if active else []})
 
-            outcome = client.run_turn(
-                thread_id=thread_id,
-                text=prompt,
-                wall_clock_seconds=wall_clock_seconds,
-                max_tokens=max_tokens,
-                on_usage=meter,
-                should_stop=should_stop,
-            )
+            turn_start = clock.iso()
+            try:
+                outcome = client.run_turn(
+                    thread_id=thread_id,
+                    text=prompt,
+                    wall_clock_seconds=wall_clock_seconds,
+                    max_tokens=max_tokens,
+                    on_usage=meter,
+                    should_stop=should_stop,
+                    on_started=turn_started,
+                )
+            except Exception as exc:
+                turn_started(turn_id)
+                self._record(kind="turn", action="finished", status="failed", run_id=run_id, subject=subject,
+                             span=span_fields(run_id, "turn:1", parent="run", start=turn_start,
+                                              end=clock.iso(), status="failed"),
+                             data={"turn_id": turn_id, "thread_id": thread_id, "status": "failed",
+                                   "stop_reason": None, "error": str(exc), "error_code": type(exc).__name__,
+                                   "usage": {}, "items": []})
+                raise
+            turn_started(outcome.turn_id)
+            self._record(kind="turn", action="finished", status=outcome.status, run_id=run_id, subject=subject,
+                         span=span_fields(run_id, "turn:1", parent="run", start=turn_start,
+                                          end=clock.iso(), status=outcome.status),
+                         data={"turn_id": outcome.turn_id, "thread_id": thread_id, "status": outcome.status,
+                               "stop_reason": outcome.stop_reason, "error": outcome.error,
+                               "error_code": outcome.error_code, "usage": outcome.usage,
+                               "items": summarize_items(outcome.items)})
             self._observe(outcome)
             result.status = outcome.status
             result.stop_reason = outcome.stop_reason
@@ -558,6 +642,8 @@ class Runner:
                 kind="run", action="finished",
                 status="ok" if result.status == "completed" else result.status,
                 run_id=run_id, subject=subject,
+                span=span_fields(run_id, "run", start=run_start, end=result.finished_at,
+                                 status=result.status),
                 data={"outcome": result.status, "cost": round(settled, 5), "unit": result.unit,
                       "disposal": disposal, "usage": result.usage, "error": result.error,
                       "stop_reason": result.stop_reason,
@@ -571,6 +657,8 @@ class Runner:
             shutil.rmtree(home, ignore_errors=True)
             cancel_path.unlink(missing_ok=True)
             self.registry.unregister(run_id)
+
+        self._export_trace(run_id, subject)
 
         # --- tell memory, and tell a human if they are needed ---
         if cairn_ref and self.tracker is not None:

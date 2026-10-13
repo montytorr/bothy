@@ -7,17 +7,22 @@ exactly like a broken tool.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as dt
+import io
 import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
 from bothy import clock, codex, policy
 from bothy.audit import AuditError, AuditLog
+from bothy.cli import main
+from bothy.trace import build_trace
 from bothy.budget import BudgetPolicy, BudgetLedger
 from bothy.capability import DynamicTool, Profile, ToolRegistry, render_config_toml
 from bothy.config import Config, load
@@ -47,6 +52,9 @@ class FakeAlerter:
 
     def incident(self, **kwargs: Any) -> None:
         self.incidents.append(kwargs)
+
+    def resolved(self, **kwargs: Any) -> None:
+        pass
 
 
 class RunnerCase(unittest.TestCase):
@@ -351,6 +359,84 @@ class UnknownKeyTests(unittest.TestCase):
         loaded = load(self.write({"profiles": {"cheap": {"max_tokens": 5000, "wall_clock_seconds": 60}}}))
         active = Profile.from_dict("cheap", loaded.profiles["cheap"])
         self.assertEqual((active.max_tokens, active.wall_clock_seconds), (5000, 60))
+
+
+class TraceTests(RunnerCase):
+    """An approval decision is a span under the turn, so a run's trace shows what was refused."""
+
+    def run_with_decisions(self, requests: list[tuple[str, dict[str, Any]]]) -> str:
+        self.config.profiles = {"mail": profile_raw(rule("deny", reason="no outbound mail"))}
+        run_id = "run_policy_trace"
+        sent: list[dict[str, Any]] = []
+
+        class Stub(codex.CodexClient):
+            def start(self) -> Any:
+                self._popen = SimpleNamespace(pid=12345)
+                return self._popen
+
+            def handshake(self) -> dict[str, Any]:
+                return {}
+
+            def start_thread(self, **kwargs: Any) -> str:
+                return "thread-1"
+
+            def request(self, method: str, params: Any = None, **kwargs: Any) -> dict[str, Any]:
+                if method == "turn/start":
+                    self._notifications.put(("turn/started", {"turn": {"id": "turn-1"}}))
+                    for index, (name, body) in enumerate(requests):
+                        self._handle_server_request({"id": index, "method": name, "params": body})
+                    self._notifications.put(("turn/completed", {"turn": {"status": "completed"}}))
+                    return {"turn": {"id": "turn-1"}}
+                return {}
+
+            def _send(self, payload: dict[str, Any]) -> None:
+                sent.append(payload)
+
+            def close(self, **kwargs: Any) -> str:
+                return "terminated"
+
+        self.sent = sent
+        with mock.patch("bothy.runner.codex.CodexClient", Stub), \
+                mock.patch.object(self.runner.registry, "register"), \
+                mock.patch("bothy.runner.ids.run_id", return_value=run_id):
+            result = self.runner.run(subject="policy-trace", prompt="go", profile="mail")
+        self.assertTrue(result.ok, result.error)
+        return run_id
+
+    def test_a_deny_decision_traces_as_root_turn_approval(self) -> None:
+        run_id = self.run_with_decisions([("item/mcpToolCall/requestApproval", approval_request())])
+        self.assertEqual(self.sent[0]["result"]["decision"], "decline")
+        made = build_trace(self.audit, run_id)["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        root = next(s for s in made if "parentSpanId" not in s)
+        turn = next(s for s in made if s["name"].startswith("turn "))
+        [approval] = [s for s in made if s["name"].startswith("approval ")]
+        self.assertEqual(approval["name"], "approval mail.send_message")
+        self.assertEqual(turn["parentSpanId"], root["spanId"])
+        self.assertEqual(approval["parentSpanId"], turn["spanId"])
+        attributes = {a["key"]: a["value"] for a in approval["attributes"]}
+        self.assertEqual(attributes["bothy.verdict"], {"stringValue": "deny"})
+        self.assertEqual(approval["status"]["code"], 2)
+
+    def test_each_decision_in_a_run_gets_its_own_span(self) -> None:
+        run_id = self.run_with_decisions([("item/mcpToolCall/requestApproval", approval_request()),
+                                          ("item/mcpToolCall/requestApproval", approval_request("read_message"))])
+        spans = [r["span"]["span_id"] for r in self.audit.records()
+                 if r["kind"] == "approval" and r["run_id"] == run_id]
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(len(set(spans)), 2)
+
+
+class MainConfigErrorTests(unittest.TestCase):
+    def test_a_stray_config_key_exits_78_and_names_the_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "config.json"
+            path.write_text(json.dumps({"home": temp, "wall_clock_secnds": 5}))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                code = main(["--config", str(path), "doctor"])
+        self.assertEqual(code, 78)
+        self.assertIn("bothy:", err.getvalue())
+        self.assertIn("wall_clock_secnds", err.getvalue())
 
 
 if __name__ == "__main__":

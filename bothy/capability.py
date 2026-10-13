@@ -289,13 +289,14 @@ class ToolRegistry:
         self._gate = gate
 
     def gated(self, gate: Callable[[str, Any], str | None]) -> "ToolRegistry":
-        """The same tools behind an approval gate.
+        """Put this registry's tools behind an approval gate, and return it.
 
         ``gate(name, arguments)`` returns None to let the call run, or the
         reason it was declined. A gate that raises declines: a policy that
         cannot answer has not approved anything.
         """
-        return ToolRegistry(list(self._tools.values()), gate=gate)
+        self._gate = gate
+        return self
 
     def add(self, tool: DynamicTool) -> None:
         self._tools[tool.name] = tool

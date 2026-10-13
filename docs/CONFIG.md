@@ -87,6 +87,23 @@ Token limits must be positive integers; wall clocks must be positive and finite.
 Usage arrives in updates, so a token cap can overshoot by an update. API runs
 also interrupt when their metered spend exceeds the reservation made at admission.
 
+## Trace export
+
+| Key | Default | |
+|---|---|---|
+| `otlp_endpoint` | `null` | Optional OTLP/HTTP collector base URL; `/v1/traces` is appended if needed |
+
+After a run's `finished` record, Bothy can send its run, turn and hosted-tool
+spans as OTLP/JSON. The reservation and worker slot are released first. Building
+and posting the export have a two-second deadline; failures write `export/failed`
+and drop that export, with no retry. At most two export threads run at once;
+if both are still blocked, another export is dropped and audited immediately.
+
+Headers come only from `OTEL_EXPORTER_OTLP_HEADERS` in the service environment,
+as comma-separated `name=value` pairs with URL-encoded values. Keep credentials
+in the mode-0600 environment file, never in `config.json` or the endpoint URL.
+The same endpoint can be overridden by `BOTHY_OTLP_ENDPOINT`.
+
 ## Concurrency and money
 
 | Key | Default | |
