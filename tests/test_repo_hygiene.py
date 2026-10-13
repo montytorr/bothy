@@ -15,7 +15,7 @@ SOURCES = sorted(
     path for path in ROOT.rglob("*.py")
     if "vendor" not in path.parts and "__pycache__" not in path.parts
 )
-DOCS = sorted(ROOT.glob("*.md")) + sorted((ROOT / "docs").glob("*.md"))
+DOCS = sorted(ROOT.glob("*.md")) + sorted((ROOT / "docs").glob("*.md")) + sorted((ROOT / "docs" / "sops").glob("*.md"))
 
 # Scripts that are never intended here. Latin, punctuation and symbols are
 # deliberate throughout -- em dashes, middle dots, arrows -- so only alphabets

@@ -18,6 +18,23 @@ that holds it, and the value is read at startup from a `0600` file.
 | `home` | `~/.bothy` | State directory |
 | `workspace` | cwd | Where workers run |
 
+## Standard operating procedures
+
+A scheduled job can carry a procedure written in MUST / SHOULD / MAY form:
+`bothy schedule add triage --sop triage ...`. The name is bare (`^[a-z0-9][a-z0-9-]{0,63}$`)
+and resolves to `$BOTHY_HOME/sops/<name>.md`; the resolved path must stay inside
+that directory, so a symlink out is refused. It is trusted text, written by an
+operator: it is injected into the job's prompt at fire time (not fenced as
+untrusted) and its sha256 is recorded on the wake. The agent has no tool that
+writes it. `bothy sop list|show|set NAME [FILE]` manages them (`set` reads stdin
+or a file, and writes atomically).
+
+A SOP that is missing, empty or over 16 KB at fire time is never truncated or
+skipped: the wake is recorded as processed with `outcome: refused`,
+`gate: sop_missing`, audited and alerted, no run starts, and the job moves on to
+its next time. `docs/sops/drove-detached-start.md` is a worked example for a
+job that reports on Drove runs.
+
 ## The worker
 
 | Key | Default | |
