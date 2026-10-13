@@ -533,6 +533,15 @@ class Runner:
                              data={"interrupt_id": pending.id, "decision": "decline"})
 
         def interrupt_asked(pending: codex.PendingInterrupt) -> bool:
+            # The remote message may appear before post() returns its ref.
+            # Guard the shared thread against ambiguity during that interval;
+            # client.answer still rejects this entry until activation succeeds.
+            with client._holds_lock:
+                if self.interrupt_board is None or client.interrupts.get(pending.id) is not pending or client._closed.is_set():
+                    return False
+                interrupt_ids.add(pending.id)
+                self.interrupt_board.register(Entry(pending.id, pending.deadline, run_id, subject, reply_to or {},
+                    lambda text, actor: client.answer(pending.id, text, actor)))
             self._record(kind="interrupt", action="asked", status="pending", run_id=run_id, subject=subject,
                          span=span_fields(run_id, pending.id, parent="turn:1", start=pending.asked_at),
                          data={"interrupt_id": pending.id, "prompt": pending.prompt, "kind": pending.kind,

@@ -343,6 +343,29 @@ class HoldIntegration(unittest.TestCase):
         approvals = [r for r in self.audit.records() if r["kind"] == "approval"]
         self.assertEqual([r["action"] for r in approvals], ["confirm", "proceed"])
 
+    def test_question_visible_before_post_ack_cannot_implicitly_approve_other_request(self):
+        self.confirm_profile()
+        self.method, self.params = "mcpServer/elicitation/request", mcp_approval()
+        def post(channel, text, **kwargs):
+            if "Which bucket?" in text:
+                # Slack has displayed this question, but its HTTP post has not
+                # returned. An implicit yes could be meant for either request.
+                self.reply("yes", delivery="ambiguous-during-post")
+                self.assertEqual(self.interrupts("answered"), [])
+                self.assertEqual(len(self.interrupts("ambiguous")), 1)
+                confirmation = next(p for p in self.client.interrupts.values() if p.kind == "approval")
+                self.reply(f"answer {confirmation.id} approve", delivery="explicit-confirmation")
+            return ["posted"]
+        self.slack.client.post.side_effect = post
+        def ask_second():
+            self.client._handle_server_request({"id": 8, "method": "item/tool/requestUserInput", "params": QUESTION})
+        result = self.run_stub([ask_second], profile="confirm")
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(self.sent[0], {"id": 7, "result": {"action": "accept", "content": {}}})
+        [approval] = self.interrupts("answered")
+        self.assertEqual(approval["data"]["decision"], "approve")
+        self.assertEqual(approval["actor"], "human")
+
     def test_confirm_other_text_declines(self):
         self.confirm_profile()
         self.method, self.params = "mcpServer/elicitation/request", mcp_approval()
