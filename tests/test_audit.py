@@ -29,6 +29,20 @@ class AuditTests(unittest.TestCase):
             self.log.append(kind="run", action="finished", run_id=f"r{index}")
         self.assertEqual(self.log.verify(), 5)
 
+    def test_old_and_span_records_share_one_verified_chain(self) -> None:
+        old = self.log.append(kind="run", action="admitted", run_id="mixed")
+        self.assertNotIn("span", old)
+        span = {"trace_id": "a" * 32, "span_id": "b" * 16, "parent_span_id": None,
+                "start": old["ts"], "end": old["ts"], "status": "ok"}
+        self.log.append(kind="run", action="finished", run_id="mixed", span=span)
+        self.assertEqual(AuditLog(self.log.path).verify(), 2)
+        lines = self.log.path.read_text().splitlines()
+        changed = json.loads(lines[-1])
+        changed["span"]["span_id"] = "c" * 16
+        self.log.path.write_text(lines[0] + "\n" + json.dumps(changed) + "\n")
+        with self.assertRaises(ChainBreak):
+            self.log.verify()
+
     def test_an_edited_record_is_caught_at_its_own_sequence(self) -> None:
         for index in range(4):
             self.log.append(kind="run", action="finished", run_id=f"r{index}")

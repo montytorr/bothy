@@ -71,8 +71,9 @@ class AuditLog:
 
     Not SQLite on purpose. An operator at a client site should be able to read
     the audit trail with ``cat`` and mail it to us, with no tooling and no lock
-    to contend for. The volume is one record per interesting decision, not one
-    per tool call, so a text file is the right size of answer.
+    to contend for. Decisions, run/turn spans and Bothy-hosted tool calls get
+    records; Codex-run items are capped at 200 summaries per turn. Rotation
+    bounds retention, so a text file remains the right size of answer.
     """
 
     def __init__(self, path: str | os.PathLike[str], *, max_bytes: int = 32 * 1024 * 1024) -> None:
@@ -129,6 +130,12 @@ class AuditLog:
         self._tip = (sequence, previous)
         self._tip_stat = signature
         return self._tip
+
+    def all_records(self) -> Iterator[dict[str, Any]]:
+        """Read every retained segment in chain order, including the live log."""
+        paths = sorted(self.path.parent.glob(f"{self.path.stem}-*{self.path.suffix}"))
+        for path in [*paths, self.path]:
+            yield from AuditLog(path).records()
 
     def _tail_tip(self) -> tuple[int, str] | None:
         with self.path.open("rb") as handle:
@@ -238,6 +245,7 @@ class AuditLog:
         subject: str | None = None,
         actor: str | None = None,
         data: dict[str, Any] | None = None,
+        span: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Write one record and return it. Raises AuditError if it cannot.
 
@@ -260,6 +268,8 @@ class AuditLog:
                 "data": data or {},
                 "prev": previous,
             }
+            if span is not None:
+                record["span"] = span
             record["hash"] = _digest(record)
             line = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
             try:

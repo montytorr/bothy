@@ -102,6 +102,38 @@ class TurnTests(unittest.TestCase):
         self.assertEqual(outcome.messages, ["done"])
         self.assertNotIn("turn/interrupt", self.calls)
 
+    def test_start_callback_knows_the_turn_id(self) -> None:
+        starts = []
+        self.client._notifications.put(("turn/completed", {"turn": {"status": "completed"}}))
+        self.turn(on_started=starts.append)
+        self.assertEqual(starts, ["turn"])
+
+    def test_item_timing_keeps_recorded_arrival_times(self) -> None:
+        self.client._notifications.put(("item/started", {
+            "observed_at": "2026-10-13T07:00:00Z", "item": {"id": "item", "type": "fileChange"}}))
+        self.client._notifications.put(("item/completed", {
+            "observed_at": "2026-10-13T07:00:02Z", "item": {"id": "item", "type": "fileChange"}}))
+        self.client._notifications.put(("turn/completed", {"turn": {"status": "completed"}}))
+        item, = self.turn().items
+        self.assertEqual((item["start"], item["end"]), ("2026-10-13T07:00:00Z", "2026-10-13T07:00:02Z"))
+
+    def test_tool_callback_records_success_and_failure_once(self) -> None:
+        calls, replies = [], []
+        self.client._on_tool_call = calls.append
+        self.client._send = replies.append
+        self.client._handle_tool_call({"id": 1}, {"tool": "missing", "arguments": "x" * 900})
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["status"], "failed")
+        self.assertEqual(len(calls[0]["arguments"]), 500)
+        self.assertFalse(replies[0]["result"]["success"])
+        self.assertLessEqual(calls[0]["start"], calls[0]["end"])
+
+    def test_tool_observer_failure_still_replies(self) -> None:
+        self.client._on_tool_call = mock.Mock(side_effect=RuntimeError("observer down"))
+        self.client._send = mock.Mock()
+        self.client._handle_tool_call({"id": 1}, {"tool": "missing"})
+        self.client._send.assert_called_once()
+
     def test_terminal_error_does_not_replace_the_interrupt_cause(self) -> None:
         self.client._notifications.put(("turn/completed", {"turn": {"status": "failed", "error": "remote"}}))
         outcome = self.turn(should_stop=lambda: "cancelled")

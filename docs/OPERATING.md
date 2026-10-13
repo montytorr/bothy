@@ -27,6 +27,30 @@ Every record carries one `run_id`, so a whole run is one command:
 bothy audit --run run_20260918T061249Z_9b9f6971
 ```
 
+`audit --run` includes every retained rotated segment. To see a run as a span
+tree, or export it to an OpenTelemetry collector:
+
+```bash
+bothy trace run_20260918T061249Z_9b9f6971
+bothy trace run_20260918T061249Z_9b9f6971 --json
+bothy trace run_20260918T061249Z_9b9f6971 --otlp http://127.0.0.1:4318
+```
+
+The tree has a run root, turns beneath it, and Bothy-hosted tool calls beneath
+each turn. Each record stores its deterministic trace and span ids inside the
+hash chain. Old runs retain a root using their `admitted` and `finished` times;
+they cannot supply historical tool spans that were never recorded. Rotated
+segments participate while retained (eight archives by default).
+
+`turn/finished` carries status, stop reason, error code, usage and up to 200
+Codex execution, MCP and file-change summaries, with arguments limited to 500
+characters and item start/end times. Full command output and file diffs are
+excluded. `--json` prints OTLP/JSON with nanosecond strings and typed attributes.
+`--otlp` sends once with a two-second deadline; headers come from
+`OTEL_EXPORTER_OTLP_HEADERS`. Set `otlp_endpoint` to export automatically after
+each run. An automatic export failure writes `export/failed` after the budget
+reservation and worker slot have been returned; it does not fail the run.
+
 | Symptom | Where to look |
 |---|---|
 | Nothing is running | `bothy status` — is the pool `probing`? Is budget headroom zero? |

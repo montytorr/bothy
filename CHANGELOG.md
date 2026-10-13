@@ -19,6 +19,11 @@ Every release states its **Breaking Changes** heading even when it is empty.
   MCP tool allowlists.
 
 ### Added
+- **Run traces (BOTHY-26):** hash-chained run, turn and hosted-tool spans,
+  bounded Codex item summaries, and `bothy trace ID [--json] [--otlp URL]` in
+  Drove's OTLP/JSON shape. Trace and `audit --run` include rotated segments;
+  optional `otlp_endpoint` export drops failures after two seconds, without
+  holding the run's reservation or retrying.
 - **Scheduled goals (BOTHY-29):** jobs can validate a run with an argv command
   or final-output regex and retry up to five attempts. Failures feed bounded,
   untrusted evidence into the next prompt with durable backoff; success is
