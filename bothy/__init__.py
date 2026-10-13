@@ -14,4 +14,4 @@ Standard library only. See docs/DESIGN.md for the rules it is built to, each
 of which was bought with somebody's outage.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

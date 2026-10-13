@@ -8,7 +8,7 @@
 *Runs Codex under supervision. Remembers in Cairn.*
 *Speaks up when it needs you. Closed to everything but the tailnet.*
 
-`stdlib only` · `no virtualenv` · `no build step` · `~9.5k lines` · `271 tests`
+`stdlib only` · `no virtualenv` · `no build step` · `~12.4k lines` · `519 tests`
 
 </div>
 
@@ -186,6 +186,32 @@ $ bothy checklist
 - Verify the audit chain is intact, with no missing or invalid links.   ← the agent wrote this
 ```
 
+## What 0.2.0 adds
+
+The round that followed the first release, in the order an operator meets it:
+
+- **Injection hardening.** A webhook payload can never replace the prompt.
+  Payloads, poll items and heartbeat checklists sit inside fresh nonce fences.
+  Webhook and poll runs lose the memory-write tools unless the profile sets
+  `allow_from_untrusted`, and public routes need an explicit `mcp_tools` list.
+- **Approval policies.** A profile's `approvals` give a tool a verdict:
+  `proceed`, `deny`, `guide` or `confirm`. Every decision is audited.
+- **Lifecycle controls.** Typed `stop_reason`s, per-job and per-profile
+  `max_tokens` and wall clock, `bothy cancel`, and deferred wakes that back off
+  from 4 to 64 seconds.
+- **Traces.** Audit records are span-shaped; `bothy trace` prints a run as a
+  tree and `otlp_endpoint` exports it.
+- **SOP jobs and goals.** A scheduled job can carry a written procedure
+  (`--sop`) and validate its own run, retrying up to five attempts
+  (`--validate-cmd`, `--validate-regex`, `--max-attempts`).
+- **Chat answers.** With `question_hold_seconds` set, a person can answer a
+  live question or confirm an approval from Slack, Discord or `bothy answer`
+  within a bounded hold.
+
+Unknown config and profile keys are now refused rather than ignored, so check
+`bothy doctor` before restarting an upgraded install. See the
+[CHANGELOG](CHANGELOG.md).
+
 ## Install
 
 ```bash
@@ -208,12 +234,15 @@ is a contract — `75` restart me, `78` stop — and the two service managers ne
 | `clock` `ids` | Time with an offset, monotonic deadlines, one run id per run |
 | `audit` | Append-only, hash-chained, verifiable across rotation |
 | `budget` `pool` | Reservations, subject lanes, a pool that heals itself |
-| `proc` `lifecycle` | Process groups, zombie-aware liveness, the 75/78 contract |
-| `codex` `capability` | The app-server client; profiles and Bothy-hosted tools |
+| `proc` `lifecycle` | Process groups, zombie-aware liveness, the 75/78 contract, cancel |
+| `codex` `capability` `policy` | The app-server client; profiles, Bothy-hosted tools, approval verdicts |
+| `interrupts` | Questions and confirmations held for a bounded time, answered from chat or the CLI |
+| `trace` | Span-shaped audit records, as OTLP/JSON |
+| `goal` | Validation checks and attempts for scheduled jobs |
 | `wake` `poll` `slack` `discord` `ws` | Four ways in, on one durable queue |
 | `tailnet` `ratelimit` `install` | Who is calling, how often, and putting it on a machine |
 | `runner` `daemon` `schedule` `cronspec` | One run door-to-record; four loops; the heartbeat |
-| `tracker` `alert` `retention` `config` | Cairn, saying something, sweeping up, the whole surface |
+| `tracker` `alert` `notice` `retention` `config` | Cairn, saying something, sweeping up, the whole surface |
 | `drove` | Starting Drove runs, watching them, passing on what needs a person |
 
 `bothy/vendor/a2a_reactor/` is vendored verbatim from
@@ -226,7 +255,7 @@ make check     # quiet, non-zero on failure
 make test      # verbose
 ```
 
-**271 tests, standard library `unittest`.** They assert *properties*, and each
+**519 tests, standard library `unittest`.** They assert *properties*, and each
 was demonstrated by hand against the real thing — real Codex, the real GitHub
 API, a real systemd install — **before** being written down. The tests are
 recorded evidence, not a guess at what the code does.
@@ -248,7 +277,8 @@ reported a genuine sandbox failure, and a hash-chained audit trail joining all o
 it by run id.
 
 **Not proven:** no live Slack workspace and no live Discord application have ever
-been connected, and it has not yet run on a Mac mini. The protocols, ack
+been connected, a chat answer has not completed a live Codex round trip, and it has
+not yet run on a Mac mini. The protocols, ack
 discipline, allowlists and lane keying are proven against fakes and against the
 RFC — the credentials paths are not.
 

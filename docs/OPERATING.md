@@ -57,6 +57,8 @@ reservation and worker slot have been returned; it does not fail the run.
 | A wake never ran | `bothy audit \| grep refused` — every refusal names its gate |
 | It stopped and stayed stopped | Exit **78** means restarting cannot help. Read the last log line |
 | It keeps restarting | Exit **75** is transient. Check the supervisor's restart budget |
+| A tool call was declined | `bothy audit \| grep approval` — each decision names the rule, verdict and reason |
+| A run stopped early | The `finished` record's `stop_reason`; `bothy trace <id>` shows the turns |
 | A run cost more than expected | `bothy audit --run <id>` — the `finished` record carries usage and cost |
 | Chat is silent | Allowlists are deny-by-default. Was the speaker listed? |
 | Discord messages arrive empty | The `MESSAGE_CONTENT` privileged intent is not enabled |
@@ -71,6 +73,7 @@ Bothy refuses work deliberately and records why. These are all normal:
 - `lane_busy` — something else is already working that subject. It will be retried.
 - `pool_full` / `pool_probing` — capacity. It will be retried.
 - `budget` — the cap would be breached. Names the cap and when it resets.
+- `sop_missing` — a job's procedure file is gone, empty or too large (see below).
 - `profile` — a capability profile that does not exist. Without a goal it will **not** be retried.
 
 A wake that is refused for capacity too often, or waits too long, is
@@ -78,6 +81,46 @@ A wake that is refused for capacity too often, or waits too long, is
 4 seconds to a maximum of 64 seconds; 30 refusals take about 28 minutes of
 retries before abandonment. The six-hour age limit still applies.
 
+## Scheduled jobs, procedures and goals
+
+```bash
+bothy schedule list [--json]
+bothy schedule add nightly --kind cron --spec "0 2 * * *" --tz Europe/Paris \
+  --prompt "Anything need attention?" --profile mail --heartbeat
+bothy schedule remove nightly
+```
+
+`schedule add` also takes `--subject`, `--min-spacing`, `--active-from` /
+`--active-to` (hours), `--wall-clock SECONDS` and `--max-tokens N` (per-job
+limits; `bothy run` takes the same two), `--sop NAME`, the goal flags below, and
+the Drove flags (`--drove-next`, `--drove-from-cairn`, `--drove-up`,
+`--drove-repo`; see "Drove runs"). Every field and its default is in CONFIG.md.
+
+**Procedures.** `--sop NAME` gives a job a MUST/SHOULD/MAY procedure from
+`$BOTHY_HOME/sops/NAME.md`, injected into its prompt at fire time. Manage them
+with:
+
+```bash
+bothy sop list
+bothy sop show triage
+bothy sop set triage triage.md      # or omit the file to read stdin
+```
+
+A job whose SOP has gone missing, is empty or is over 16 KB does not run. Its wake
+is recorded as processed (`refused`, gate `sop_missing`), an alert says which SOP,
+and the job waits for its next time. Fix it with `sop show` and `sop set`;
+nothing needs restarting. `docs/sops/drove-detached-start.md` is a worked example.
+
+**Goals.** A model job can validate its own run and try again:
+
+```bash
+bothy schedule add repair --prompt "Repair the report" \
+  --validate-cmd python3 check_report.py --max-attempts 3
+bothy schedule add report --prompt "Say VERIFIED if the report is correct" \
+  --validate-regex '^VERIFIED$' --max-attempts 2 --validate-timeout 60
+```
+
+The check, its limits and the budget rule are in CONFIG.md ("Scheduled goals").
 A scheduled model job with a validation check stays pending after a failed
 attempt, up to its `max_attempts` limit (1 by default, at most 5). Bothy writes
 `goal_attempts` before starting each run, separately from the capacity refusal
@@ -100,6 +143,7 @@ Wakes without a goal retain the ordinary behavior: capacity refusals are
 retried; other outcomes are processed with the runner's status. Inspect goal
 evidence with `bothy audit --json` (the text audit view shows the summary only).
 
+
 ## Answering a held question or approval
 
 Set `question_hold_seconds` to a positive number (for example, `300`) to allow
@@ -113,6 +157,8 @@ If several requests are live in the same thread, an implicit reply is audited
 as ambiguous and Bothy replies with their ids. Use `answer <int_id> <text>` to
 choose one. Closed or rejected replies are audited and explained in the thread.
 Approval prompts include a fenced tool-argument summary, capped at 300 characters.
+At most 16 requests may be held at once, and posting to chat uses at most two
+workers across runs; a post that takes more than five seconds is abandoned.
 
 A hold activates only after the question was posted, or in a foreground
 `bothy run` that prints the CLI answer hint. Background webhook/poll/job runs
@@ -277,14 +323,6 @@ the machine, not from Bothy's budget. `drove_max_runs` (default 1) is the cap.
 an item reaching a real channel. Everything above is tested against a stand-in
 for `drove` that speaks the shapes in Drove's README.
 
-## A job that did not run: `sop_missing`
-
-A job with `--sop NAME` whose file has gone missing, is empty or is over 16 KB
-does not run. Its wake is recorded as processed (`refused`, gate `sop_missing`),
-an alert says which SOP, and the job waits for its next time as usual. Fix it
-with `bothy sop show NAME` and `bothy sop set NAME FILE`; nothing needs
-restarting.
-
 ## Things that need a human
 
 | Alert | What it means |
@@ -384,6 +422,13 @@ git pull && make check && sudo bothy install && systemctl restart dev.bothy.<sit
 `make check` first, always. The install is idempotent and rewrites the wrapper
 and unit; it leaves your config, state and secrets alone.
 
+**From 0.1.0 to 0.2.0**, run `bothy doctor` before restarting. Unknown keys in
+`config.json` or a profile are now refused by name (exit 78) rather than ignored,
+so a stray or misspelt key stops the service from starting. Public routes must
+also give every `mcp_servers` entry an explicit `mcp_tools` list, and webhook and
+poll runs lose `bothy_checklist_update` and `bothy_note` unless their profile sets
+`allow_from_untrusted`.
+
 ## What lives where
 
 ```
@@ -420,6 +465,9 @@ mail it to you, with no tooling and no lock to contend for.
 - Chat allowlists are **deny by default** and the daemon refuses to start empty.
 - A webhook signature authenticates the **sender, never the content**. Everything
   inside a payload is untrusted input, and the prompt says so.
-- A worker gets **nothing** beyond Codex's built-ins unless a profile grants it.
+- A worker gets **nothing** beyond Codex's built-ins unless a profile grants it,
+  and a profile's `approvals` decide what it may do with a granted tool.
+- Webhook and poll runs cannot write memory that later runs will trust, and
+  everything they read arrives inside a fresh nonce fence.
 - The **sandbox** is the boundary, not the approval policy: `approvalPolicy:
   "never"` means *do not stop to ask*, not *allow anything*.

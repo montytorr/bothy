@@ -9,6 +9,8 @@ Every release states its **Breaking Changes** heading even when it is empty.
 
 ## Unreleased
 
+## 0.2.0 — 2026-10-13
+
 ### Security
 
 - **Prompt injection protection (BOTHY-23):** webhook payloads cannot replace
@@ -68,6 +70,35 @@ Every release states its **Breaking Changes** heading even when it is empty.
   with its sha256 on the wake. A missing, empty or oversized (over 16 KB) file is
   refused (`sop_missing`), audited and alerted rather than truncated. Manage with
   `bothy sop list|show|set`. Ships `docs/sops/drove-detached-start.md`.
+
+### Breaking Changes
+
+- **Unknown config and profile keys are refused (BOTHY-28):** `config.json` and
+  every profile used to drop a key Bothy did not recognise, so a stray or
+  misspelt key was ignored. It now fails the load and names the key, so a config
+  that carries one will not start after upgrading. Before restarting the
+  service, run `bothy doctor`: it loads the config and exits 78 (a config error) naming
+  the key. Remove or correct the key, then restart.
+- **Config errors exit 78:** a config that fails to load now exits 78, the
+  contract's "restarting cannot help", so launchd and systemd stop instead of
+  restarting a service that cannot start.
+
+### Known gaps
+
+- A chat answer or approval has not completed a live Codex round trip; the
+  request and response shapes were checked against Codex 0.162.0's generated
+  schema, and MCP's `_meta` approval marker is observed binary metadata.
+- No test pins Bothy to Codex's generated schema (it is not vendored), so a
+  Codex upgrade could change the approval and question shapes unnoticed.
+- `bothy trace` and the OTLP export do not yet show `interrupt/*` records
+  (questions, answers, ambiguous or late replies); they are in the audit log only.
+- No live Slack workspace or Discord application has answered a held question,
+  and Discord replies to Drove attention items have only run against a stand-in.
+
+## 0.1.0
+
+### Added
+
 - **Wake sources:** signed webhooks, schedules, Slack (Socket Mode), Discord
   (gateway) and polling — all producing wakes on one durable queue and passing
   one admission gate.
@@ -159,12 +190,8 @@ Every release states its **Breaking Changes** heading even when it is empty.
 - 271 tests, standard library only.
 
 ### Breaking Changes
-- **Unknown config and profile keys are refused (BOTHY-28):** `config.json` and
-  every profile used to drop a key Bothy did not recognise, so a stray or
-  misspelt key was ignored. It now fails the load and names the key, so a config
-  that carries one will not start after upgrading. Before restarting the
-  service, run `bothy doctor`: it loads the config and exits 78 (a config error) naming
-  the key. Remove or correct the key, then restart.
+
+- None. First release.
 
 ### Known gaps
 - Drove runs and attention forwarding are tested against a stand-in for `drove`
