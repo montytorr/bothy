@@ -103,13 +103,56 @@ racing.
 
 | Key | Default | |
 |---|---|---|
-| `profiles{}` | `{}` | Named bundles: `mcp_servers`, `mcp_tools`, `mcp_ask`, `tools`, `skill_roots`, `sandbox`, `model` |
+| `profiles{}` | `{}` | Named bundles: `mcp_servers`, `mcp_tools`, `mcp_ask`, `approvals`, `tools`, `skill_roots`, `sandbox`, `model`, `max_tokens`, `wall_clock_seconds` |
 | `default_profile` | `null` | A job naming none gets **nothing** beyond Codex's built-ins |
 
 `mcp_tools` scopes which of a server's tools are enabled; `mcp_ask` pins
 individual ones to `approval_mode = always`. Naming a tool in `mcp_ask` that is
 absent from `mcp_tools` is refused — gating a capability must not be what grants
 it.
+
+### Approval rules
+
+A profile's `approvals` list answers "may I?" for a tool, instead of the old
+decline-everything default. Each rule is an object:
+
+| Key | Required | |
+|---|---|---|
+| `server` | yes | An MCP server the profile grants, or `bothy` for a tool Bothy hosts (listed in `tools`) |
+| `tool` | yes | Must be enabled by the profile (`mcp_tools`, or `tools` for `bothy`); a rule that names anything else is refused |
+| `verdict` | yes | `proceed`, `deny`, `guide` or `confirm` |
+| `reason` | `guide` only | `guide` declines **and tells the model the reason**, so it is required. Optional text for the others |
+| `unless_approved_within` | no, `confirm` only | Seconds. A human approval this recent lets the call through |
+
+| Verdict | Effect |
+|---|---|
+| `proceed` | The call runs |
+| `deny` | Declined, with `reason` |
+| `guide` | Declined; `reason` reaches the model on the wire |
+| `confirm` | Declined as "awaiting human confirmation" and audited with `status: awaiting_human`, unless a human approved this server and tool within `unless_approved_within` seconds |
+
+```json
+{"server": "mail", "tool": "send_message", "verdict": "confirm",
+ "unless_approved_within": 900, "reason": "outbound mail needs a person"}
+```
+
+Any verdict other than `proceed` renders `approval_mode = "always"` for that
+tool, so Codex asks Bothy. A tool with no rule that Codex asks about is declined,
+as before, but now audited. A declined `mcp_ask` tool also raises an alert.
+Every decision is a `kind: approval` audit record (`action` is the verdict,
+`status` is `ok`, `refused` or `awaiting_human`, `data` is
+`{method, server, tool, rule, reason}`). Rules for `bothy` tools are audited when
+they match.
+
+`confirm` finds the human's approval in the audit log: the newest `kind:
+interrupt`, `action: answered` record with `data.decision: "approve"` and the
+same `data.server` and `data.tool`. Without a window, or with no such record,
+the call stays declined. If the log cannot be read, the call is **denied**.
+Nothing writes that record yet; the chat hold in BOTHY-31 will.
+
+Unknown keys are refused at load, in the config and in every profile, naming the
+key. `max_tokens` and `wall_clock_seconds` are profile keys too: per-profile
+limits that apply between a run's own limit and the config-wide one.
 
 Webhook and polling runs cannot use `bothy_checklist_update` or `bothy_note`,
 even when their profile lists those tools. These writes persist into later

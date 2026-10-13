@@ -42,6 +42,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
+from . import policy
 from .audit import AuditLog
 
 __all__ = ["Profile", "DynamicTool", "ToolRegistry", "builtin_tools", "render_config_toml",
@@ -79,11 +80,25 @@ class Profile:
     approval_policy: str | None = None
     developer_instructions: str | None = None
     config: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # Per-profile run limits. The runner falls back to the config-wide ones.
+    max_tokens: int | None = None
+    wall_clock_seconds: float | None = None
+    # Typed approval rules, see policy.py. A tool named here must also be in
+    # mcp_tools (or tools, for server "bothy"): gating must not grant it.
+    approvals: list[dict[str, Any]] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_dict(cls, name: str, raw: dict[str, Any]) -> "Profile":
+        if not isinstance(raw, dict):
+            raise ValueError(f"profile {name}: must be an object, not {type(raw).__name__}")
+        # Derived from the fields, so a key a later change adds is accepted
+        # without anyone extending a list. A key that is NOT a field is refused:
+        # dropping it silently turns a typo'd safety setting into no setting.
         known = {field.name for field in dataclasses.fields(cls)} - {"name"}
-        profile = cls(name=name, **{key: value for key, value in raw.items() if key in known})
+        unknown = sorted(set(raw) - known)
+        if unknown:
+            raise ValueError(f"profile {name}: unknown key(s) {unknown}; known keys are {sorted(known)}")
+        profile = cls(name=name, **raw)
         profile.validate()
         return profile
 
@@ -124,6 +139,30 @@ class Profile:
                 raise ValueError(
                     f"profile {self.name}: mcp_tools names {server!r}, which this profile does not grant"
                 )
+        for rule in self.rules():
+            if rule.server == policy.HOSTED_SERVER:
+                granted, where = rule.tool in self.tools, "tools"
+            elif rule.server not in self.mcp_servers:
+                raise ValueError(
+                    f"profile {self.name}: approvals names {rule.server!r}, which this profile does not grant"
+                )
+            else:
+                allowed = self.mcp_tools.get(rule.server)
+                granted, where = allowed is None or rule.tool in allowed, "mcp_tools"
+            if not granted:
+                raise ValueError(
+                    f"profile {self.name}: approvals rule for {rule.label} names a tool that is not listed "
+                    f"in {where}. Add it to {where} to grant it, or remove the rule — a rule that gates "
+                    f"a tool must not be what enables it."
+                )
+
+    def rules(self) -> tuple[policy.ApprovalRule, ...]:
+        return policy.parse_rules(self.name, self.approvals)
+
+    def asked_tools(self, server: str) -> list[str]:
+        """Tools of ``server`` Codex must ask us about: ``mcp_ask``, or a rule that gates."""
+        gated = {rule.tool for rule in self.rules() if rule.server == server and rule.verdict != "proceed"}
+        return sorted(set(self.mcp_ask.get(server) or []) | gated)
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -132,7 +171,7 @@ class Profile:
         bits = []
         for server in sorted(self.mcp_servers):
             allowed = self.mcp_tools.get(server)
-            ask = self.mcp_ask.get(server) or []
+            ask = self.asked_tools(server)
             # Naming the tools, not just the server: "mcp: gmail" reads as
             # harmless and may include `send`.
             scope = ", ".join(allowed) if allowed else ("NO TOOLS" if allowed == [] else "ALL TOOLS")
@@ -214,7 +253,7 @@ def render_config_toml(profile: Profile | None, *, extra: dict[str, Any] | None 
                     lines += [f"[mcp_servers.{name}.{key}]"]
                     for sub, item in value.items():
                         lines.append(f"{sub} = {_toml_value(item)}")
-            for tool in sorted(profile.mcp_ask.get(name) or []):
+            for tool in profile.asked_tools(name):
                 lines += [f"[mcp_servers.{name}.tools.{tool}]", 'approval_mode = "always"']
     return "\n".join(lines) + "\n"
 
@@ -244,8 +283,19 @@ class DynamicTool:
 class ToolRegistry:
     """The dynamic tools available to a run, and the dispatch for their calls."""
 
-    def __init__(self, tools: list[DynamicTool] | None = None) -> None:
+    def __init__(self, tools: list[DynamicTool] | None = None,
+                 gate: Callable[[str, Any], str | None] | None = None) -> None:
         self._tools: dict[str, DynamicTool] = {tool.name: tool for tool in (tools or [])}
+        self._gate = gate
+
+    def gated(self, gate: Callable[[str, Any], str | None]) -> "ToolRegistry":
+        """The same tools behind an approval gate.
+
+        ``gate(name, arguments)`` returns None to let the call run, or the
+        reason it was declined. A gate that raises declines: a policy that
+        cannot answer has not approved anything.
+        """
+        return ToolRegistry(list(self._tools.values()), gate=gate)
 
     def add(self, tool: DynamicTool) -> None:
         self._tools[tool.name] = tool
@@ -260,7 +310,7 @@ class ToolRegistry:
         """
         blocked = {"bothy_checklist_update", "bothy_note"} if untrusted and not allow_from_untrusted else set()
         return ToolRegistry([self._tools[name] for name in names
-                             if name in self._tools and name not in blocked])
+                             if name in self._tools and name not in blocked], gate=self._gate)
 
     def specs(self) -> list[dict[str, Any]]:
         return [tool.spec() for tool in self._tools.values()]
@@ -276,6 +326,13 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             return False, f"{name} is not a tool this run was given"
+        if self._gate is not None:
+            try:
+                declined = self._gate(name, arguments)
+            except Exception as exc:  # noqa: BLE001 - fail closed
+                declined = f"approval check failed: {type(exc).__name__}: {exc}"
+            if declined is not None:
+                return False, declined
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)

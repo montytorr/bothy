@@ -188,6 +188,15 @@ class Config:
         for path in (self.home, self.state_dir, self.wake_dir, self.homes_dir, self.control_dir):
             path.mkdir(parents=True, exist_ok=True)
 
+    def validate_profiles(self) -> None:
+        """Every profile must parse, so a bad one is a startup error and not a refused run."""
+        from .capability import Profile
+
+        if not isinstance(self.profiles, dict):
+            raise ValueError("profiles must map profile names to objects")
+        for name, raw in self.profiles.items():
+            Profile.from_dict(name, raw)
+
     def validate_public_profiles(self, routes: list[Any] | None = None) -> None:
         """Public input must never reach an MCP server with an implicit grant."""
         from .capability import Profile
@@ -281,6 +290,14 @@ def load(path: str | os.PathLike[str] | None = None, **overrides: Any) -> Config
             # with silently-default settings is how a site ends up unprotected.
             raise ValueError(f"{source} is not valid JSON: {exc}") from exc
 
+    # A key that is not a Config field is refused, not dropped: a misspelt
+    # safety setting would otherwise load as its default and look configured.
+    # Derived from the fields so a key a later change adds is accepted for free.
+    known = {field.name for field in dataclasses.fields(Config)}
+    unknown = sorted(set(raw) - known)
+    if unknown:
+        raise ValueError(f"{source}: unknown config key(s) {unknown}")
+
     nested = {"pool": PoolPolicy, "budget": BudgetPolicy}
     for key, value in raw.items():
         if key in nested and isinstance(value, dict):
@@ -301,5 +318,6 @@ def load(path: str | os.PathLike[str] | None = None, **overrides: Any) -> Config
         if hasattr(config, key):
             setattr(config, key, value)
 
+    config.validate_profiles()
     config.validate_public_profiles()
     return config

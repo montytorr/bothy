@@ -19,6 +19,12 @@ Every release states its **Breaking Changes** heading even when it is empty.
   MCP tool allowlists.
 
 ### Added
+- **Typed approval policies (BOTHY-28):** a profile `approvals` list gives a
+  tool a `proceed`, `deny`, `guide` or `confirm` verdict, with `confirm`
+  honouring a human approval found in the audit log within
+  `unless_approved_within` seconds. Every approval decision is audited, a
+  declined `mcp_ask` tool raises an alert, Bothy-hosted tools can be gated, and
+  unknown config or profile keys are now refused by name instead of dropped.
 - **Lifecycle controls (BOTHY-25):** typed stop reasons on run outcomes and the
   finished audit, per-job token and wall-clock limits with profile/config
   fallbacks, API reservation overruns interrupted live, and `bothy cancel`
@@ -122,7 +128,12 @@ Every release states its **Breaking Changes** heading even when it is empty.
 - 271 tests, standard library only.
 
 ### Breaking Changes
-- None. First release.
+- **Unknown config and profile keys are refused (BOTHY-28):** `config.json` and
+  every profile used to drop a key Bothy did not recognise, so a stray or
+  misspelt key was ignored. It now fails the load and names the key, so a config
+  that carries one will not start after upgrading. Before restarting the
+  service, run `bothy doctor`: it loads the config and exits non-zero naming
+  the key. Remove or correct the key, then restart.
 
 ### Known gaps
 - Drove runs and attention forwarding are tested against a stand-in for `drove`

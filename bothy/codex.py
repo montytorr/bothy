@@ -377,16 +377,30 @@ class CodexClient:
                 }
             )
         elif "requestApproval" in method:
-            verdict = self._approval(method, params)
-            self._send({"id": message["id"], "result": {"decision": verdict.decision}})
+            verdict = self._decide(method, params)
+            result = {"decision": verdict.decision}
+            if verdict.reason:
+                # The model can only act on a refusal it can read.
+                result["reason"] = verdict.reason
+            self._send({"id": message["id"], "result": result})
         else:
             # Unknown request: refuse explicitly rather than hanging the turn.
+            # The policy hears of it first, so a request under a method name we
+            # did not anticipate is audited instead of vanishing.
+            self._decide(method, params)
             self._send(
                 {
                     "id": message["id"],
                     "error": {"code": -32601, "message": f"{self.client_name} does not implement {method}"},
                 }
             )
+
+    def _decide(self, method: str, params: dict[str, Any]) -> ApprovalDecision:
+        """Ask the approval policy. A policy that fails declines; it never approves."""
+        try:
+            return self._approval(method, params)
+        except Exception as exc:  # noqa: BLE001
+            return ApprovalDecision("decline", reason=f"approval policy failed: {type(exc).__name__}: {exc}")
 
     def _handle_tool_call(self, message: dict[str, Any], params: dict[str, Any]) -> None:
         """Answer a dynamic tool call. Never raises, always replies.
