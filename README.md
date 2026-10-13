@@ -5,7 +5,7 @@
 ### A small agent harness you can leave somewhere.
 
 *Woken by signed webhooks, cron schedules, chat, or polling.*
-*Runs Codex under supervision. Remembers in Cairn.*
+*Runs Codex under supervision. Remembers in Cairn, if you run it.*
 *Speaks up when it needs you. Closed to everything but the tailnet.*
 
 `stdlib only` · `no virtualenv` · `no build step` · `~12.4k lines` · `519 tests`
@@ -20,6 +20,9 @@ when they leave.
 
 That is the whole design brief. Bothy is the agent harness you install on a
 client's Mac mini, walk away from, and monitor from a distance.
+
+[Cairn](https://cairn.montytorr.com) is the family's task ledger. Bothy uses it
+only if you run it. Without Cairn, the audit log is the record.
 
 ```mermaid
 flowchart LR
@@ -113,7 +116,7 @@ bin/bothy status
 $ bin/bothy doctor
   [ok  ] state directory writable: /home/you/.bothy/state
   [ok  ] audit chain intact: 14 records verified
-  [ok  ] codex present: codex-cli 0.154.0
+  [ok  ] codex present: codex-cli 0.162.0
   [ok  ] cairn reachable: memory and task ledger
   [ok  ] no orphaned workers: 0 process group(s) left by a previous instance
   [warn] sandbox can start: bwrap: loopback: Operation not permitted — runs needing a shell will fail
