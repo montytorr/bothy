@@ -100,6 +100,59 @@ Wakes without a goal retain the ordinary behavior: capacity refusals are
 retried; other outcomes are processed with the runner's status. Inspect goal
 evidence with `bothy audit --json` (the text audit view shows the summary only).
 
+## Answering a held question or approval
+
+Set `question_hold_seconds` to a positive number (for example, `300`) to allow
+an in-flight agent to wait for a person. Bothy posts each question into its
+originating Slack thread or as a Discord reply, with an `int_` id and the hold
+limit. Reply in that Slack thread, reply to the posted Discord question, or
+send `answer <int_id> <text>` from an allowlisted account. Replies are audited
+with their actor and consumed as answers; they do not create a new wake.
+An account outside the allowlist cannot answer; its attempt is audited as ignored.
+If several requests are live in the same thread, an implicit reply is audited
+as ambiguous and Bothy replies with their ids. Use `answer <int_id> <text>` to
+choose one. Closed or rejected replies are audited and explained in the thread.
+Approval prompts include a fenced tool-argument summary, capped at 300 characters.
+
+A hold activates only after the question was posted, or in a foreground
+`bothy run` that prints the CLI answer hint. Background webhook/poll/job runs
+without a chat origin decline immediately; a failed post never spends the full
+hold waiting for a reply. For a foreground run, use the id from its hint:
+
+```bash
+bothy answer int_0123456789abcdef0123456789abcdef -- 'Use the archive bucket'
+bothy answer int_0123456789abcdef0123456789abcdef -- approve
+```
+
+Use `bothy answer <id> -- <text>` when text starts with `-`. The CLI requires an
+announced `state/control/<int_id>.pending` marker whose deadline and runner
+PID/boot/start identity are still live. Unknown, expired and closed ids return
+non-zero without leaving an answer file. It atomically writes and fsyncs
+`state/control/<int_id>.answer` before acknowledging; the supervision tick
+consumes it, and removes the marker when the request closes. Question-answer
+audit text is capped at 2000 characters with the full answer's SHA-256 digest. Answer while the hold is live:
+there is no durable resume after expiry or restart. A `confirm` approval accepts
+only `approve` or `yes` (case-insensitive); other text declines. An approval is
+recorded before delivery, and `unless_approved_within` lets later calls to that
+same server/tool proceed within its configured window. This covers MCP and
+Bothy-hosted tools. If a request asks several questions, the CLI's single text
+is used as the answer for each question id.
+
+With no answer, each question id receives the unattended-run guidance at the
+deadline and the agent continues. Approval requests receive a decline. Actual waiting extends its wall clock, with one total extension cap
+per run. `SIGTERM` or cancellation declines pending holds on the next 100 ms
+tick before interrupting the turn; outbound chat posting cannot block that tick.
+Questions remain on the run outcome, with answered state for held questions.
+
+The request and response shapes were checked against
+`codex app-server generate-json-schema` from installed Codex 0.162.0. MCP's
+`_meta` approval marker and tool keys remain observed binary metadata because
+the schema leaves `_meta` untyped. Modern unanswered questions receive the
+unattended-run guidance in each id's `answers` array, matching that schema. Questions marked `isSecret: true` are
+declined immediately, redacted from observers/outcomes/audit text, and never
+posted to chat. The audit records why they were declined. A live protocol
+round trip has not been verified.
+
 ## Drove runs
 
 Bothy can start Drove runs (a planner and its workers in herdr panes, on a Cairn
@@ -198,6 +251,19 @@ A restart tells nothing twice. A crash in the instant between the send and the
 second write sends that one item again: a duplicate is the cheaper mistake when
 the message is "a person is needed". Ids are Drove's and are never reused, so an
 item that went away and came back is a new message.
+
+**Answering from Discord.** With the gateway bot configured and your account
+allowlisted, reply to a forwarded `question`, `asking` or `blocked` message.
+Bothy invokes `drove send <seat> --run <id> --kind answer -- <text>` with the
+reply as one argument, and consumes redelivery without sending it again.
+The newest 1024 reply delivery claims are retained across restarts and item
+resolution; a distinct follow-up reply is a new answer.
+Permission, trust and dialog items remain pane-only. Drove sends run outside the
+gateway and attention-file lock, on at most four workers with a 15-second command
+timeout, and their outcomes are audited. The send attempt is fsynced
+before dispatch; a crash or failed send leaves an ambiguous attempt for a person
+to handle in the pane, rather than retrying it automatically. Slack attention
+items still use the pane.
 
 **If chat is down**, an item stays *to tell* and is retried every poll. After 20
 failed attempts it is abandoned and audited, and the alert goes to the log if
@@ -338,7 +404,7 @@ $BOTHY_HOME/
     checklist.md        the standing checklist, editable by hand or by the agent
     wakes/wakes.jsonl   the durable queue
     homes/              one disposable CODEX_HOME per run
-    control/            operator controls; cancellation files expire with the run
+    control/            operator controls; answer files are consumed by a live hold
 /usr/local/etc/bothy.env   secrets, 0600, owned by the service user
 /var/log/bothy/bothy.log   stdout and stderr
 ```

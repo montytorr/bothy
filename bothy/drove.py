@@ -62,6 +62,9 @@ __all__ = [
 # Drove's argument parser as an option.
 CAIRN_REF = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,31}-[0-9]{1,9}$")
 PROJECT_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9]{0,31}$")
+_ANSWER_SLOTS = threading.BoundedSemaphore(4)
+
+SEAT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 # Drove codes that can clear on their own, so the wake waits and is retried
@@ -775,6 +778,73 @@ class AttentionForwarder:
                 self.file.save(data)
             result.pending = sum(1 for entry in entries.values() if entry["state"] in {"new", "closing"})
         return result
+
+    def answer(self, reference: str, text: str, *, actor: str, delivery: str, allowed: bool = True) -> bool:
+        """Consume a reply, dispatching each delivery at most once.
+
+        Persist the attempt before the external command. A crash during send
+        leaves an ambiguous delivery pane-only, rather than sending it twice.
+        Retain the newest 1024 delivery claims, including after an item clears.
+        Permission, trust and dialog can only be answered in the pane.
+        """
+        with self.file.lock:
+            data = self.file.load()
+            deliveries = data.get("answer_deliveries") or {}
+            if allowed and delivery in deliveries:
+                return True
+            for item_id, entry in (data.get("items") or {}).items():
+                if (entry.get("refs") or {}).get("discord") != reference:
+                    continue
+                item = entry.get("item") or {}
+                if not allowed:
+                    self.audit.append(kind="interrupt", action="ignored", status="refused", actor=actor,
+                                      subject=item_id, data={"reason": "speaker is not on the allowlist"})
+                    return True
+                if item.get("kind") not in {"question", "asking", "blocked"} or entry.get("state") != "open":
+                    self.audit.append(kind="interrupt", action="ignored", status="refused", actor=actor,
+                                      subject=item_id, data={"reason": "attention item must be answered in its pane"})
+                    return True
+                run, seat = item.get("run"), item.get("seat")
+                if not isinstance(run, str) or not RUN_ID.fullmatch(run) or not isinstance(seat, str) or not SEAT_ID.fullmatch(seat):
+                    self.audit.append(kind="interrupt", action="ignored", status="refused", actor=actor,
+                                      subject=item_id, data={"reason": "invalid run or seat in attention item"})
+                    return True
+                deliveries[delivery] = clock.iso()
+                if len(deliveries) > 1024:
+                    oldest = min(deliveries, key=deliveries.get)
+                    del deliveries[oldest]
+                data["answer_deliveries"] = deliveries
+                self.file.save(data)
+                dispatch = (item_id, run, seat)
+                break
+            else:
+                return False
+        # The durable claim precedes dispatch; neither the gateway callback nor
+        # the attention file lock waits for the subprocess. Slots bound senders.
+        if not _ANSWER_SLOTS.acquire(blocking=False):
+            self.audit.append(kind="interrupt", action="failed", status="failed", actor=actor,
+                              subject=dispatch[0], data={"reason": "answer senders busy; answer in the pane"})
+            return True
+        try:
+            threading.Thread(target=self._send_answer, args=(*dispatch, text, actor), daemon=True).start()
+        except RuntimeError as exc:
+            _ANSWER_SLOTS.release()
+            self.audit.append(kind="interrupt", action="failed", status="failed", actor=actor,
+                              subject=dispatch[0], data={"reason": str(exc)[:300]})
+        return True
+
+    def _send_answer(self, item_id: str, run: str, seat: str, text: str, actor: str) -> None:
+        try:
+            try:
+                outcome = self.cli.run([self.cli.binary, "send", seat, "--run", run, "--kind", "answer", "--", text], timeout=15.0)
+            except Exception as exc:  # noqa: BLE001 - preserve the claim on ambiguous delivery
+                outcome = Outcome(False, "exception", error=str(exc)[:300])
+            self.audit.append(kind="interrupt", action="answered", status="ok" if outcome.ok else "failed",
+                              actor=actor, subject=item_id,
+                              data={"decision": "answer", "run": run, "seat": seat,
+                                    "code": outcome.code, "error": outcome.error})
+        finally:
+            _ANSWER_SLOTS.release()
 
     def _deliver(self, notice: Notice, refs: dict[str, str]) -> tuple[bool, dict[str, str]]:
         try:

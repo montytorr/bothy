@@ -36,13 +36,15 @@ import dataclasses
 import json
 import os
 import queue
+import secrets
 import subprocess
 import threading
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
 
-from . import clock, proc
+from . import clock, policy, proc
 from .capability import ToolRegistry
+from .interrupts import control_transaction, pending_owner, write_control
 
 __all__ = [
     "CodexError",
@@ -53,8 +55,14 @@ __all__ = [
     "default_approval",
     "default_question",
     "Question",
+    "PendingInterrupt",
     "StopReason",
 ]
+
+# Notification HTTP can stall in DNS despite a socket timeout. Bound observers
+# across runs so a failed chat endpoint cannot accumulate immortal threads.
+_NOTIFY_SLOTS = threading.BoundedSemaphore(2)
+_MAX_PENDING_INTERRUPTS = 16
 
 StopReason = Literal["wall_clock", "token_cap", "budget", "awaiting_human", "cancelled"]
 
@@ -82,6 +90,9 @@ class ApprovalDecision:
 
     decision: str  # accept | acceptForSession | decline | cancel
     reason: str = ""
+    hold: bool = False
+    server: str = ""
+    tool: str = ""
 
 
 def default_approval(method: str, params: dict[str, Any]) -> ApprovalDecision:
@@ -95,6 +106,73 @@ def default_approval(method: str, params: dict[str, Any]) -> ApprovalDecision:
     return ApprovalDecision("decline", reason=f"no approval policy configured for {method}")
 
 
+# Checked against `codex app-server generate-json-schema` 0.162.0.
+# MCP _meta approval keys are observed binary metadata; the schema leaves _meta
+# untyped. policy.identify() keeps that distinction and declines real forms.
+def question_answer(params: dict[str, Any], text: str) -> dict[str, Any]:
+    questions = params.get("questions")
+    questions = questions if isinstance(questions, list) else []
+    return {"answers": {q["id"]: {"answers": [text]} for q in questions
+                        if isinstance(q, dict) and isinstance(q.get("id"), str)}}
+
+
+def approval_answer(method: str, decision: str, reason: str = "") -> dict[str, Any]:
+    if method == "mcpServer/elicitation/request":
+        action = decision if decision in {"accept", "cancel"} else "decline"
+        return {"action": action, **({"content": {}} if action == "accept" else {})}
+    if method == "item/permissions/requestApproval":
+        # GrantedPermissionProfile has no required fields: {} grants nothing.
+        return {"permissions": {}, "scope": "turn"}
+    if method in {"applyPatchApproval", "execCommandApproval"}:
+        legacy = {"accept": "approved", "acceptForSession": "approved_for_session", "cancel": "abort"}
+        return {"decision": legacy.get(decision, {"denied": {"rejection": reason or "declined by Bothy"}})}
+    # Modern command/file decisions have no reason field. The audit holds it.
+    return {"decision": decision}
+
+
+UNATTENDED_GUIDANCE = (
+    "Bothy runs unattended and cannot wait for an answer. "
+    "Your question has been recorded and sent to an operator. "
+    "Continue with what you can do without it, or stop and say "
+    "what you are blocked on.")
+
+
+def question_decline(method: str = "item/tool/requestUserInput", params: dict[str, Any] | None = None) -> dict[str, Any]:
+    guidance = UNATTENDED_GUIDANCE
+    if params and secret_question(params):
+        guidance = "Bothy cannot collect secrets through chat. This question was declined; continue without it."
+    if method == "item/tool/requestUserInput":
+        return question_answer(params or {}, guidance)
+    return {"decision": "decline", "reason": guidance}
+
+
+def secret_question(params: dict[str, Any]) -> bool:
+    questions = params.get("questions")
+    return isinstance(questions, list) and any(
+        isinstance(q, dict) and q.get("isSecret") for q in questions)
+
+
+@dataclasses.dataclass
+class PendingInterrupt:
+    id: str
+    rpc_id: Any
+    deadline: float
+    kind: str
+    method: str
+    params: dict[str, Any]
+    prompt: str
+    started: float
+    server: str = ""
+    tool: str = ""
+    text: str | None = None
+    actor: str = ""
+    announced: bool = False
+    announcing: bool = False
+    announcement_failed: bool = False
+    asked_at: str = dataclasses.field(default_factory=clock.iso)
+    question: Question | None = None
+
+
 def _question_text(params: dict[str, Any]) -> str:
     """Pull the human-readable question out of a requestUserInput payload.
 
@@ -103,6 +181,9 @@ def _question_text(params: dict[str, Any]) -> str:
     try the known shapes, then fall back to the whole payload rather than
     reporting an empty string.
     """
+    questions = params.get("questions")
+    if isinstance(questions, list) and questions:
+        return "\n".join(_question_text(q) for q in questions if isinstance(q, dict))
     for key in ("prompt", "question", "message", "text", "title"):
         value = params.get(key)
         if isinstance(value, str) and value.strip():
@@ -142,9 +223,14 @@ class Question:
     prompt: str
     params: dict[str, Any] = dataclasses.field(default_factory=dict)
     asked_at: str = ""
+    interrupt_id: str | None = None
+    answered: bool = False
+    secret: bool = False
 
     def as_dict(self) -> dict[str, Any]:
-        return {"method": self.method, "prompt": self.prompt, "asked_at": self.asked_at}
+        return {"method": self.method, "prompt": self.prompt, "asked_at": self.asked_at,
+                **({"interrupt_id": self.interrupt_id, "answered": self.answered} if self.interrupt_id else {}),
+                **({"secret": True} if self.secret else {})}
 
 
 @dataclasses.dataclass
@@ -160,9 +246,8 @@ class TurnOutcome:
     error: str | None = None
     error_code: str | None = None
     items: list[dict[str, Any]] = dataclasses.field(default_factory=list)
-    #: Questions the agent put to a person during the turn. A turn can complete
-    #: with questions outstanding — Bothy cannot block waiting for an answer —
-    #: so this is how they survive the run rather than being lost.
+    #: All questions this turn, including whether a bounded hold was answered.
+    #: Expired questions survive on the outcome for the operator to investigate.
     questions: list[Question] = dataclasses.field(default_factory=list)
     stop_reason: StopReason | None = None
 
@@ -190,7 +275,14 @@ class CodexClient:
         approval: Callable[[str, dict[str, Any]], ApprovalDecision] = default_approval,
         on_question: Callable[[Question], None] = default_question,
         on_tool_call: Callable[[dict[str, Any]], None] | None = None,
+        tool_approval: Callable[[dict[str, Any]], ApprovalDecision] | None = None,
         tools: "ToolRegistry | None" = None,
+        question_hold_seconds: float = 0,
+        reply_channel: bool = False,
+        control_dir: Path | None = None,
+        on_interrupt: Callable[[PendingInterrupt], bool] | None = None,
+        on_answer: Callable[[PendingInterrupt, str, str], bool] | None = None,
+        on_resolved: Callable[[PendingInterrupt, str], None] | None = None,
     ) -> None:
         self.run_id = run_id
         self.codex_home = Path(codex_home)
@@ -202,10 +294,23 @@ class CodexClient:
         self._approval = approval
         self._on_question = on_question
         self._on_tool_call = on_tool_call
+        self._tool_approval = tool_approval
         #: Every question asked this run, in order. Read by run_turn onto the
         #: outcome so they reach the audit log and the operator.
         self.questions: list[Question] = []
         self._tools = tools
+        self.question_hold_seconds = question_hold_seconds
+        self.reply_channel = reply_channel
+        self._control_owner: dict[str, Any] | None = None
+        self.control_dir = control_dir
+        self._on_interrupt = on_interrupt
+        self._on_answer = on_answer
+        self._on_resolved = on_resolved
+        self.interrupts: dict[str, PendingInterrupt] = {}
+        self._holds_lock = threading.RLock()
+        self._write_lock = threading.Lock()
+        self._hold_used = 0.0
+        self._hold_limit: float | None = None
 
         self._popen: subprocess.Popen | None = None
         self._next_id = 0
@@ -252,6 +357,10 @@ class CodexClient:
     def close(self, *, grace_seconds: float = 10.0) -> str:
         """Kill the whole worker group and reap it. Always safe to call."""
         self._closed.set()
+        try:
+            self._tick_interrupts(stopping=True)
+        except CodexError:
+            pass  # the worker is already gone; its process group is still reaped
         if self._popen is None:
             return "never-started"
         pgid = self._popen.pid
@@ -333,6 +442,12 @@ class CodexClient:
         """Answer a request Codex addressed to us — approvals, mostly."""
         method = str(message.get("method"))
         params = message.get("params") or {}
+        params = params if isinstance(params, dict) else {}
+        hidden = method.endswith("/requestUserInput") and secret_question(params)
+        if hidden:
+            # Do not expose even the secret question's header/options/prompt to
+            # observers, the outcome or chat. Decline the entire batch.
+            params = {"secret": True}
         try:
             self._on_event(method, params)
         except Exception:  # noqa: BLE001
@@ -343,50 +458,27 @@ class CodexClient:
             # and the audit log directly, with no subprocess, port or credential.
             self._handle_tool_call(message, params)
         elif method.endswith("/requestUserInput"):
-            # NOT an approval. The model is asking a person for information, and
-            # routing it through the approval handler declined it in
-            # milliseconds with nobody told — the single moment the agent
-            # reaches for a human was the one moment it could not get one.
-            #
-            # Bothy still cannot block: a turn waiting on a person would hold a
-            # slot and a budget reservation indefinitely. So the question is
-            # recorded, handed to whoever is listening while the run is still
-            # going, and the turn is told plainly that it will not get an answer
-            # now — which is a fact the model can act on, unlike a bare refusal.
-            question = Question(
-                method=method,
-                prompt=_question_text(params),
-                params=params,
-                asked_at=clock.iso(),
-            )
+            question = Question(method=method, prompt="[secret question declined]" if hidden else _question_text(params),
+                                params=params, asked_at=clock.iso(), secret=hidden)
             self.questions.append(question)
+            if not hidden and self._hold(message, "question", question.prompt, question=question):
+                return
             try:
                 self._on_question(question)
             except Exception:  # noqa: BLE001
-                # A failing notifier must not take the run down with it; the
-                # question is already on the outcome either way.
                 pass
-            self._send(
-                {
-                    "id": message["id"],
-                    "result": {
-                        "decision": "decline",
-                        "reason": (
-                            "Bothy runs unattended and cannot wait for an answer. "
-                            "Your question has been recorded and sent to an operator. "
-                            "Continue with what you can do without it, or stop and say "
-                            "what you are blocked on."
-                        ),
-                    },
-                }
-            )
-        elif "requestApproval" in method:
+            self._send({"id": message["id"], "result": question_decline(method, message.get("params") or {})})
+        elif ("requestApproval" in method or method in {
+                "mcpServer/elicitation/request", "applyPatchApproval", "execCommandApproval"}):
             verdict = self._decide(method, params)
-            result = {"decision": verdict.decision}
-            if verdict.reason:
-                # The model can only act on a refusal it can read.
-                result["reason"] = verdict.reason
-            self._send({"id": message["id"], "result": result})
+            if method == "item/permissions/requestApproval" or (
+                    method == "mcpServer/elicitation/request" and not policy.mcp_tool_approval(params)):
+                verdict = ApprovalDecision("decline", reason="permission grants and non-tool elicitations are unsupported")
+            if verdict.hold and self._hold(message, "approval", f"Approve {verdict.server}.{verdict.tool}: {verdict.reason}",
+                                           server=verdict.server, tool=verdict.tool):
+                return
+            self._send({"id": message["id"],
+                        "result": approval_answer(method, verdict.decision, verdict.reason)})
         else:
             # Unknown request: refuse explicitly rather than hanging the turn.
             # The policy hears of it first, so a request under a method name we
@@ -399,6 +491,152 @@ class CodexClient:
                 }
             )
 
+    def _hold(self, message: dict[str, Any], kind: str, prompt: str,
+              *, server: str = "", tool: str = "", question: Question | None = None) -> bool:
+        if (self.question_hold_seconds <= 0 or self._closed.is_set() or self._stop_reason is not None
+                or not self.reply_channel or self._on_interrupt is None):
+            return False
+        if kind == "question" and not question_answer(message.get("params") or {}, "")["answers"]:
+            # Unknown/legacy question payloads cannot be answered from ids we do
+            # not have. Keep their existing recorded decline instead of guessing.
+            return False
+        if len(self.interrupts) >= _MAX_PENDING_INTERRUPTS:
+            return False
+        now = clock.monotonic()
+        deadline = now + min(self.question_hold_seconds, 5.0)
+        if self._hold_limit is not None:
+            deadline = min(deadline, self._hold_limit)
+        if deadline <= now:
+            return False
+        pending = PendingInterrupt("int_" + secrets.token_hex(16), message["id"], deadline,
+                                   kind, str(message["method"]), message.get("params") or {},
+                                   prompt, now, server, tool)
+        pending.question = question
+        if question is not None:
+            question.interrupt_id = pending.id
+        with self._holds_lock:
+            self.interrupts[pending.id] = pending
+        return True
+
+    def answer(self, interrupt_id: str, text: str, actor: str = "cli") -> bool:
+        """First answer wins; expired and unknown holds cannot approve anything."""
+        with self._holds_lock:
+            pending = self.interrupts.get(interrupt_id)
+            if (pending is None or self._closed.is_set() or self._stop_reason is not None
+                    or not pending.announced or pending.text is not None or clock.monotonic() >= pending.deadline):
+                return False
+            if self._on_answer is not None and not self._on_answer(pending, text, actor):
+                return False
+            pending.text, pending.actor = text, actor
+            return True
+
+    def activate_interrupt(self, pending: PendingInterrupt, register: Callable[[], None] | None = None) -> bool:
+        """Publish a CLI marker only after a chat post or foreground hint succeeds."""
+        deadline = clock.monotonic() + self.question_hold_seconds
+        if self._hold_limit is not None:
+            deadline = min(deadline, self._hold_limit)
+        if self.control_dir is not None:
+            if self._control_owner is None:
+                self._control_owner = pending_owner(self.run_id)
+            with control_transaction(self.control_dir):
+                write_control(self.control_dir, f"{pending.id}.pending",
+                              {"owner": self._control_owner, "deadline": deadline})
+        with self._holds_lock:
+            if (self.interrupts.get(pending.id) is pending and not self._closed.is_set()
+                    and clock.monotonic() < pending.deadline):
+                pending.deadline = deadline
+                pending.started = clock.monotonic()
+                pending.announced = True
+                if register is not None:
+                    register()  # memory-only board registration; no outbound work
+                return True
+        self._clear_control(pending.id)
+        return False
+
+    def _clear_control(self, interrupt_id: str) -> None:
+        if self.control_dir is not None:
+            with control_transaction(self.control_dir):
+                (self.control_dir / f"{interrupt_id}.pending").unlink(missing_ok=True)
+                (self.control_dir / f"{interrupt_id}.answer").unlink(missing_ok=True)
+
+    def _tick_interrupts(self, *, stopping: bool = False) -> None:
+        with self._holds_lock:
+            snapshot = list(self.interrupts.values())
+        announcements = []
+        for pending in snapshot:
+            with self._holds_lock:
+                if (not pending.announced and not pending.announcing and not stopping
+                        and not pending.announcement_failed and clock.monotonic() < pending.deadline
+                        and _NOTIFY_SLOTS.acquire(blocking=False)):
+                    pending.announcing = True
+                    announcements.append(pending)
+        # Start observers outside the lock, including deterministic test observers.
+        for pending in announcements:
+            try:
+                threading.Thread(target=self._announce_interrupt, args=(pending,), daemon=True).start()
+            except RuntimeError:
+                _NOTIFY_SLOTS.release()
+                with self._holds_lock:
+                    pending.announcement_failed = True
+        if not stopping and self.control_dir is not None:
+            for pending in snapshot:
+                path = self.control_dir / f"{pending.id}.answer"
+                with control_transaction(self.control_dir):
+                    try:
+                        body = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        body = None
+                    path.unlink(missing_ok=True)
+                if isinstance(body, dict) and isinstance(body.get("text"), str):
+                    self.answer(pending.id, body["text"], "cli")
+        resolved = []
+        with self._holds_lock:
+            for pending in snapshot:
+                if self.interrupts.get(pending.id) is not pending:
+                    continue
+                if pending.text is None and not stopping and not pending.announcement_failed and clock.monotonic() < pending.deadline:
+                    continue
+                del self.interrupts[pending.id]
+                state = ("stopped" if stopping else "answered" if pending.text is not None else
+                         "unavailable" if pending.announcement_failed else "expired")
+                resolved.append((pending, state))
+        # No hosted handler, wire write, control-file I/O or observer callback
+        # holds _holds_lock. A slow approved tool cannot stall another answer.
+        for pending, state in resolved:
+            self._clear_control(pending.id)
+            if self._on_resolved is not None:
+                self._on_resolved(pending, state)
+            if pending.method == "item/tool/call":
+                accepted = state == "answered" and pending.text.strip().lower() in {"approve", "yes"}
+                self._handle_tool_call({"id": pending.rpc_id}, pending.params, approved=True,
+                                       refused=None if accepted else "human approval declined")
+                continue
+            if state == "answered":
+                result = (question_answer(pending.params, pending.text) if pending.kind == "question"
+                          else approval_answer(pending.method, "accept" if
+                               pending.text.strip().lower() in {"approve", "yes"} else "decline"))
+            else:
+                result = (question_decline(pending.method, pending.params) if pending.kind == "question"
+                          else approval_answer(pending.method, "decline"))
+            self._send({"id": pending.rpc_id, "result": result})
+            if state == "answered" and pending.question is not None:
+                pending.question.answered = True
+
+    def _announce_interrupt(self, pending: PendingInterrupt) -> None:
+        try:
+            delivered = self._on_interrupt(pending)
+            if delivered:
+                if not pending.announced:
+                    delivered = self.activate_interrupt(pending)
+            if not delivered:
+                with self._holds_lock:
+                    pending.announcement_failed = True
+        except Exception:  # noqa: BLE001 - notification failure declines at the next tick
+            with self._holds_lock:
+                pending.announcement_failed = True
+        finally:
+            _NOTIFY_SLOTS.release()
+
     def _decide(self, method: str, params: dict[str, Any]) -> ApprovalDecision:
         """Ask the approval policy. A policy that fails declines; it never approves."""
         try:
@@ -406,7 +644,8 @@ class CodexClient:
         except Exception as exc:  # noqa: BLE001
             return ApprovalDecision("decline", reason=f"approval policy failed: {type(exc).__name__}: {exc}")
 
-    def _handle_tool_call(self, message: dict[str, Any], params: dict[str, Any]) -> None:
+    def _handle_tool_call(self, message: dict[str, Any], params: dict[str, Any],
+                          *, approved: bool = False, refused: str | None = None) -> None:
         """Answer a dynamic tool call. Never raises, always replies.
 
         A tool that fails answers ``success: false`` with the reason as text, so
@@ -415,8 +654,21 @@ class CodexClient:
         tool bug into a lost run.
         """
         name = str(params.get("tool") or "")
+        if self._tool_approval is not None and not approved:
+            try:
+                verdict = self._tool_approval(params)
+            except Exception as exc:  # noqa: BLE001 - a failing gate always denies
+                verdict = ApprovalDecision("decline", reason=f"tool approval failed: {exc}")
+            if verdict.hold and self._hold({**message, "method": "item/tool/call", "params": params},
+                                           "approval", f"Approve {verdict.server}.{verdict.tool}: {verdict.reason}",
+                                           server=verdict.server, tool=verdict.tool):
+                return
+            if verdict.decision not in {"accept", "acceptForSession"}:
+                refused = verdict.reason or "tool approval declined"
         started = clock.iso()
-        if self._tools is None:
+        if refused is not None:
+            ok, text = False, refused
+        elif self._tools is None:
             ok, text = False, f"{name} is not available to this run"
         else:
             ok, text = self._tools.call(name, params.get("arguments"))
@@ -442,8 +694,9 @@ class CodexClient:
             raise CodexError("worker is not running")
         blob = json.dumps({"jsonrpc": "2.0", **payload}, separators=(",", ":")) + "\n"
         try:
-            self._popen.stdin.write(blob.encode("utf-8"))
-            self._popen.stdin.flush()
+            with self._write_lock:
+                self._popen.stdin.write(blob.encode("utf-8"))
+                self._popen.stdin.flush()
         except (BrokenPipeError, ValueError) as exc:
             raise CodexError(f"worker stdin is gone: {exc}") from exc
 
@@ -599,17 +852,32 @@ class CodexClient:
         item_starts: dict[str, str] = {}
 
         deadline = clock.monotonic() + wall_clock_seconds
+        self._hold_limit = deadline + self.question_hold_seconds
+        previous_tick = deadline - wall_clock_seconds
         interrupted = False
 
         while True:
-            remaining = deadline - clock.monotonic()
+            now = clock.monotonic()
+            with self._holds_lock:
+                held = [p for p in self.interrupts.values() if p.announced]
+                if held and not interrupted:
+                    began = min(p.started for p in held)
+                    extension = min(max(0, now - max(previous_tick, began)),
+                                    self.question_hold_seconds - self._hold_used)
+                    self._hold_used += extension
+                    deadline += extension
+            previous_tick = now
+            remaining = deadline - now
             if not interrupted:
                 reason = should_stop() if should_stop is not None else None
+                self._tick_interrupts(stopping=(reason is not None or self._stop_reason is not None or remaining <= 0))
+            if not interrupted:
                 if reason is not None:
                     self._interrupt(reason)
                 if remaining <= 0:
                     self._interrupt("wall_clock")
             if self._stop_reason is not None and not interrupted:
+                self._tick_interrupts(stopping=True)
                 interrupted = True
                 outcome.status = "interrupted"
                 outcome.stop_reason = self._stop_reason
@@ -687,8 +955,8 @@ class CodexClient:
                     outcome.error = str(finished["error"])
                 break
 
-        # A turn can complete with questions outstanding — Bothy never blocks on
-        # one — so they ride out on the outcome or they are lost.
+        # Questions survive on the outcome whether answered or expired.
+        self._tick_interrupts(stopping=True)
         outcome.questions = list(self.questions)
         return outcome
 

@@ -7,8 +7,9 @@ a tool that is broken. A policy needs four answers, not two:
 
   proceed   let the call through.
   deny      decline it, for the reason given.
-  guide     decline it, and tell the model what to do instead. The reason is the
-            whole point, so it is required and it travels on the wire.
+  guide     decline it with a required reason. Bothy-hosted tools return the
+            reason in contentItems text; modern Codex-side approvals record it
+            in the audit only (their response schemas have no reason field).
   confirm   decline it until a human has said yes, then let it through for a
             bounded time. See below.
 
@@ -28,6 +29,12 @@ decision: ``action`` is the verdict, ``status`` is ``ok``, ``refused`` or
 ``awaiting_human``, and ``data`` is ``{method, server, tool, rule, reason}``.
 Calls to Bothy-hosted tools are audited only when a rule matched, because
 BOTHY-26 already records every such call as ``kind="tool"``.
+
+Codex 0.162.0 MCP tool approvals arrive as ``mcpServer/elicitation/request``.
+The generated schema leaves ``_meta`` untyped: its ``codex_approval_kind``
+marker and ``tool_name``/``tool_title`` keys are observed binary metadata.
+Unmarked forms/URL elicitations are declined. Additional permission requests
+are also denied and answered with an empty grant; a tool rule cannot grant them.
 
 THE TIME RULE (``confirm`` with ``unless_approved_within``). A human's approval
 is a fact in the audit log, not a flag in memory, so it survives a restart and
@@ -57,6 +64,7 @@ today only records; BOTHY-31 puts the chat hold there and may call the client's
 from __future__ import annotations
 
 import dataclasses
+import re
 import datetime as _dt
 from typing import Any, Literal
 
@@ -117,7 +125,7 @@ def parse_rules(profile: str, raw: Any) -> tuple[ApprovalRule, ...]:
         if not isinstance(reason, str):
             raise ValueError(f"{where} reason must be a string")
         if verdict == "guide" and not reason.strip():
-            raise ValueError(f"{where} is a guide rule and needs a reason: the reason is what the model is told")
+            raise ValueError(f"{where} is a guide rule and needs a reason: the reason guides hosted tools and is recorded in the audit")
         window = entry.get("unless_approved_within")
         if window is not None:
             if verdict != "confirm":
@@ -190,13 +198,32 @@ def _dig(params: dict[str, Any], keys: tuple[str, ...], nests: tuple[str, ...]) 
     return ""
 
 
+def mcp_tool_approval(params: dict[str, Any]) -> bool:
+    """Observed approval marker in an otherwise untyped MCP _meta payload."""
+    meta = params.get("_meta")
+    return isinstance(meta, dict) and meta.get("codex_approval_kind") == "mcp_tool_call"
+
+
 def identify(method: str, params: dict[str, Any]) -> tuple[str, str]:
     """The (server, tool) a request is about, or empty strings if it names none."""
+    params = params if isinstance(params, dict) else {}
     if method == HOSTED_METHOD:
         return HOSTED_SERVER, str(params.get("tool") or "")
-    server = _dig(params, ("server", "serverName", "mcpServer", "mcp_server"),
-                  ("item", "invocation", "call", "toolCall"))
-    tool = _dig(params, ("tool", "toolName", "tool_name"), ("item", "invocation", "call", "toolCall"))
+    if method == "mcpServer/elicitation/request":
+        server = _dig(params, ("serverName",), ())
+        if not mcp_tool_approval(params):
+            return server, ""
+        # These keys and the quoted message template are observed in the
+        # installed binary. _meta is untyped in the generated 0.162.0 schema.
+        tool = _dig(params["_meta"], ("tool_name", "tool_title"), ())
+        if not tool:
+            message = params.get("message")
+            match = re.search(r'\btool "([^"\r\n]+)"', message) if isinstance(message, str) else None
+            tool = match.group(1) if match else ""
+        return server, tool
+    server = _dig(params, ("server", "serverName", "server_name", "mcpServer", "mcp_server"),
+                  ("item", "invocation", "call", "toolCall", "request", "_meta"))
+    tool = _dig(params, ("tool", "toolName", "tool_name"), ("item", "invocation", "call", "toolCall", "request", "_meta"))
     return server, tool
 
 
@@ -227,6 +254,10 @@ def evaluate(method: str, params: dict[str, Any], facts: Facts) -> ApprovalDecis
     params = params if isinstance(params, dict) else {}
     server, tool = identify(method, params)
     base = {"method": method, "server": server, "tool": tool}
+    if method == "item/permissions/requestApproval":
+        return ApprovalDecision("deny", "Bothy does not grant additional permissions", status="refused", **base)
+    if method == "mcpServer/elicitation/request" and not mcp_tool_approval(params):
+        return ApprovalDecision("deny", "MCP forms and URL elicitations are unsupported", status="refused", **base)
     gated = tool in (facts.mcp_ask.get(server) or [])
     rule = next((r for r in facts.rules if r.server == server and r.tool == tool), None) if tool else None
 

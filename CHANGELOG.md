@@ -18,13 +18,33 @@ Every release states its **Breaking Changes** heading even when it is empty.
   checklist writes record SHA-256 digests, and public routes require explicit
   MCP tool allowlists.
 
+### Fixed
+
+- **Codex approval replies (BOTHY-31):** MCP tool approvals now use the
+  elicitation response shape and observed tool identity. Additional permission
+  requests receive an empty grant, and non-tool MCP forms/URLs receive an
+  audited decline. These audited refusals also apply with the default hold of
+  zero; previously these methods were unanswerable or used the wrong response.
+
 ### Added
+
+- **Bounded human holds (BOTHY-31):** opt-in `question_hold_seconds` lets
+  allowlisted Slack/Discord replies or `bothy answer` answer live questions
+  and `confirm` approvals. Waiting has a total cap below reservation expiry;
+  unanswered requests decline at the deadline and shutdown declines promptly.
+  Discord replies to Drove question/asking/blocked attention items dispatch
+  one answer; permission and trust dialogs remain pane-only. Codex 0.162.0
+  request/response schemas were checked; secret questions are redacted and
+  declined, and additional permissions and non-tool MCP elicitations are denied.
 - **Typed approval policies (BOTHY-28):** a profile `approvals` list gives a
   tool a `proceed`, `deny`, `guide` or `confirm` verdict, with `confirm`
   honouring a human approval found in the audit log within
   `unless_approved_within` seconds. Every approval decision is audited, a
   declined `mcp_ask` tool raises an alert, Bothy-hosted tools can be gated, and
   unknown config or profile keys are now refused by name instead of dropped.
+  Guide reasons reach the model through hosted-tool contentItems text; modern
+  Codex-side approval schemas carry only the decision, so their reasons remain
+  in the audit.
 - **Run traces (BOTHY-26):** hash-chained run, turn and hosted-tool spans,
   bounded Codex item summaries, and `bothy trace ID [--json] [--otlp URL]` in
   Drove's OTLP/JSON shape. Trace and `audit --run` include rotated segments;

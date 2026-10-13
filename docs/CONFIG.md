@@ -75,6 +75,7 @@ budget admission gate and settles its own reservation.
 | `codex_binary` | `codex` | |
 | `sandbox` | `readOnly` | The actual boundary. Widen deliberately |
 | `approval_policy` | `never` | *Do not stop to ask* — not *allow anything* |
+| `question_hold_seconds` | `0` | Optional bounded wait for human questions and confirm approvals; also the total wall-clock extension per run |
 | `wall_clock_seconds` | `900` | Enforced with `turn/interrupt`, on a monotonic clock |
 | `max_tokens` | `null` | Interrupt when cumulative input + output tokens reach the cap |
 | `codex_credentials_dir` | `~/.codex` | Where `auth.json` is copied from |
@@ -86,6 +87,21 @@ the named profile's values, then these worker defaults. `bothy run` and
 Token limits must be positive integers; wall clocks must be positive and finite.
 Usage arrives in updates, so a token cap can overshoot by an update. API runs
 also interrupt when their metered spend exceeds the reservation made at admission.
+
+A positive `question_hold_seconds` must be finite, and its sum with every
+known config, profile and stored job wall clock must be strictly below
+`budget.reservation_ttl_seconds`. Equal values are refused at load/startup;
+run-specific overrides are checked before starting a worker. The environment
+key is `BOTHY_QUESTION_HOLD_SECONDS`. For example, `300` allows a five-minute
+hold; actual waiting extends the wall clock by at most 300 seconds across all
+questions in that run. At most 16 requests may be held concurrently, and
+notification workers are capped at two across runs. A chat hold activates only
+after a successful thread post; notification attempts expire within five seconds.
+A foreground `bothy run` can instead activate a hold by printing the CLI answer
+hint. Background webhook/poll/job runs with no chat origin decline immediately;
+a failed chat post also declines without waiting for the full hold. With `0`, questions and confirmations decline immediately.
+The daemon drain is serial: a held run delays other model wakes, which is why
+the default is zero. Threads and worker homes remain disposable.
 
 ## Trace export
 
@@ -171,15 +187,15 @@ decline-everything default. Each rule is an object:
 | `server` | yes | An MCP server the profile grants, or `bothy` for a tool Bothy hosts (listed in `tools`) |
 | `tool` | yes | Must be enabled by the profile (`mcp_tools`, or `tools` for `bothy`); a rule that names anything else is refused |
 | `verdict` | yes | `proceed`, `deny`, `guide` or `confirm` |
-| `reason` | `guide` only | `guide` declines **and tells the model the reason**, so it is required. Optional text for the others |
+| `reason` | `guide` only | Required for `guide`; returned as text by Bothy-hosted tools and recorded in every approval audit. Codex-side approval responses have no reason field |
 | `unless_approved_within` | no, `confirm` only | Seconds. A human approval this recent lets the call through |
 
 | Verdict | Effect |
 |---|---|
 | `proceed` | The call runs |
-| `deny` | Declined, with `reason` |
-| `guide` | Declined; `reason` reaches the model on the wire |
-| `confirm` | Declined as "awaiting human confirmation" and audited with `status: awaiting_human`, unless a human approved this server and tool within `unless_approved_within` seconds |
+| `deny` | Declined; the audit records `reason` |
+| `guide` | Declined; hosted tools return `reason` in contentItems text. Modern Codex-side approvals record it in the audit only |
+| `confirm` | Waits for a live answer when a hold is configured, or proceeds on a recent approval within `unless_approved_within`. Otherwise declined; audited as `awaiting_human` |
 
 ```json
 {"server": "mail", "tool": "send_message", "verdict": "confirm",
@@ -192,13 +208,19 @@ as before, but now audited. A declined `mcp_ask` tool also raises an alert.
 Every decision is a `kind: approval` audit record (`action` is the verdict,
 `status` is `ok`, `refused` or `awaiting_human`, `data` is
 `{method, server, tool, rule, reason}`). Rules for `bothy` tools are audited when
-they match.
+they match. MCP tool approvals arrive as `mcpServer/elicitation/request` with
+an observed `_meta.codex_approval_kind: "mcp_tool_call"` marker; real forms and
+URL elicitations are declined. Additional permission requests receive an empty
+grant (`permissions: {}`, `scope: "turn"`), never additional access. These audited
+refusals apply even with `question_hold_seconds: 0`; the default-off behavior
+for these previously unsupported/mis-answered methods is now an audited deny.
 
 `confirm` finds the human's approval in the audit log: the newest `kind:
 interrupt`, `action: answered` record with `data.decision: "approve"` and the
-same `data.server` and `data.tool`. Without a window, or with no such record,
-the call stays declined. If the log cannot be read, the call is **denied**.
-Nothing writes that record yet; the chat hold in BOTHY-31 will.
+same `data.server` and `data.tool`. Without a window, each new call needs its
+own live human answer. With a window and no recent approval, confirmation is
+still required. If the log cannot be read, the call is **denied**. An answer
+collected by the bounded chat hold or `bothy answer` writes that record.
 
 Unknown keys are refused at load, in the config and in every profile, naming the
 key. `max_tokens` and `wall_clock_seconds` are profile keys too: per-profile

@@ -49,6 +49,7 @@ from .lifecycle import EX_CONFIG, EX_TEMPFAIL, AlreadyRunning, InstanceLock, Lif
 from .pool import Admission
 from .proc import ProcessRegistry
 from .retention import RetentionPolicy, sweep
+from .interrupts import InterruptBoard
 from .runner import Runner
 from .poll import PollState, Poller, Source
 from .drove import AttentionForwarder, DroveCli, DroveRuns, reaction_for
@@ -142,6 +143,10 @@ class Daemon:
         self.slack: "SlackBridge | None" = None
         self.discord: "DiscordBridge | None" = None
         self._stopping = threading.Event()
+        self.interrupt_board = InterruptBoard(audit, self._post_question)
+        self.runner.interrupt_board = self.interrupt_board
+        self.runner.post_question = self._post_question
+        self.runner.stopping = self._stopping.is_set
         self._drain_wanted = threading.Event()
         self._threads: list[threading.Thread] = []
 
@@ -295,6 +300,8 @@ class Daemon:
                         wall_clock_seconds=event.get("wall_clock_seconds"),
                         max_tokens=event.get("max_tokens"),
                         untrusted=self._untrusted_source(event),
+                        reply_to={key: (event.get("payload") or {})[key] for key in ("slack", "discord")
+                                  if event.get("route") == key and key in (event.get("payload") or {})},
                     )
                     gate = (result.refusal or {}).get("gate")
                     if result.status == "refused" and gate in self.CAPACITY_GATES:
@@ -724,6 +731,15 @@ class Daemon:
 
     # ---- lifecycle ------------------------------------------------------
 
+    def _post_question(self, origin: dict[str, Any], text: str) -> list[str]:
+        if self.slack is not None and origin.get("slack"):
+            where = origin["slack"]
+            return self.slack.client.post(where["channel"], text, thread_ts=where.get("thread_ts"))
+        if self.discord is not None and origin.get("discord"):
+            where = origin["discord"]
+            return self.discord.client.post(where["channel"], text, reply_to=where.get("message_id"))
+        return []
+
     def _build_slack(self) -> "SlackBridge | None":
         """Wire Slack if both tokens are present, and refuse a listening-but-deaf setup."""
         app_env = self.config.slack_app_token_env
@@ -746,6 +762,7 @@ class Daemon:
             app_token=app_token, bot_token=bot_token, store=self.store, audit=self.audit,
             allow_from=self.config.slack_allow_from, profile=self.config.slack_profile,
             ack_emoji=self.config.slack_ack_emoji,
+            interrupt_board=self.interrupt_board,
             on_stored=self._drain_wanted.set,
             on_error=lambda message, fatal: self.alerter.incident(
                 job="slack", error=message, severity="critical" if fatal else "warning",
@@ -778,6 +795,8 @@ class Daemon:
             channels=self.config.discord_channels,
             profile=self.config.discord_profile,
             message_content=self.config.discord_message_content,
+            interrupt_board=self.interrupt_board,
+            attention=self.attention,
             on_stored=self._drain_wanted.set,
             on_error=lambda message, fatal: self.alerter.incident(
                 job="discord", error=message, severity="critical" if fatal else "warning",
@@ -793,6 +812,7 @@ class Daemon:
         """Acquire the state directory and begin. Raises rather than guessing."""
         try:
             self.config.validate_public_profiles(self.routes)
+            self.config.validate_holds()
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         if self.attention is not None and not (self.config.discord_webhook_url
@@ -1018,6 +1038,7 @@ class SlackBridge:
         allow_from: list[str],
         profile: str | None = None,
         ack_emoji: str = "eyes",
+        interrupt_board: InterruptBoard | None = None,
         on_stored: Callable[[], None] | None = None,
         on_error: Callable[[str, bool], None] | None = None,
     ) -> None:
@@ -1026,6 +1047,7 @@ class SlackBridge:
         self.store = store
         self.audit = audit
         self.allow_from = set(allow_from)
+        self.interrupt_board = interrupt_board
         self.profile = profile
         self.ack_emoji = ack_emoji
         self.on_stored = on_stored or (lambda: None)
@@ -1046,6 +1068,11 @@ class SlackBridge:
         text = self._text_of(message)
         channel = str(event.get("channel") or "")
 
+        if self.interrupt_board is not None and self.interrupt_board.receive(
+                source="slack", channel=channel, reference=str(event.get("thread_ts") or ""),
+                text=text, actor=speaker, allowed=speaker in self.allow_from,
+                delivery=f"slack:{message.get('envelope_id')}"):
+            return True
         if speaker not in self.allow_from:
             self.audit.append(kind="slack", action="ignored", status="refused",
                               subject=channel, actor=speaker,
@@ -1108,6 +1135,8 @@ class DiscordBridge:
         channels: list[str] | None = None,
         profile: str | None = None,
         message_content: bool = True,
+        interrupt_board: InterruptBoard | None = None,
+        attention: AttentionForwarder | None = None,
         on_stored: Callable[[], None] | None = None,
         on_error: Callable[[str, bool], None] | None = None,
     ) -> None:
@@ -1116,6 +1145,8 @@ class DiscordBridge:
         self.store = store
         self.audit = audit
         self.allow_from = set(allow_from)
+        self.interrupt_board = interrupt_board
+        self.attention = attention
         self.channels = set(channels or ())
         self.profile = profile
         self.on_stored = on_stored or (lambda: None)
@@ -1141,6 +1172,15 @@ class DiscordBridge:
             return True
         if self.channels and channel not in self.channels:
             return True
+        reference = str((message.get("message_reference") or {}).get("message_id") or "")
+        if self.interrupt_board is not None and self.interrupt_board.receive(
+                source="discord", channel=channel, reference=reference, text=text, actor=speaker,
+                allowed=speaker in self.allow_from, delivery=f"discord:{message.get('id')}"):
+            return True
+        if self.attention is not None and reference and self.attention.answer(
+                reference, text, actor=speaker, delivery=f"discord:{message.get('id')}",
+                allowed=speaker in self.allow_from):
+            return True
         if speaker not in self.allow_from:
             self.audit.append(kind="discord", action="ignored", status="refused",
                               subject=channel, actor=speaker,
@@ -1162,7 +1202,8 @@ class DiscordBridge:
             "subject": self._subject_of(message),
             "delivery_key": f"discord:{message.get('id')}",
             "payload": {"prompt": text,
-                        "discord": {"channel": channel, "message_id": str(message.get("id") or "")}},
+                        "discord": {"channel": channel, "message_id": str(message.get("id") or ""),
+                                    "message_reference": reference}},
             "prompt": text,
             "profile": self.profile,
             "processed": False,
