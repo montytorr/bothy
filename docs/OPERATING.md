@@ -47,12 +47,33 @@ Bothy refuses work deliberately and records why. These are all normal:
 - `lane_busy` — something else is already working that subject. It will be retried.
 - `pool_full` / `pool_probing` — capacity. It will be retried.
 - `budget` — the cap would be breached. Names the cap and when it resets.
-- `profile` — a capability profile that does not exist. It will **not** be retried.
+- `profile` — a capability profile that does not exist. Without a goal it will **not** be retried.
 
 A wake that is refused for capacity too often, or waits too long, is
 **abandoned** with an alert rather than retried forever. Retries back off from
 4 seconds to a maximum of 64 seconds; 30 refusals take about 28 minutes of
 retries before abandonment. The six-hour age limit still applies.
+
+A scheduled model job with a validation check stays pending after a failed
+attempt, up to its `max_attempts` limit (1 by default, at most 5). Bothy writes
+`goal_attempts` before starting each run, separately from the capacity refusal
+counter `attempts`. A capacity refusal does not consume a goal attempt. Goal
+retries wait 4, 8, 16 or 32 seconds, using the same durable backoff shape and
+64-second ceiling as capacity retries; the drain moves on to other wakes while
+they wait. Restarting does not replenish the attempt limit or bypass the delay.
+
+Passing the check processes the wake as `verified`. Each check's `goal` audit entry
+names the wake, run, attempt, workspace, check command (or regex) and evidence.
+Failed check evidence is capped at 4 KB and included in the next prompt inside
+an untrusted fence. Missing commands, timeouts and empty check output fail;
+a run that did not complete feeds its error back without running its check.
+Exhausting attempts processes the wake as `unverified` and raises one goal alert.
+A `budget` or `budget_unknown` refusal also stops the goal and alerts, even with
+attempts left. Each admitted attempt reserves and settles budget independently.
+
+Wakes without a goal retain the ordinary behavior: capacity refusals are
+retried; other outcomes are processed with the runner's status. Inspect goal
+evidence with `bothy audit --json` (the text audit view shows the summary only).
 
 ## Drove runs
 

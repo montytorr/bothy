@@ -35,6 +35,39 @@ skipped: the wake is recorded as processed with `outcome: refused`,
 its next time. `docs/sops/drove-detached-start.md` is a worked example for a
 job that reports on Drove runs.
 
+## Scheduled goals
+
+A model job can carry `validate` and `max_attempts` in `state/jobs.json`.
+`validate` is either `{"command": ["python3", "check.py"], "timeout_seconds": 120}`
+or `{"output_regex": "VERIFIED"}`. `max_attempts` defaults to 1 and must be an
+integer from 1 to 5; more than one attempt requires a check. Drove actions cannot
+carry model-run checks. Both fields are validated when the job is written and
+copied onto its wake when it fires, so editing the job cannot change an active goal.
+
+```bash
+bothy schedule add repair --prompt "Repair the report" \
+  --validate-cmd python3 check_report.py --max-attempts 3
+bothy schedule add report --prompt "Check the report and say VERIFIED if correct" \
+  --validate-regex '^VERIFIED$' --max-attempts 2
+# Use a JSON argv array for commands with options or arguments containing spaces:
+bothy schedule add tests --prompt "Fix failing tests" \
+  --validate-cmd '["python3", "-m", "unittest", "discover", "-s", "tests"]' \
+  --validate-timeout 120 --max-attempts 3
+```
+
+Commands run in `workspace`, as argv without a shell, with a positive, finite
+deadline (`--validate-timeout`, default 120 seconds, maximum 600 seconds). Values
+above 600 are refused when adding a job; a check runs in the serial drain, so
+its deadline also bounds how long it can hold up other wakes. The process group is killed
+on timeout. A missing command, timeout, nonzero exit or empty output fails the
+check. A regex searches the final messages; empty final output fails even if the
+regex could match it. An incomplete run fails before its check runs.
+
+`schedule list` shows the check, its timeout and attempt limit (`--json` includes
+the stored fields). In API budget mode, `schedule add` refuses a job if
+`max_attempts * per_run_usd > per_day_usd`; each attempt still passes the normal
+budget admission gate and settles its own reservation.
+
 ## The worker
 
 | Key | Default | |

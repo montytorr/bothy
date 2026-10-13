@@ -19,6 +19,12 @@ Every release states its **Breaking Changes** heading even when it is empty.
   MCP tool allowlists.
 
 ### Added
+- **Scheduled goals (BOTHY-29):** jobs can validate a run with an argv command
+  or final-output regex and retry up to five attempts. Failures feed bounded,
+  untrusted evidence into the next prompt with durable backoff; success is
+  `verified`, exhaustion or budget refusal is `unverified` and alerted. Each
+  attempt keeps normal budget admission and settlement, and API jobs cannot
+  declare attempts whose worst-case spend exceeds the daily cap.
 - **Deferred wake backoff:** capacity and transient Drove refusals retry after
   4 seconds, doubling to a 64-second cap. Deadlines survive restarts, and new
   wakes do not consume a waiting wake's attempts.

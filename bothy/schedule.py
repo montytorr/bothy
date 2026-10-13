@@ -56,6 +56,7 @@ from typing import Any
 from . import clock
 from .cronspec import CronError, CronSpec
 from .drove import ActionError, parse_action
+from .goal import validate_definition
 
 __all__ = ["Job", "Schedule", "NO_REPLY", "strip_no_reply", "ScheduleError"]
 
@@ -146,6 +147,8 @@ class Job:
     # An action for Drove instead of a prompt: no model turn, no Codex. See drove.py.
     drove: dict[str, Any] | None = None
     sop: str | None = None                     # a bare name; resolved to <home>/sops/<name>.md
+    validate: dict[str, Any] | None = None      # command argv or final-output regex
+    max_attempts: int = 1                      # goal attempts, separately from capacity refusals
     last_fired_at: str | None = None
     next_due_at: str | None = None
     misfires: int = 0
@@ -275,6 +278,12 @@ class Schedule:
 
     def put(self, job: Job, *, sops_dir: Path | None = None) -> Job:
         """Add or replace a job, validating it now rather than at fire time."""
+        try:
+            validate_definition(job.validate, job.max_attempts)
+        except ValueError as exc:
+            raise ScheduleError(f"job {job.id}: {exc}") from exc
+        if job.drove is not None and job.validate is not None:
+            raise ScheduleError(f"job {job.id}: validate requires a model run, not a Drove action")
         if job.sop is not None:
             if sops_dir is not None:
                 read_sop(sops_dir, job.sop)         # missing, empty or oversized refuses
