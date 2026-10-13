@@ -209,6 +209,18 @@ class QueueTests(unittest.TestCase):
         self.daemon(lambda s: completed(s)).drain()
         self.assertEqual(self.store.pending(), [])
 
+    def test_a_waiting_webhook_or_poll_keeps_its_taint_when_retry_becomes_due(self) -> None:
+        for index, route in enumerate(("/x", "poll:issues")):
+            self.enqueue(f"taint{index}", "alpha", route=route,
+                         next_attempt_at=clock.iso(self.now + dt.timedelta(seconds=4)))
+            daemon = self.daemon(lambda s: completed(s))
+            with patch.object(daemon.fake_runner, "run", wraps=daemon.fake_runner.run) as run:
+                self.assertEqual(daemon.drain(), 0)
+                run.assert_not_called()
+                self.now += dt.timedelta(seconds=4)
+                self.assertEqual(daemon.drain(), 1)
+                self.assertTrue(run.call_args.kwargs["untrusted"])
+
     def test_a_permanently_stuck_lane_is_abandoned_not_retried_forever(self) -> None:
         """Every path that requeues work must advance a counter that gives up."""
         self.enqueue("w1", "alpha")

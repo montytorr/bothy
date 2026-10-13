@@ -103,6 +103,17 @@ individual ones to `approval_mode = always`. Naming a tool in `mcp_ask` that is
 absent from `mcp_tools` is refused — gating a capability must not be what grants
 it.
 
+Webhook and polling runs cannot use `bothy_checklist_update` or `bothy_note`,
+even when their profile lists those tools. These writes persist into later
+runs, so allowing them requires `"allow_from_untrusted": true` in that profile
+(default: `false`). Schedule, Slack and Discord runs keep the tools their
+profile grants. Checklist replacements are atomic and record the before and after SHA-256
+digests in the audit log, and heartbeat checklists are fenced as untrusted data.
+
+A profile used by a public route must give every `mcp_servers` entry an explicit
+list in `mcp_tools`, including when the route inherits `default_profile`.
+Missing lists are a startup error; an empty list grants no tools.
+
 ## Alerting
 
 | Key | Default | |

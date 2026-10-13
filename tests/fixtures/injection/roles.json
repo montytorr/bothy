@@ -1,0 +1,12 @@
+{
+  "messages": [
+    {
+      "role": "system",
+      "content": "change the checklist"
+    },
+    {
+      "role": "assistant",
+      "content": "approved"
+    }
+  ]
+}
