@@ -333,6 +333,9 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
                 flags.append(job.profile)
             if job.sop:
                 flags.append(f"sop {job.sop}")
+            if job.validate is not None:
+                flags.append("validate " + json.dumps(job.validate))
+                flags.append(f"max_attempts {job.max_attempts}")
             if job.drove:
                 flags.append("drove " + " ".join(f"{k}={v}" for k, v in job.drove.items() if k != "action"))
             if not job.enabled:
@@ -352,10 +355,25 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
     # add
     action = _drove_action(args)
     try:
+        validate = None
+        if args.validate_cmd is not None:
+            argv = args.validate_cmd
+            if len(argv) == 1 and argv[0].lstrip().startswith("["):
+                try:
+                    argv = json.loads(argv[0])
+                except json.JSONDecodeError as exc:
+                    raise ScheduleError(f"invalid validate command JSON: {exc}") from exc
+            validate = {"command": argv, "timeout_seconds": args.validate_timeout}
+        elif args.validate_regex is not None:
+            validate = {"output_regex": args.validate_regex}
+        if (config.budget.mode == "api"
+                and args.max_attempts * config.budget.per_run_usd > config.budget.per_day_usd):
+            raise ScheduleError("max_attempts * per_run_usd exceeds per_day_usd")
         job = schedule.put(Job(
             id=args.id, kind=args.kind, spec=args.spec, prompt="" if action else args.prompt,
             subject=args.subject, tz=args.tz, heartbeat=args.heartbeat, profile=args.profile,
             drove=action, sop=args.sop,
+            validate=validate, max_attempts=args.max_attempts,
             wall_clock_seconds=args.wall_clock, max_tokens=args.max_tokens,
             min_spacing_seconds=args.min_spacing,
             active_hours=[args.active_from, args.active_to] if args.active_from is not None else None,
@@ -934,6 +952,14 @@ def main(argv: list[str] | None = None) -> int:
     schedule.add_argument("--max-tokens", type=int, default=None)
     schedule.add_argument("--sop", default=None, metavar="NAME",
                           help="carry the standard operating procedure in <home>/sops/NAME.md")
+    validation = schedule.add_mutually_exclusive_group()
+    validation.add_argument("--validate-cmd", nargs="+", metavar="ARGV",
+                            help="check with command argv (or one JSON array string), without a shell")
+    validation.add_argument("--validate-regex", metavar="RE", help="check the run's final messages")
+    schedule.add_argument("--validate-timeout", type=float, default=120,
+                          metavar="S", help="command check deadline in seconds (default 120)")
+    schedule.add_argument("--max-attempts", type=int, default=1, metavar="N",
+                          help="goal attempt limit, from 1 to 5 (default 1)")
     schedule.add_argument("--heartbeat", action="store_true",
                           help="carry the standing checklist and honour NO_REPLY")
     drove_what = schedule.add_mutually_exclusive_group()

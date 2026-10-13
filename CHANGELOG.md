@@ -24,6 +24,12 @@ Every release states its **Breaking Changes** heading even when it is empty.
   Drove's OTLP/JSON shape. Trace and `audit --run` include rotated segments;
   optional `otlp_endpoint` export drops failures after two seconds, without
   holding the run's reservation or retrying.
+- **Scheduled goals (BOTHY-29):** jobs can validate a run with an argv command
+  or final-output regex and retry up to five attempts. Failures feed bounded,
+  untrusted evidence into the next prompt with durable backoff; success is
+  `verified`, exhaustion or budget refusal is `unverified` and alerted. Each
+  attempt keeps normal budget admission and settlement, and API jobs cannot
+  declare attempts whose worst-case spend exceeds the daily cap.
 - **Lifecycle controls (BOTHY-25):** typed stop reasons on run outcomes and the
   finished audit, per-job token and wall-clock limits with profile/config
   fallbacks, API reservation overruns interrupted live, and `bothy cancel`
