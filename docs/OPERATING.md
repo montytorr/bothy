@@ -467,6 +467,12 @@ also give every `mcp_servers` entry an explicit `mcp_tools` list, and webhook an
 poll runs lose `bothy_checklist_update` and `bothy_note` unless their profile sets
 `allow_from_untrusted`.
 
+**From 0.2.0 to 0.3.0**, nothing breaks. Run `bothy doctor` first. Memory is
+opt-in per profile (`memory: off` by default), and every new key defaults to off
+or harmless. Memory files live in `$BOTHY_HOME/memory` and must sit outside the
+workspace. The global `timezone` key sets the date of a daily note. The installed
+service runs from the checkout, so `git pull`, then restart the service.
+
 ## What lives where
 
 ```

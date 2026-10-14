@@ -8,7 +8,7 @@
 *Runs Codex under supervision. Remembers in Cairn, if you run it.*
 *Speaks up when it needs you. Closed to everything but the tailnet.*
 
-`stdlib only` · `no virtualenv` · `no build step` · `~12.4k lines` · `665 tests`
+`stdlib only` · `no virtualenv` · `no build step` · `~13.7k lines` · `665 tests`
 
 </div>
 
@@ -25,8 +25,11 @@ client's Mac mini, walk away from, and monitor from a distance.
 only if you run it, and a run started with `--ref` reads its task there first.
 Without Cairn, the audit log is the record.
 
-A profile can carry a persona and a few durable notes between runs. Bothy keeps
-them outside the workspace and audits every memory write.
+A profile can carry a persona (`SOUL.md`) and a few durable notes between runs
+(`MEMORY.md`, `USER.md`, and daily notes you can search). Memory is off until a
+profile opts in. Bothy keeps it outside the workspace, refuses secret-looking text, audits
+every write, and can consolidate daily notes on a schedule, saving a restorable
+preimage first.
 
 ```mermaid
 flowchart LR
@@ -120,8 +123,9 @@ bin/bothy status
 $ bin/bothy doctor
   [ok  ] state directory writable: /home/you/.bothy/state
   [ok  ] audit chain intact: 14 records verified
-  [ok  ] codex present: codex-cli 0.162.0
+  [ok  ] codex present: codex-cli 0.162.1
   [ok  ] cairn reachable: memory and task ledger
+  [ok  ] memory FTS5: FTS5 search; missing FTS5 uses a case-insensitive scan
   [ok  ] no orphaned workers: 0 process group(s) left by a previous instance
   [warn] sandbox can start: bwrap: loopback: Operation not permitted — runs needing a shell will fail
   [warn] alert route configured: a failure nobody hears about is not handled
@@ -193,7 +197,24 @@ $ bothy checklist
 - Verify the audit chain is intact, with no missing or invalid links.   ← the agent wrote this
 ```
 
-## What 0.2.0 adds
+## What 0.3.0 adds
+
+A memory layer, opt-in per profile (`memory: off` by default):
+
+- **Persona and notes.** `SOUL.md`, `MEMORY.md` and `USER.md` live in
+  `$BOTHY_HOME/memory`, never in the workspace. The `bothy_memory` tool writes
+  them under caps and a secret scan, and audits each write.
+- **Daily notes and search.** `bothy_memory_note`, `bothy_memory_search` and
+  `bothy_memory_get` (FTS5, with a scan fallback). `timezone` sets the day.
+- **Dreams.** `schedule add --dream` consolidates new daily notes, saving a
+  preimage first; `bothy memory preimages` and `restore` undo it.
+- **Cairn brief.** A run started with `--ref` reads the task's digest first.
+- **Reply capture** now collects terminal turn items without duplicates.
+
+Untrusted runs (webhook, poll) do not get the memory write tools unless the
+profile sets `allow_from_untrusted`. See the [CHANGELOG](CHANGELOG.md).
+
+## What 0.2.0 added
 
 The round that followed the first release, in the order an operator meets it:
 
@@ -215,9 +236,8 @@ The round that followed the first release, in the order an operator meets it:
   live question or confirm an approval from Slack, Discord or `bothy answer`
   within a bounded hold.
 
-Unknown config and profile keys are now refused rather than ignored, so check
-`bothy doctor` before restarting an upgraded install. See the
-[CHANGELOG](CHANGELOG.md).
+Unknown config and profile keys have been refused rather than ignored since
+0.2.0, so check `bothy doctor` before restarting an upgraded install.
 
 ## Install
 
@@ -249,6 +269,7 @@ is a contract — `75` restart me, `78` stop — and the two service managers ne
 | `wake` `poll` `slack` `discord` `ws` | Four ways in, on one durable queue |
 | `tailnet` `ratelimit` `install` | Who is calling, how often, and putting it on a machine |
 | `runner` `daemon` `schedule` `cronspec` | One run door-to-record; four loops; the heartbeat |
+| `memory` `memory_index` | Persona, curated and daily notes, FTS5 search, dreams and preimages |
 | `tracker` `alert` `notice` `retention` `config` | Cairn, saying something, sweeping up, the whole surface |
 | `drove` | Starting Drove runs, watching them, passing on what needs a person |
 
@@ -281,13 +302,15 @@ Built and proven end to end against a real Codex app-server, the real GitHub API
 and a real systemd install: supervised turns, parallel runs, budget refusal on
 live quota, crash recovery under `SIGKILL`, a heartbeat that woke itself and
 reported a genuine sandbox failure, and a hash-chained audit trail joining all of
-it by run id.
+it by run id. The memory layer has run live against real Codex too: persona,
+writes and recall, search, a dream with restore, and the untrusted gate
+(BOTHY-42, BOTHY-45).
 
-**Not proven:** no live Slack workspace and no live Discord application have ever
-been connected, a chat answer has not completed a live Codex round trip, and it has
-not yet run on a Mac mini. The protocols, ack
-discipline, allowlists and lane keying are proven against fakes and against the
-RFC — the credentials paths are not.
+**Not proven:** no live Slack workspace and no live Discord application have
+ever been connected, a chat answer has not completed a live Codex round trip,
+no Slack or Discord run has used memory, and it has not yet run on a Mac mini.
+The protocols, ack discipline, allowlists and lane keying are proven against
+fakes and against the RFC — the credentials paths are not.
 
 ## Documentation
 
