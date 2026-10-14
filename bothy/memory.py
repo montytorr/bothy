@@ -573,7 +573,7 @@ def restore(root: Path, profile: str, file: str, preimage: str, audit: AuditLog)
     if supplied.parent != Path("."):
         raise MemoryError("path", "preimage must be inside the profile's preimages directory")
     path = resolve_path(root, profile, f"preimages/{supplied.name}")
-    if not path.name.startswith(FILES[file] + "-") or path.suffix != ".md":
+    if not path.name.startswith((FILES[file] + "-", file.upper() + "-")) or path.suffix != ".md":
         raise MemoryError("file", "preimage must belong to the selected file")
     try:
         if path.stat().st_size > CAPS[file] * 4:

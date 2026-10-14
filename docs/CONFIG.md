@@ -99,13 +99,19 @@ budget admission gate and settles its own reservation.
 | `approval_policy` | `never` | *Do not stop to ask* — not *allow anything* |
 | `question_hold_seconds` | `0` | Optional bounded wait for human questions and confirm approvals; also the total wall-clock extension per run |
 | `wall_clock_seconds` | `900` | Enforced with `turn/interrupt`, on a monotonic clock |
-| `max_tokens` | `null` | Interrupt when cumulative input + output tokens reach the cap |
+| `max_tokens` | `null` | Interrupt when cumulative input + output tokens across the run’s thread reach the cap |
 | `codex_credentials_dir` | `~/.codex` | Where `auth.json` is copied from |
 | `codex_inherit_config` | `false` | Inheriting the host's config makes a client behave unlike your test |
 
 Jobs can set `max_tokens` and `wall_clock_seconds`; unset values fall back to
 the named profile's values, then these worker defaults. `bothy run` and
 `bothy schedule add` accept `--max-tokens N` and `--wall-clock SECONDS`.
+The count is cumulative across the run's thread, including repeated input
+context in model turns after tool calls. In the BOTHY-42 live test, persona plus
+memory tools used about 30,000 tokens for a two-turn exchange. A cap can be
+reached after an answer has already arrived; the run still stops as `token_cap`.
+Doctor warns non-fatally when a memory-enabled profile's effective cap (profile,
+otherwise config-wide) is below 100,000. Choose a cap with room for tool turns.
 Token limits must be positive integers; wall clocks must be positive and finite.
 Usage arrives in updates, so a token cap can overshoot by an update. API runs
 also interrupt when their metered spend exceeds the reservation made at admission.

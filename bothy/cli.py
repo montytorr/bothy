@@ -189,8 +189,14 @@ def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
           "FTS5 search; missing FTS5 uses a case-insensitive scan", fatal=False)
 
     for name, raw in sorted(config.profiles.items()):
-        if Profile.from_dict(name, raw).memory == "off":
+        profile = Profile.from_dict(name, raw)
+        if profile.memory == "off":
             continue
+        max_tokens = profile.max_tokens if profile.max_tokens is not None else config.max_tokens
+        if max_tokens is not None and max_tokens < 100_000:
+            check(f"memory {name} token cap", False,
+                  f"max_tokens={max_tokens} is below 100000; persona plus memory tools measured about "
+                  "30000 cumulative tokens for two turns", fatal=False)
         for file in memory.FILES:
             try:
                 _, text = memory.read_file(config.memory_dir, name, file)
@@ -284,6 +290,8 @@ def cmd_run(args: argparse.Namespace, config: Config) -> int:
         print(f"{result.status}  {result.run_id}  {result.cost:.4f} {result.unit}")
         if result.refusal:
             print(f"  refused at gate '{result.refusal.get('gate')}': {result.refusal.get('reason')}")
+        if result.stop_reason:
+            print(f"  stopped: {result.stop_reason}")
         for message in result.messages:
             print(f"  {message}")
         if result.error:
@@ -570,8 +578,16 @@ def cmd_memory(args: argparse.Namespace, config: Config) -> int:
                 print(memory.display(path.name))
             return 0
         if args.action == "restore":
-            memory.restore(config.memory_dir, args.profile, args.file, args.source, AuditLog(config.audit_path))
-            print(f"{memory.FILES[args.file]} restored for {args.profile}")
+            file, preimage = args.file, args.source
+            if preimage is None:
+                preimage = file
+                filename = pathlib.Path(preimage).name if preimage else ""
+                file = next((key for key in ("memory", "user")
+                             if filename.startswith((memory.FILES[key] + "-", key.upper() + "-"))), None)
+                if file is None:
+                    raise memory.MemoryError("file", "use PROFILE memory|user PREIMAGE or a MEMORY-/USER- preimage name")
+            memory.restore(config.memory_dir, args.profile, file, preimage, AuditLog(config.audit_path))
+            print(f"{memory.FILES[file]} restored for {args.profile}")
             return 0
         if args.action == "search":
             hits = memory_index.search(config.memory_dir, config.state_dir, args.profile, args.file)
@@ -1121,10 +1137,13 @@ def main(argv: list[str] | None = None) -> int:
     sop.add_argument("source", nargs="?", default=None, help="set: a file path; omit or '-' for stdin")
     sop.set_defaults(func=cmd_sop)
 
-    notes = subparsers.add_parser("memory", help="per-profile persona and curated notes")
+    notes = subparsers.add_parser(
+        "memory", help="per-profile persona and curated notes",
+        epilog="Restore: bothy memory restore PROFILE memory|user PREIMAGE; "
+               "or bothy memory restore PROFILE PREIMAGE (MEMORY-/USER- name infers the file).")
     notes.add_argument("action", choices=["list", "show", "set", "search", "preimages", "restore"])
     notes.add_argument("profile", nargs="?", default=None)
-    notes.add_argument("file", nargs="?", help="show/set: soul, memory, user or show daily; search: query")
+    notes.add_argument("file", nargs="?", help="show/set: soul, memory, user or show daily; search: query; restore: memory|user")
     notes.add_argument("source", nargs="?", default=None, help="set: file or stdin; restore: preimage; show daily: YYYY-MM-DD")
     notes.set_defaults(func=cmd_memory)
 

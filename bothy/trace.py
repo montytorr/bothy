@@ -49,11 +49,15 @@ def summarize_items(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep execution facts and times, never an unbounded transcript or diff."""
     summaries = []
     for item in items:
-        if item.get("type") not in {"commandExecution", "mcpToolCall", "fileChange"}:
+        if item.get("type") not in {"commandExecution", "mcpToolCall", "fileChange",
+                                    "dynamicToolCall", "agentMessage", "agent_message"}:
             continue
         summary = {key: item[key] for key in ("id", "type", "start", "end", "status", "exitCode", "server", "tool")
                    if key in item}
-        arguments = item.get("arguments", item.get("command", item.get("changes")))
+        # Hosted memory tools can contain private notes. Keep only metadata for
+        # dynamic calls and messages, just as the dedicated tool audit does.
+        arguments = (item.get("arguments", item.get("command", item.get("changes")))
+                     if item.get("type") in {"commandExecution", "mcpToolCall", "fileChange"} else None)
         if arguments is not None:
             summary["arguments"] = _short_arguments(arguments)
         summaries.append(summary)
