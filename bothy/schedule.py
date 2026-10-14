@@ -143,6 +143,7 @@ class Job:
     tz: str = "UTC"
     active_hours: list[int] | None = None      # [start, end) in the job's tz
     min_spacing_seconds: float = 60.0
+    dream: bool = False                        # scheduled memory consolidation
     heartbeat: bool = False                    # append the standing checklist
     profile: str | None = None                 # capability bundle; None = built-ins only
     # An action for Drove instead of a prompt: no model turn, no Codex. See drove.py.
@@ -163,6 +164,23 @@ class Job:
     def from_dict(cls, raw: dict[str, Any]) -> "Job":
         known = {field.name for field in dataclasses.fields(cls)}
         return cls(**{key: value for key, value in raw.items() if key in known})
+
+    def validate_dream(self, profiles: dict[str, Any] | None) -> None:
+        if type(self.dream) is not bool:
+            raise ScheduleError(f"job {self.id}: dream must be true or false")
+        if not self.dream:
+            return
+        if self.heartbeat or self.drove is not None or self.sop is not None:
+            raise ScheduleError(f"job {self.id}: dream cannot also be heartbeat, Drove or SOP")
+        from .capability import Profile
+
+        try:
+            valid = (self.profile is not None and profiles is not None and self.profile in profiles
+                     and Profile.from_dict(self.profile, profiles[self.profile]).memory == "write")
+        except (ValueError, TypeError):
+            valid = False
+        if not valid:
+            raise ScheduleError(f"job {self.id}: dream requires a named profile with memory: write")
 
     def zone(self) -> _dt.tzinfo:
         if self.tz.upper() == "UTC":
@@ -241,8 +259,9 @@ class Job:
 class Schedule:
     """The job store, and the decision about what is due."""
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(self, path: str | os.PathLike[str], *, profiles: dict[str, Any] | None = None) -> None:
         self.path = Path(path)
+        self.profiles = profiles
         self._lock = threading.Lock()
 
     # ---- storage -------------------------------------------------------
@@ -254,7 +273,9 @@ class Schedule:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {}
+        return data
 
     def _save(self, data: dict[str, dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -273,14 +294,21 @@ class Schedule:
             raise
 
     def jobs(self) -> list[Job]:
-        return [Job.from_dict(raw) for raw in self._load().values()]
+        jobs = [Job.from_dict(raw) for raw in self._load().values()]
+        for job in jobs:
+            job.validate_dream(self.profiles)
+        return jobs
 
     def get(self, job_id: str) -> Job | None:
         raw = self._load().get(job_id)
-        return Job.from_dict(raw) if raw else None
+        job = Job.from_dict(raw) if raw else None
+        if job is not None:
+            job.validate_dream(self.profiles)
+        return job
 
     def put(self, job: Job, *, sops_dir: Path | None = None) -> Job:
         """Add or replace a job, validating it now rather than at fire time."""
+        job.validate_dream(self.profiles)
         try:
             validate_definition(job.validate, job.max_attempts)
         except ValueError as exc:
@@ -331,7 +359,10 @@ class Schedule:
         """Jobs that should fire now, after every guard has had its say."""
         now = moment or clock.utcnow()
         ready: list[Job] = []
-        for job in self.jobs():
+        # Runtime validation belongs to fire(): a changed profile must produce
+        # one refused firing, then advance without blocking other due jobs.
+        for raw in self._load().values():
+            job = Job.from_dict(raw)
             if not job.enabled or job.next_due_at is None:
                 continue
             try:
@@ -355,6 +386,7 @@ class Schedule:
         """
         now = moment or clock.utcnow()
         with self._lock:
+            # Refused firings must advance even if their dream grant is invalid.
             data = self._load()
             raw = data.get(job_id)
             if raw is None:

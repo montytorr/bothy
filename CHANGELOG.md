@@ -11,6 +11,13 @@ Every release states its **Breaking Changes** heading even when it is empty.
 
 ### Added
 
+- **Scheduled memory consolidation (BOTHY-41):** `schedule add --dream`
+  builds bounded, fenced prompts from new daily notes and grants the dream-only
+  `bothy_memory_consolidate` tool. Audited replacements enforce caps, scanning,
+  bullet format and a 25% drop guard, saving fsynced preimages first.
+  Empty dreams skip Codex; successful dreams track their input cutoff.
+  Retention keeps 14 preimages per file; operators can list and restore them.
+
 - **Daily memory and search (BOTHY-40):** opt-in `bothy_memory_note` appends
   bounded, scanned, audited daily notes with local offset timestamps.
   `bothy_memory_search` and `bothy_memory_get` provide fenced reads in read or
