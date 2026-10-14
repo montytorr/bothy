@@ -281,14 +281,15 @@ Memory is opt-in for each capability profile:
 {"profiles": {"triage": {
   "memory": "write",
   "memory_on_heartbeat": false,
-  "tools": ["bothy_memory"],
+  "tools": ["bothy_memory", "bothy_memory_note", "bothy_memory_search", "bothy_memory_get"],
   "developer_instructions": "Check the queue and report what needs attention."
 }}}
 ```
 
 `memory` accepts `off` (default), `read` or `write`. `read` and `write` both
-inject the profile's files; `write` also makes `bothy_memory` available when
-listed in `tools`. A memory-enabled profile name must match
+inject the profile's files and offer `bothy_memory_search` / `bothy_memory_get`
+when listed in `tools`. `write` also offers `bothy_memory` / `bothy_memory_note`
+when listed. A memory-enabled profile name must match
 `^[a-z0-9][a-z0-9_-]{0,63}$`. `memory_on_heartbeat` is a boolean, default `false`.
 
 The files live in `$BOTHY_HOME/memory/<profile>/`, beside SOPs. They stay outside
@@ -355,6 +356,44 @@ clears a file. `bothy doctor` checks enabled profiles' files for readability and
 caps; failures are non-fatal warnings.
 `show` escapes non-printable characters so hand-edited files cannot send control
 codes to the operator's terminal.
+
+`bothy_memory_note` takes `{text}` and appends an entry with an ISO-8601 offset
+timestamp to `daily/YYYY-MM-DD.md` in the profile directory. The global
+`timezone` key accepts an IANA name such as `Europe/Paris`; its default `null`
+uses the system's local timezone. Dates and retention use that same timezone.
+Each entry allows at most 2,000 characters, and each day's file at most 64 KiB
+of UTF-8 bytes, including timestamps and formatting. Both caps are checked
+before the secret/Unicode scan. Refusals name the cap without truncating.
+Appends share a profile daily-directory flock with retention, fsync the file
+and directory, and audit intent first with profile, date, the entry body's
+SHA-256 and character count, never the text. Note arguments are redacted in
+generic audits and approval holds; untrusted runs need
+`allow_from_untrusted: true` to receive the note tool.
+
+Daily notes are never injected into prompts, including heartbeats. Search
+reaches them on demand. `bothy_memory_search` takes `{query, limit?}`: queries
+allow at most 500 characters, the default limit is 6 and the maximum is 20.
+It searches daily notes, MEMORY and USER (never SOUL) with SQLite FTS5 and
+BM25 ranking, returning relative paths, line ranges and snippets of at most
+240 characters, fenced as memory data. Terms are quoted literally and joined
+with AND, so FTS operators in input cannot widen the search or break syntax.
+The disposable cache at `$BOTHY_HOME/state/memory-index/<profile>.sqlite`
+tracks file sizes and modification times, then hashes changed content. Deleted
+or corrupt caches rebuild from files. SQLite without FTS5 uses a plain
+case-insensitive scan; doctor reports a non-fatal warning.
+
+`bothy_memory_get` takes `{path, from_line?, lines?}` with a relative profile
+path, a starting line (default 1) and at most 200 lines (default 200). Absolute
+paths, parent traversal and symlinks are refused. Results are fenced as data.
+Operators can use `bothy memory show PROFILE daily YYYY-MM-DD` to display a
+whole day and `bothy memory search PROFILE "QUERY"` to search. Both escape
+terminal control characters through the same display helper as curated files.
+
+The global `memory_retention_days` defaults to 90 and must be an integer of
+at least 1. The janitor deletes daily files whose local date is older than
+that many days, prunes their cached search rows, and audits removal counts.
+The cutoff day itself is kept, as are MEMORY, USER and SOUL. Retention also
+sweeps directories for profiles removed from configuration.
 
 ## Cairn
 

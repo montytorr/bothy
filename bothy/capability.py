@@ -319,7 +319,7 @@ class ToolRegistry:
         future version renamed should degrade to less capability, never to a
         run that refuses to start.
         """
-        blocked = {"bothy_checklist_update", "bothy_note", "bothy_memory"} if untrusted and not allow_from_untrusted else set()
+        blocked = {"bothy_checklist_update", "bothy_note", "bothy_memory", "bothy_memory_note"} if untrusted and not allow_from_untrusted else set()
         return ToolRegistry([self._tools[name] for name in names
                              if name in self._tools and name not in blocked], gate=self._gate)
 

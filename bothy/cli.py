@@ -18,7 +18,7 @@ from typing import Any
 
 import os
 
-from . import __version__, clock, codex, ids, memory, proc
+from . import __version__, clock, codex, ids, memory, memory_index, proc
 from .alert import Alerter, CompositeSink, DiscordWebhookSink, SlackWebhookSink, StderrSink
 from .audit import AuditError, AuditLog, ChainBreak
 from .budget import BudgetLedger
@@ -185,6 +185,8 @@ def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
 
     tracker = CairnTracker(agent=config.cairn_agent, binary=config.cairn_binary)
     check("cairn reachable", tracker.available(), "memory and task ledger", fatal=False)
+    check("memory FTS5", memory_index.fts5_available(),
+          "FTS5 search; missing FTS5 uses a case-insensitive scan", fatal=False)
 
     for name, raw in sorted(config.profiles.items()):
         if Profile.from_dict(name, raw).memory == "off":
@@ -561,7 +563,18 @@ def cmd_memory(args: argparse.Namespace, config: Config) -> int:
             raise memory.MemoryError("profile", "name a configured memory-enabled profile")
         if Profile.from_dict(args.profile, config.profiles[args.profile]).memory == "off":
             raise memory.MemoryError("profile", f"profile {args.profile} has memory off")
+        if args.action == "search":
+            hits = memory_index.search(config.memory_dir, config.state_dir, args.profile, args.file)
+            print(memory.display(memory_index.format_hits(hits)))
+            return 0
         if args.action == "show":
+            if args.file == "daily":
+                text = memory.read_day(config.memory_dir, args.profile, args.source)
+                text = memory.display(text)
+                print(text, end="" if text.endswith("\n") else "\n")
+                return 0
+            if args.file is not None and args.file not in memory.FILES:
+                raise memory.MemoryError("file", "show needs soul, memory, user or daily YYYY-MM-DD")
             for file in (args.file,) if args.file else memory.FILES:
                 _, text = memory.read_file(config.memory_dir, args.profile, file)
                 if args.file is None:
@@ -569,7 +582,7 @@ def cmd_memory(args: argparse.Namespace, config: Config) -> int:
                 text = memory.display(text)
                 print(text, end="" if text.endswith("\n") else "\n")
             return 0
-        if args.file is None:
+        if args.file not in memory.FILES:
             raise memory.MemoryError("file", "set needs soul, memory or user")
         text = sys.stdin.read() if args.source in (None, "-") else pathlib.Path(args.source).read_text(encoding="utf-8")
         size = memory.write(config.memory_dir, args.profile, args.file, AuditLog(config.audit_path),
@@ -1098,10 +1111,10 @@ def main(argv: list[str] | None = None) -> int:
     sop.set_defaults(func=cmd_sop)
 
     notes = subparsers.add_parser("memory", help="per-profile persona and curated notes")
-    notes.add_argument("action", choices=["list", "show", "set"])
+    notes.add_argument("action", choices=["list", "show", "set", "search"])
     notes.add_argument("profile", nargs="?", default=None)
-    notes.add_argument("file", nargs="?", choices=["soul", "memory", "user"])
-    notes.add_argument("source", nargs="?", default=None, help="set: a file path; omit or '-' for stdin")
+    notes.add_argument("file", nargs="?", help="show/set: soul, memory, user or show daily; search: query")
+    notes.add_argument("source", nargs="?", default=None, help="set: file or stdin; show daily: YYYY-MM-DD")
     notes.set_defaults(func=cmd_memory)
 
     serve = subparsers.add_parser("serve", help="run the daemon in the foreground")

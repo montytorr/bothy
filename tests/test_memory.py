@@ -347,7 +347,7 @@ class Runs(MemoryCase):
                 outer.during_turn()
                 for i, arguments in enumerate(outer.tool_calls):
                     self._handle_server_request({"id": i, "method": "item/tool/call", "params": {
-                        "threadId": "thread-1", "turnId": "turn-1", "tool": "bothy_memory", "arguments": arguments}})
+                        "threadId": "thread-1", "turnId": "turn-1", "tool": outer.tool_name, "arguments": arguments}})
                     outer.after_tool_call(self)
                 return codex.TurnOutcome(status="completed", turn_id="turn-1", messages=["done"])
 
@@ -358,6 +358,7 @@ class Runs(MemoryCase):
                 return "terminated"
 
         self.tool_calls = []
+        self.tool_name = "bothy_memory"
         for stub in (patch("bothy.runner.codex.CodexClient", Stub), patch.object(self.processes, "register")):
             stub.start()
             self.addCleanup(stub.stop)
@@ -563,6 +564,63 @@ class Runs(MemoryCase):
             self.assertIn('"file": "memory"', text)
         self.assertFalse(self.sent[0]["result"]["success"])
         self.assertNotIn(SECRET, self.config.audit_path.read_text())
+
+    def test_daily_note_arguments_redacted_on_success_and_refusal(self) -> None:
+        self.tool_name = "bothy_memory_note"
+        self.config.profiles["worker"]["tools"] = [self.tool_name]
+        self.tool_calls = [{"text": "Private daily fact."}, {"text": SECRET}]
+        self.assertTrue(self.execute().ok)
+        self.assertTrue(self.sent[0]["result"]["success"])
+        self.assertFalse(self.sent[1]["result"]["success"])
+        calls = [r for r in self.audit.records() if r["kind"] == "tool"]
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(r["data"]["arguments"]["redacted"] for r in calls))
+        for text in ("Private daily fact.", SECRET):
+            self.assertNotIn(text, self.config.audit_path.read_text())
+        self.assertNotIn("Private daily fact.", self.injected() or "")
+
+    def test_daily_note_confirm_hold_redacts_text(self) -> None:
+        from tests.test_interrupts import ImmediateThread
+
+        self.tool_name = "bothy_memory_note"
+        self.config.profiles["worker"]["tools"] = [self.tool_name]
+        self.config.profiles["worker"]["approvals"] = [
+            {"server": "bothy", "tool": self.tool_name, "verdict": "confirm", "reason": "Ask operator"}]
+        self.config.question_hold_seconds = 30
+        self.runner.post_question = Mock(return_value=["posted"])
+        self.tool_calls = [{"text": SECRET}]
+
+        def confirm(client):
+            client._tick_interrupts()
+            pending = next(iter(client.interrupts.values()))
+            self.assertTrue(client.answer(pending.id, "yes", "operator"))
+            client._tick_interrupts()
+
+        self.after_tool_call = confirm
+        stderr = io.StringIO()
+        with patch("bothy.codex.threading.Thread", ImmediateThread), contextlib.redirect_stderr(stderr):
+            result = self.execute(foreground=True, reply_to={"slack": {"channel": "test"}})
+        self.assertTrue(result.ok, result.error)
+        self.runner.post_question.assert_called_once()
+        for text in (stderr.getvalue(), self.runner.post_question.call_args.args[1], self.config.audit_path.read_text()):
+            self.assertNotIn(SECRET, text)
+            self.assertIn('"redacted":true', text.replace(" ", ""))
+        self.assertFalse(self.sent[0]["result"]["success"])
+
+    def test_daily_tool_grants_for_read_write_off_and_untrusted(self) -> None:
+        tools = ["bothy_memory_note", "bothy_memory_search", "bothy_memory_get"]
+        self.config.profiles["worker"]["tools"] = tools
+        for mode, untrusted, expected in (("read", False, tools[1:]), ("write", False, tools),
+                                          ("write", True, tools[1:]), ("off", False, [])):
+            with self.subTest(mode=mode, untrusted=untrusted):
+                self.config.profiles["worker"]["memory"] = mode
+                self.assertTrue(self.execute(untrusted=untrusted).ok)
+                names = [s["name"] for s in self.started[-1]["dynamic_tools"] or []]
+                self.assertEqual(set(names), set(expected))
+        self.config.profiles["worker"]["memory"] = "write"
+        self.config.profiles["worker"]["allow_from_untrusted"] = True
+        self.assertTrue(self.execute(untrusted=True).ok)
+        self.assertEqual({s["name"] for s in self.started[-1]["dynamic_tools"]}, set(tools))
 
     def test_memory_refusal_releases_cairn_budget_and_exports_trace(self) -> None:
         tracker = Mock()

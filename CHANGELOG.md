@@ -11,6 +11,13 @@ Every release states its **Breaking Changes** heading even when it is empty.
 
 ### Added
 
+- **Daily memory and search (BOTHY-40):** opt-in `bothy_memory_note` appends
+  bounded, scanned, audited daily notes with local offset timestamps.
+  `bothy_memory_search` and `bothy_memory_get` provide fenced reads in read or
+  write mode, with a disposable FTS5/BM25 cache and a scan fallback.
+  Daily notes stay out of prompts; retention removes old days and cached rows.
+  Operators can show a day or search memory, and doctor warns when FTS5 is absent.
+
 - **Cairn brief at run start (BOTHY-39):** a run started with `--ref` reads the
   task's `cairn show` digest and appends it to the prompt as fenced, untrusted
   data capped at 6,000 characters. The read has a 10 second deadline, is audited
