@@ -381,6 +381,10 @@ def load(path: str | os.PathLike[str] | None = None, **overrides: Any) -> Config
             setattr(config, key, value)
 
     config.validate_profiles()
+    # A dream grant is valid only against the current configured profile.
+    from .schedule import Schedule
+
+    Schedule(config.state_dir / "jobs.json", profiles=config.profiles).jobs()
     config.validate_holds()
     config.validate_public_profiles()
     return config

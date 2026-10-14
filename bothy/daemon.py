@@ -109,7 +109,7 @@ class Daemon:
         self.retention = retention or RetentionPolicy()
 
         self.store = WakeStore(config.wake_dir)
-        self.schedule = Schedule(config.state_dir / "jobs.json")
+        self.schedule = Schedule(config.state_dir / "jobs.json", profiles=config.profiles)
         self.poller = Poller(PollState(config.state_dir / "poll.json"))
         self.sources = [Source(**entry) for entry in config.poll_sources]
         self._next_poll: dict[str, float] = {}
@@ -225,6 +225,13 @@ class Daemon:
     # pending and is retried. These are the gates that mean "not now".
     CAPACITY_GATES = frozenset({"lane_busy", "pool_full", "pool_probing"})
 
+    def _dream_job_for(self, event: dict[str, Any]) -> Job | None:
+        route = str(event.get("route", ""))
+        if not route.startswith("schedule:"):
+            return None
+        job = self.schedule.get(route.removeprefix("schedule:"))
+        return job if job is not None and job.dream else None
+
     def drain(self) -> int:
         """Turn pending wakes into runs. Returns how many were handled.
 
@@ -292,11 +299,13 @@ class Daemon:
                             continue
                         self.store.mark(event["id"], goal_attempts=goal_attempts + 1)
 
+                    dream_job = self._dream_job_for(event)
                     result = self.runner.run(
                         subject=subject,
                         prompt=self._prompt_for(event),
                         wake_id=event["id"],
-                        profile=event.get("profile"),
+                        profile=dream_job.profile if dream_job else event.get("profile"),
+                        dream=dream_job is not None,
                         wall_clock_seconds=event.get("wall_clock_seconds"),
                         max_tokens=event.get("max_tokens"),
                         untrusted=self._untrusted_source(event),
@@ -364,8 +373,8 @@ class Daemon:
 
     # ---- the schedule ---------------------------------------------------
 
-    def fire(self, job: Job) -> str:
-        """Turn a due job into a wake. Returns the wake id.
+    def fire(self, job: Job) -> str | None:
+        """Turn a due job into a wake. Invalid dreams return None without a wake.
 
         A scheduled job produces a WAKE, not a run. It joins the same durable
         queue as a webhook and passes the same admission gate, so lanes, budget
@@ -373,6 +382,18 @@ class Daemon:
         eventually disagree with the first, and the disagreement would be found
         in production.
         """
+        try:
+            job.validate_dream(self.config.profiles)
+        except ScheduleError as exc:
+            error = str(exc)
+            self.audit.append(kind="schedule", action="refused", subject=job.lane(), status="refused",
+                              data={"job": job.id, "gate": "dream_invalid", "error": error})
+            self.alerter.incident(job=f"dream:{job.id}", error=error, severity="warning",
+                                  title=f"job {job.id} did not run",
+                                  summary="Its dream definition requires a profile with memory: write "
+                                          "and no heartbeat, Drove action or SOP.",
+                                  reaction="Check the dream job and its profile:", command="bothy schedule list")
+            return None
         if job.drove:
             wake_id = ids_wake_id()
             self.store.append({
@@ -386,7 +407,7 @@ class Daemon:
             self._drove_wanted.set()
             return wake_id
 
-        prompt = job.prompt
+        prompt = "" if job.dream else job.prompt
         sop_sha = None
         if job.sop:
             try:

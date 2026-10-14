@@ -102,7 +102,7 @@ def _has_other_wake_source(config: Config) -> bool:
     forwards_drove = bool(config.drove_attention_interval_seconds
                           and (config.discord_webhook_url or config.slack_webhook_url))
     return bool(config.poll_sources or config.slack_app_token_env or config.discord_bot_token_env
-                or forwards_drove or Schedule(config.state_dir / "jobs.json").jobs())
+                or forwards_drove or Schedule(config.state_dir / "jobs.json", profiles=config.profiles).jobs())
 
 
 def cmd_serve(args: argparse.Namespace, config: Config) -> int:
@@ -330,7 +330,7 @@ def cmd_trace(args: argparse.Namespace, config: Config) -> int:
 def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
     """List, add or remove scheduled jobs."""
     config.ensure_dirs()
-    schedule = Schedule(config.state_dir / "jobs.json")
+    schedule = Schedule(config.state_dir / "jobs.json", profiles=config.profiles)
 
     if args.action == "list":
         jobs = schedule.jobs()
@@ -344,6 +344,8 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
             flags = []
             if job.heartbeat:
                 flags.append("heartbeat")
+            if job.dream:
+                flags.append("dream")
             if job.profile:
                 flags.append(job.profile)
             if job.sop:
@@ -386,7 +388,7 @@ def cmd_schedule(args: argparse.Namespace, config: Config) -> int:
             raise ScheduleError("max_attempts * per_run_usd exceeds per_day_usd")
         job = schedule.put(Job(
             id=args.id, kind=args.kind, spec=args.spec, prompt="" if action else args.prompt,
-            subject=args.subject, tz=args.tz, heartbeat=args.heartbeat, profile=args.profile,
+            subject=args.subject, tz=args.tz, heartbeat=args.heartbeat, dream=args.dream, profile=args.profile,
             drove=action, sop=args.sop,
             validate=validate, max_attempts=args.max_attempts,
             wall_clock_seconds=args.wall_clock, max_tokens=args.max_tokens,
@@ -421,7 +423,7 @@ def _uses_drove(config: Config) -> bool:
     """Whether anything configured would call Drove, so doctor knows to look."""
     if config.drove_attention_interval_seconds or any(route.get("drove") for route in config.routes):
         return True
-    return any(job.drove for job in Schedule(config.state_dir / "jobs.json").jobs())
+    return any(job.drove for job in Schedule(config.state_dir / "jobs.json", profiles=config.profiles).jobs())
 
 
 def cmd_drove(args: argparse.Namespace, config: Config) -> int:
@@ -563,6 +565,14 @@ def cmd_memory(args: argparse.Namespace, config: Config) -> int:
             raise memory.MemoryError("profile", "name a configured memory-enabled profile")
         if Profile.from_dict(args.profile, config.profiles[args.profile]).memory == "off":
             raise memory.MemoryError("profile", f"profile {args.profile} has memory off")
+        if args.action == "preimages":
+            for path in memory.preimages(config.memory_dir, args.profile):
+                print(memory.display(path.name))
+            return 0
+        if args.action == "restore":
+            memory.restore(config.memory_dir, args.profile, args.file, args.source, AuditLog(config.audit_path))
+            print(f"{memory.FILES[args.file]} restored for {args.profile}")
+            return 0
         if args.action == "search":
             hits = memory_index.search(config.memory_dir, config.state_dir, args.profile, args.file)
             print(memory.display(memory_index.format_hits(hits)))
@@ -1073,6 +1083,7 @@ def main(argv: list[str] | None = None) -> int:
                           metavar="S", help="command check deadline in seconds (default 120)")
     schedule.add_argument("--max-attempts", type=int, default=1, metavar="N",
                           help="goal attempt limit, from 1 to 5 (default 1)")
+    schedule.add_argument("--dream", action="store_true", help="consolidate memory; ignores --prompt")
     schedule.add_argument("--heartbeat", action="store_true",
                           help="carry the standing checklist and honour NO_REPLY")
     drove_what = schedule.add_mutually_exclusive_group()
@@ -1111,10 +1122,10 @@ def main(argv: list[str] | None = None) -> int:
     sop.set_defaults(func=cmd_sop)
 
     notes = subparsers.add_parser("memory", help="per-profile persona and curated notes")
-    notes.add_argument("action", choices=["list", "show", "set", "search"])
+    notes.add_argument("action", choices=["list", "show", "set", "search", "preimages", "restore"])
     notes.add_argument("profile", nargs="?", default=None)
     notes.add_argument("file", nargs="?", help="show/set: soul, memory, user or show daily; search: query")
-    notes.add_argument("source", nargs="?", default=None, help="set: file or stdin; show daily: YYYY-MM-DD")
+    notes.add_argument("source", nargs="?", default=None, help="set: file or stdin; restore: preimage; show daily: YYYY-MM-DD")
     notes.set_defaults(func=cmd_memory)
 
     serve = subparsers.add_parser("serve", help="run the daemon in the foreground")

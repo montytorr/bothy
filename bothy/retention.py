@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from . import clock, memory, memory_index
-from .audit import AuditLog
+from .audit import AuditError, AuditLog
 from .budget import BudgetLedger
 from .config import Config
 from .proc import ProcessRegistry
@@ -59,6 +59,7 @@ class SweepReport:
     homes_removed: list[str] = dataclasses.field(default_factory=list)
     homes_kept_live: list[str] = dataclasses.field(default_factory=list)
     reservations_expired: int = 0
+    memory_preimages_removed: int = 0
     memory_days_removed: int = 0
     memory_index_rows_pruned: int = 0
     bytes_freed: int = 0
@@ -73,6 +74,7 @@ class SweepReport:
             or self.wakes_dropped
             or self.homes_removed
             or self.reservations_expired
+            or self.memory_preimages_removed
             or self.memory_days_removed
             or self.errors
         )
@@ -89,6 +91,8 @@ class SweepReport:
             parts.append(f"removed {len(self.homes_removed)} orphaned worker home(s)")
         if self.reservations_expired:
             parts.append(f"expired {self.reservations_expired} stale reservation(s)")
+        if self.memory_preimages_removed:
+            parts.append(f"removed {self.memory_preimages_removed} memory preimage(s)")
         if self.memory_days_removed:
             parts.append(f"removed {self.memory_days_removed} daily memory file(s)")
         if self.bytes_freed:
@@ -192,6 +196,26 @@ def sweep(config: Config, policy: RetentionPolicy | None = None) -> SweepReport:
     for profile in sorted(profiles):
         if memory.PROFILE_NAME.fullmatch(profile) is None:
             continue
+        try:
+            for file in ("memory", "user"):
+                target = memory.resolve_file(config.memory_dir, profile, file)
+                if not target.parent.is_dir():
+                    continue
+                with target.with_suffix(".lock").open("a") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    expired = memory.preimages(config.memory_dir, profile, file)[:-14]
+                    if not expired:
+                        continue
+                    size = sum(path.stat().st_size for path in expired)
+                    audit.append(kind="memory", action="preimage_retention", status="pending",
+                                 data={"profile": profile, "file": file,
+                                       "files_removed": len(expired), "bytes": size})
+                    for path in expired:
+                        path.unlink()
+                        report.memory_preimages_removed += 1
+                    report.bytes_freed += size
+        except (OSError, AuditError, memory.MemoryError):
+            report.errors.append("memory preimages: could not sweep profile")
         removed = []
         try:
             daily = memory.resolve_path(config.memory_dir, profile, "daily")

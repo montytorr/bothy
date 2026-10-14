@@ -382,6 +382,7 @@ class Runner:
         max_tokens: int | None = None,
         untrusted: bool = False,
         heartbeat: bool = False,
+        dream: bool = False,
         reply_to: dict[str, Any] | None = None,
         foreground: bool = False,
     ) -> RunResult:
@@ -389,6 +390,28 @@ class Runner:
         started = clock.iso()
         result = RunResult(run_id=run_id, subject=subject, status="failed", started_at=started, cairn_ref=cairn_ref)
         result.unit = self.config.budget.unit()
+
+        consolidated: set[str] = set()
+        dream_through: str | None = None
+        if dream:
+            try:
+                active_dream = self.profile(profile)
+                if untrusted or heartbeat or active_dream is None or active_dream.memory != "write":
+                    raise memory.MemoryError("dream", "dream requires a trusted schedule and memory: write")
+                prompt, dream_through = memory.dream_prompt(
+                    self.config.memory_dir, self.config.state_dir, active_dream.name)
+                if prompt is None:
+                    result.status = "completed"
+                    result.finished_at = clock.iso()
+                    self.audit.append(kind="memory", action="dream_skipped", run_id=run_id,
+                                      subject=subject, data={"profile": active_dream.name})
+                    return result
+            except (memory.MemoryError, KeyError, ValueError, TypeError) as exc:
+                result.status = "refused"
+                result.refusal = {"gate": "dream_invalid", "reason": str(exc)}
+                self._record(kind="run", action="refused", status="refused", run_id=run_id,
+                             subject=subject, data=result.refusal)
+                return result
 
         observed, resets = (None, None)
         if self.config.budget.mode == "subscription":
@@ -677,6 +700,10 @@ class Runner:
                 for tool in memory_tools:
                     if tool.name in eligible.names():
                         registry.add(tool)
+            if dream and active is not None:
+                registry.add(memory.consolidate_tool(
+                    self.config.memory_dir, active.name, self.audit, run_id=run_id,
+                    successful=consolidated))
             self._seed_home(home)
             self._write_worker_config(home, active)
             client.start()
@@ -740,13 +767,15 @@ class Runner:
             if result.status != "completed" and result.stop_reason is None and was_cancelled():
                 result.status = "interrupted"
                 result.stop_reason = "cancelled"
-            result.messages = outcome.messages
+            result.messages = [] if dream else outcome.messages
             result.usage = outcome.usage
             result.questions = [q.as_dict() for q in outcome.questions]
             result.error = outcome.error
             if self.config.budget.mode == "api":
                 spent = pricing.cost(Usage.from_app_server(outcome.usage))
             result.cost = spent
+            if dream and result.status == "completed" and consolidated and dream_through is not None:
+                memory.mark_dream_success(self.config.state_dir, active.name, dream_through)
 
         except _MemoryRefused:
             pass

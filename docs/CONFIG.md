@@ -370,8 +370,8 @@ SHA-256 and character count, never the text. Note arguments are redacted in
 generic audits and approval holds; untrusted runs need
 `allow_from_untrusted: true` to receive the note tool.
 
-Daily notes are never injected into prompts, including heartbeats. Search
-reaches them on demand. `bothy_memory_search` takes `{query, limit?}`: queries
+Daily notes stay out of ordinary run prompts, including heartbeats. Dream jobs
+read them for consolidation; search reaches them on demand. `bothy_memory_search` takes `{query, limit?}`: queries
 allow at most 500 characters, the default limit is 6 and the maximum is 20.
 It searches daily notes, MEMORY and USER (never SOUL) with SQLite FTS5 and
 BM25 ranking, returning relative paths, line ranges and snippets of at most
@@ -394,6 +394,72 @@ at least 1. The janitor deletes daily files whose local date is older than
 that many days, prunes their cached search rows, and audits removal counts.
 The cutoff day itself is kept, as are MEMORY, USER and SOUL. Retention also
 sweeps directories for profiles removed from configuration.
+
+### Scheduled consolidation (dreams)
+
+A dream is an ordinary scheduled model job with `dream: true`, default `false`.
+It requires a named profile with `memory: write`; add and load refuse invalid
+jobs by name. A grant that becomes invalid while the daemon runs is refused
+with `dream_invalid`, audited and alerted without creating a wake; the firing
+still advances to its next time and other due jobs continue. It cannot also be
+a heartbeat, Drove action or SOP job.
+The stored job grants dream mode only to its `schedule:JOB` route; webhook
+payload fields cannot grant it. Bothy ignores the job's `prompt` / `--prompt`.
+
+For example, with `profiles.main.memory: "write"`, schedule a nightly dream
+at 03:00 local time (set `--tz` to your local IANA timezone; cron defaults to UTC):
+
+```bash
+bothy schedule add dream-main --kind cron --spec "0 3 * * *" --profile main --dream --tz Europe/Paris
+```
+
+Bothy builds the prompt from fenced MEMORY.md and USER.md plus daily entries
+since the profile's last successful dream, or all retained notes on the first
+dream. Timestamped entries are filtered individually, including new entries in
+the same day's file; hand-written notes without timestamps use the file's
+modification time. Daily input is capped at 24,000 characters, keeping the
+newest characters and naming the omitted character/file counts in a truncation
+notice. Curated files and fence overhead are outside that daily-input cap.
+Fixed instructions promote durable facts, merge duplicates, drop stale facts
+and keep short bullet lines. A dream with no new notes audits `dream_skipped`,
+starts no Codex process and advances to its next scheduled time.
+
+Only dream runs receive `bothy_memory_consolidate`, regardless of whether a
+profile lists it in `tools`. Listing it cannot grant it on another run, even
+with `allow_from_untrusted: true`. Input is `{file: memory|user, text}`, the
+whole new file. It allows one successful consolidation per file per dream.
+Refusals check the character cap first, then secret/Unicode scanning, bullet
+format, then the drop guard: at least 75% of the old entry count must remain
+when the old file has eight or more entries. Counts include bullet entries,
+not continuation lines.
+
+Consolidation audits intent with before/after SHA-256 and entry counts, never
+text; a failed audit blocks the write. Under the same file lock as other
+curated-memory writes, it saves the previous bytes with an atomic, fsynced write
+to `memory/PROFILE/preimages/FILE-UTC_TIMESTAMP.md` (for example,
+`MEMORY.md-20261014T010000.000000Z.md`), then atomically replaces the file.
+Generic tool audits and approval holds redact arguments. Dream response text
+is suppressed. The janitor keeps the newest 14 preimages per file and audits
+removal counts, including profiles removed from configuration.
+
+`state/memory-dream/PROFILE.json` stores `last_dream_at` atomically only after
+a completed run with at least one successful consolidation. The timestamp is
+the input cutoff, so notes written during the run stay new for the next dream.
+Failures, refusals and runs without a successful consolidation leave it unchanged.
+
+Operators can inspect and restore earlier versions:
+
+```bash
+bothy memory preimages main
+bothy memory restore main memory MEMORY.md-20261014T010000.000000Z.md
+```
+
+Restore accepts a basename or an absolute path directly inside that profile's
+`preimages/`; paths outside it, traversal and symlinks are refused. The preimage
+must belong to the selected memory/user file. Restore applies the same caps,
+scan and bullet format, saves the current file as a new preimage, audits intent,
+and atomically replaces it. An explicit operator restore bypasses the drop guard
+so a historical version can be recovered.
 
 ## Cairn
 

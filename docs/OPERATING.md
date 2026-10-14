@@ -96,6 +96,39 @@ limits; `bothy run` takes the same two), `--sop NAME`, the goal flags below, and
 the Drove flags (`--drove-next`, `--drove-from-cairn`, `--drove-up`,
 `--drove-repo`; see "Drove runs"). Every field and its default is in CONFIG.md.
 
+**Nightly memory consolidation.** Set `profiles.main.memory` to `"write"`,
+then schedule a dream at 03:00 in your local timezone:
+
+```bash
+bothy schedule add dream-main --kind cron --spec "0 3 * * *" --profile main --dream --tz Europe/Paris
+```
+
+Use your local IANA timezone for `--tz`; cron defaults to UTC. Dream jobs
+ignore `--prompt` and cannot also be heartbeats, Drove actions or SOP jobs.
+Bothy supplies fenced MEMORY/USER files and new daily notes, capped at 24,000
+daily-note characters with the newest kept and a truncation notice.
+The dream-only `bothy_memory_consolidate` tool promotes durable facts into short
+bullets. Oversized, secret-looking, invalid-format or excessive-drop changes
+are refused; eight or more old entries must retain at least 75% of their count.
+No new notes means `dream_skipped` in the audit, no Codex start, and the next
+scheduled time still advances.
+
+Each successful replacement saves a fsynced preimage first. The janitor keeps
+14 versions per file. List and recover a version with:
+
+```bash
+bothy memory preimages main
+bothy memory restore main memory MEMORY.md-20261014T010000.000000Z.md
+bothy audit --verify
+```
+
+Restore saves the current version first, applies the caps and scan, and audits
+the replacement. It only accepts preimages inside this profile's directory.
+The profile's `state/memory-dream/main.json` advances only after a completed
+dream with at least one successful consolidation, using the input cutoff so
+notes added during the run are still available next time. See CONFIG.md's
+“Persona and memory” section for grant rules and refusal details.
+
 **Procedures.** `--sop NAME` gives a job a MUST/SHOULD/MAY procedure from
 `$BOTHY_HOME/sops/NAME.md`, injected into its prompt at fire time. Manage them
 with:
