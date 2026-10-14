@@ -106,6 +106,8 @@ class Config:
     cairn_binary: str = "cairn"
     cairn_agent: str = "bothy"
     cairn_project: str | None = None
+    # Read the task's Cairn digest into a --ref run's prompt at start.
+    cairn_brief: bool = True
     # Drove, run as a plain process: no model turn, so none of the worker
     # settings above apply to it. A run is bound to the folder it is started in,
     # so there is deliberately no default repo: a daemon's working directory is
@@ -285,6 +287,7 @@ class Config:
             "routes": [r.get("path") for r in self.routes],
             "cairn_agent": self.cairn_agent,
             "cairn_project": self.cairn_project,
+            "cairn_brief": self.cairn_brief,
             "drove": {
                 "binary": self.drove_binary,
                 "repo": self.drove_repo,
