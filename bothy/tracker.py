@@ -66,7 +66,9 @@ class CairnTracker:
 
     # ---- plumbing ------------------------------------------------------
 
-    def _run(self, args: Sequence[str], *, stdin: str | None = None, check: bool = False) -> subprocess.CompletedProcess:
+    def _run(self, args: Sequence[str], *, stdin: str | None = None, check: bool = False,
+             timeout: float | None = None) -> subprocess.CompletedProcess:
+        deadline = self.timeout if timeout is None else timeout
         env = dict(os.environ if self._env is None else self._env)
         env["CAIRN_AGENT"] = self.agent
         env.setdefault("CAIRN_PLATFORM", self.agent)
@@ -76,13 +78,13 @@ class CairnTracker:
                 input=stdin,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=deadline,
                 env=env,
             )
         except FileNotFoundError as exc:
             raise CairnUnavailable(f"{self.binary} is not installed") from exc
         except subprocess.TimeoutExpired as exc:
-            raise CairnUnavailable(f"{self.binary} {args[0]} timed out after {self.timeout}s") from exc
+            raise CairnUnavailable(f"{self.binary} {args[0]} timed out after {deadline}s") from exc
         if check and result.returncode != 0:
             raise CairnUnavailable(f"{self.binary} {' '.join(args)} failed: {result.stderr.strip()}")
         return result
@@ -112,6 +114,25 @@ class CairnTracker:
         if result.returncode != 0:
             raise CairnUnavailable(f"claim {ref} failed: {result.stderr.strip()}")
         return True
+
+    BRIEF_TIMEOUT = 10.0
+
+    def brief(self, ref: str) -> tuple[str | None, str | None]:
+        """What Cairn already holds on a task: the ``cairn show`` digest.
+
+        Returns ``(text, error)``. Never raises: not found, unreachable, timed
+        out and empty all give ``(None, reason)`` for the run's audit record.
+        """
+        try:
+            result = self._run(["show", ref], timeout=min(self.timeout, self.BRIEF_TIMEOUT))
+        except CairnUnavailable as exc:
+            return None, str(exc)
+        if result.returncode != 0:
+            return None, f"show {ref} failed: {result.stderr.strip() or result.returncode}"
+        text = result.stdout.strip()
+        if not text:
+            return None, f"show {ref} returned nothing"
+        return text, None
 
     def checkpoint(self, ref: str, summary: str) -> bool:
         """Record where a run got to. Queued locally if the server is away."""

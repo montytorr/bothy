@@ -22,7 +22,8 @@ That is the whole design brief. Bothy is the agent harness you install on a
 client's Mac mini, walk away from, and monitor from a distance.
 
 [Cairn](https://cairn.montytorr.com) is the family's task ledger. Bothy uses it
-only if you run it. Without Cairn, the audit log is the record.
+only if you run it, and a run started with `--ref` reads its task there first.
+Without Cairn, the audit log is the record.
 
 ```mermaid
 flowchart LR

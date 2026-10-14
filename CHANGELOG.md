@@ -9,6 +9,14 @@ Every release states its **Breaking Changes** heading even when it is empty.
 
 ## Unreleased
 
+### Added
+
+- **Cairn brief at run start (BOTHY-39):** a run started with `--ref` reads the
+  task's `cairn show` digest and appends it to the prompt as fenced, untrusted
+  data capped at 6,000 characters. The read has a 10 second deadline, is audited
+  (`brief_read`, `brief_failed`) and never stops the run; `cairn_brief: false`
+  turns it off.
+
 ## 0.2.0 — 2026-10-13
 
 ### Security

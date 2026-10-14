@@ -276,14 +276,15 @@ Missing lists are a startup error; an empty list grants no tools.
 ## Memory
 
 Cairn is optional. Bothy writes to it only for runs with `--ref` or profiles
-that grant `bothy_note`. An unreachable Cairn is recorded (`claim_failed`,
-`record_failed`) and the run still works. The audit log is always written.
+that grant `bothy_note`, and a `--ref` run reads the task's digest at start. An unreachable Cairn is recorded (`claim_failed`,
+`record_failed`, `brief_failed`) and the run still works. The audit log is always written.
 
 | Key | Default | |
 |---|---|---|
 | `cairn_binary` | `cairn` | The Cairn CLI |
 | `cairn_agent` | `bothy` | The agent name Bothy files notes under |
 | `cairn_project` | `null` | Limits Bothy's Cairn task lookups to this project key |
+| `cairn_brief` | `true` | Add the `cairn show` digest of a `--ref` task to the run's prompt, fenced as untrusted and capped at 6,000 characters |
 
 ## Alerting
 
