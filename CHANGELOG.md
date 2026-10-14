@@ -9,6 +9,17 @@ Every release states its **Breaking Changes** heading even when it is empty.
 
 ## Unreleased
 
+## 0.3.0 — 2026-10-14
+
+### Security
+
+- **Memory is guarded on every write (BOTHY-38, BOTHY-40, BOTHY-41):** memory
+  files live outside the workspace. Every write enforces caps and a best-effort
+  scan for secret-looking strings and invisible Unicode, and is audited before an
+  atomic replacement. Refused text is never written or audited. Untrusted runs
+  (signed webhook, poll) do not get the memory write tools unless the profile
+  sets `allow_from_untrusted: true`.
+
 ### Fixed
 
 - **Run replies and item summaries (BOTHY-43):** collect terminal turn items as
@@ -18,37 +29,67 @@ Every release states its **Breaking Changes** heading even when it is empty.
 
 ### Added
 
+- **Persona and curated memory (BOTHY-38):** profiles can load operator-written
+  `SOUL.md` and fenced `MEMORY.md` / `USER.md` notes from `$BOTHY_HOME/memory`,
+  outside the workspace. Opt-in `bothy_memory` writes (profile `memory`, off by
+  default) enforce caps, scan for secrets and invisible Unicode, and audit before
+  atomic replacement. Heartbeats skip notes unless `memory_on_heartbeat` is set;
+  `bothy memory list|show|set` and doctor help operators manage them.
+- **Cairn brief at run start (BOTHY-39):** a run started with `--ref` reads the
+  task's `cairn show` digest and appends it to the prompt as fenced, untrusted
+  data capped at 6,000 characters. The read has a 10 second deadline, is audited
+  (`brief_read`, `brief_failed`) and never stops the run; `cairn_brief: false`
+  turns it off.
+- **Daily memory and search (BOTHY-40):** opt-in `bothy_memory_note` appends
+  bounded, scanned, audited daily notes with local offset timestamps; the global
+  `timezone` key sets the date of a daily note. `bothy_memory_search` and
+  `bothy_memory_get` provide fenced reads in read or write mode, with a
+  disposable FTS5/BM25 cache and a scan fallback. Daily notes stay out of
+  prompts; `memory_retention_days` removes old days and cached rows. Operators
+  can show a day or search memory, and doctor warns when FTS5 is absent.
+- **Scheduled memory consolidation (BOTHY-41):** `schedule add --dream`
+  builds bounded, fenced prompts from new daily notes and grants the dream-only
+  `bothy_memory_consolidate` tool. Audited replacements enforce caps, scanning,
+  bullet format and a 25% drop guard, saving fsynced preimages first.
+  Empty dreams skip Codex; successful dreams track their input cutoff
+  (`last_dream_at`). Retention keeps 14 preimages per file; operators can list
+  them with `bothy memory preimages` and restore one with `bothy memory restore`.
 - **Memory operator guidance (BOTHY-43):** doctor warns non-fatally for effective
   memory-profile token caps below 100,000. Configuration docs explain cumulative
   usage and the measured baseline. Restore help names `PROFILE memory|user PREIMAGE`;
   `PROFILE PREIMAGE` infers the file from a MEMORY-/USER- preimage name and refuses
   mismatches. The runbook explains stopping foreground daemons by ctrl-c or PID.
 
-- **Scheduled memory consolidation (BOTHY-41):** `schedule add --dream`
-  builds bounded, fenced prompts from new daily notes and grants the dream-only
-  `bothy_memory_consolidate` tool. Audited replacements enforce caps, scanning,
-  bullet format and a 25% drop guard, saving fsynced preimages first.
-  Empty dreams skip Codex; successful dreams track their input cutoff.
-  Retention keeps 14 preimages per file; operators can list and restore them.
+Live-tested against real Codex (BOTHY-42, BOTHY-45): the persona was injected;
+memory writes and recall, search and get worked; a secret was refused; a real
+dream job ran under `bothy serve` with preimages, `last_dream_at` and a restore
+round trip; the `--ref` brief was read; an untrusted signed webhook run did not
+get the memory write tools, while an `allow_from_untrusted` control did.
 
-- **Daily memory and search (BOTHY-40):** opt-in `bothy_memory_note` appends
-  bounded, scanned, audited daily notes with local offset timestamps.
-  `bothy_memory_search` and `bothy_memory_get` provide fenced reads in read or
-  write mode, with a disposable FTS5/BM25 cache and a scan fallback.
-  Daily notes stay out of prompts; retention removes old days and cached rows.
-  Operators can show a day or search memory, and doctor warns when FTS5 is absent.
+### Breaking Changes
 
-- **Cairn brief at run start (BOTHY-39):** a run started with `--ref` reads the
-  task's `cairn show` digest and appends it to the prompt as fenced, untrusted
-  data capped at 6,000 characters. The read has a 10 second deadline, is audited
-  (`brief_read`, `brief_failed`) and never stops the run; `cairn_brief: false`
-  turns it off.
+- None. Memory is off by default (`memory: off`), and every new config and
+  profile key defaults to off or harmless. Unknown keys were already refused in
+  0.2.0, so an existing config loads unchanged.
 
-- **Persona and curated memory (BOTHY-38):** profiles can load operator-written
-  `SOUL.md` and fenced `MEMORY.md` / `USER.md` notes from outside the workspace.
-  Opt-in `bothy_memory` writes enforce caps, scan for secrets and invisible
-  Unicode, and audit before atomic replacement. Heartbeats skip notes by
-  default; `bothy memory list|show|set` and doctor help operators manage them.
+### Known gaps
+
+- The dream drop guard (a dream that would shrink a file by more than 25%) has
+  not been triggered live; it is covered by tests only.
+- An untrusted run with `allow_from_untrusted` has been shown to receive the
+  memory write tools, but not to write.
+- The reply-capture fix (BOTHY-43) is proven against a fake app-server that
+  speaks the stdio protocol; the exact live event sequence was not recorded.
+- No Slack or Discord run has used memory live.
+- A chat answer or approval has not completed a live Codex round trip; the
+  request and response shapes were checked against Codex 0.162.0's generated
+  schema, and MCP's `_meta` approval marker is observed binary metadata.
+- No test pins Bothy to Codex's generated schema (it is not vendored), so a
+  Codex upgrade could change the approval and question shapes unnoticed.
+- `bothy trace` and the OTLP export do not yet show `interrupt/*` records
+  (questions, answers, ambiguous or late replies); they are in the audit log only.
+- No live Slack workspace or Discord application has answered a held question,
+  and Discord replies to Drove attention items have only run against a stand-in.
 
 ## 0.2.0 — 2026-10-13
 
