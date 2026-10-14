@@ -12,7 +12,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-MINIMUM_TESTS = 150
+MINIMUM_TESTS = 581
 
 
 class SuiteIntegrityTests(unittest.TestCase):

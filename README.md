@@ -8,7 +8,7 @@
 *Runs Codex under supervision. Remembers in Cairn, if you run it.*
 *Speaks up when it needs you. Closed to everything but the tailnet.*
 
-`stdlib only` · `no virtualenv` · `no build step` · `~12.4k lines` · `519 tests`
+`stdlib only` · `no virtualenv` · `no build step` · `~12.4k lines` · `581 tests`
 
 </div>
 
@@ -24,6 +24,9 @@ client's Mac mini, walk away from, and monitor from a distance.
 [Cairn](https://cairn.montytorr.com) is the family's task ledger. Bothy uses it
 only if you run it, and a run started with `--ref` reads its task there first.
 Without Cairn, the audit log is the record.
+
+A profile can carry a persona and a few durable notes between runs. Bothy keeps
+them outside the workspace and audits every memory write.
 
 ```mermaid
 flowchart LR
@@ -259,7 +262,7 @@ make check     # quiet, non-zero on failure
 make test      # verbose
 ```
 
-**519 tests, standard library `unittest`.** They assert *properties*, and each
+**581 tests, standard library `unittest`.** They assert *properties*, and each
 was demonstrated by hand against the real thing — real Codex, the real GitHub
 API, a real systemd install — **before** being written down. The tests are
 recorded evidence, not a guess at what the code does.

@@ -18,7 +18,7 @@ from typing import Any
 
 import os
 
-from . import __version__, clock, codex, ids, proc
+from . import __version__, clock, codex, ids, memory, proc
 from .alert import Alerter, CompositeSink, DiscordWebhookSink, SlackWebhookSink, StderrSink
 from .audit import AuditError, AuditLog, ChainBreak
 from .budget import BudgetLedger
@@ -185,6 +185,19 @@ def cmd_doctor(args: argparse.Namespace, config: Config) -> int:
 
     tracker = CairnTracker(agent=config.cairn_agent, binary=config.cairn_binary)
     check("cairn reachable", tracker.available(), "memory and task ledger", fatal=False)
+
+    for name, raw in sorted(config.profiles.items()):
+        if Profile.from_dict(name, raw).memory == "off":
+            continue
+        for file in memory.FILES:
+            try:
+                _, text = memory.read_file(config.memory_dir, name, file)
+                size = len(text.encode("utf-8")) if file == "soul" else len(text)
+                unit = "bytes" if file == "soul" else "characters"
+                check(f"memory {name}/{memory.FILES[file]}", True,
+                      f"{size}/{memory.CAPS[file]} {unit} (missing files are optional)", fatal=False)
+            except memory.MemoryError as exc:
+                check(f"memory {name}/{memory.FILES[file]}", False, str(exc), fatal=False)
 
     survivors = registry.survivors()
     check("no orphaned workers", not survivors,
@@ -518,6 +531,54 @@ def cmd_sop(args: argparse.Namespace, config: Config) -> int:
     os.replace(handle.name, path)
     print(f"sop {args.name} written to {path} ({len(text)} chars)")
     return 0
+
+
+def cmd_memory(args: argparse.Namespace, config: Config) -> int:
+    """Manage persona and curated notes without giving the model SOUL writes."""
+    if args.action == "list":
+        profiles = [name for name, raw in sorted(config.profiles.items())
+                    if Profile.from_dict(name, raw).memory != "off"]
+        for name in profiles:
+            print(f"  {name}")
+            for file, filename in memory.FILES.items():
+                try:
+                    raw, text = memory.read_file(config.memory_dir, name, file)
+                    size = len(raw) if file == "soul" else len(text)
+                    unit = "bytes" if file == "soul" else "characters"
+                    print(f"    {filename}: {size}/{memory.CAPS[file]} {unit}, {len(raw)} bytes")
+                except memory.MemoryError as exc:
+                    try:
+                        size = f"{memory.resolve_file(config.memory_dir, name, file).stat().st_size} bytes"
+                    except (OSError, memory.MemoryError):
+                        size = "size unavailable"
+                    unit = "bytes" if file == "soul" else "characters"
+                    print(f"    {filename}: {size}, cap {memory.CAPS[file]} {unit}; {exc}")
+        if not profiles:
+            print("no memory-enabled profiles")
+        return 0
+    try:
+        if not args.profile or args.profile not in config.profiles:
+            raise memory.MemoryError("profile", "name a configured memory-enabled profile")
+        if Profile.from_dict(args.profile, config.profiles[args.profile]).memory == "off":
+            raise memory.MemoryError("profile", f"profile {args.profile} has memory off")
+        if args.action == "show":
+            for file in (args.file,) if args.file else memory.FILES:
+                _, text = memory.read_file(config.memory_dir, args.profile, file)
+                if args.file is None:
+                    print(f"{memory.FILES[file]}:")
+                text = memory.display(text)
+                print(text, end="" if text.endswith("\n") else "\n")
+            return 0
+        if args.file is None:
+            raise memory.MemoryError("file", "set needs soul, memory or user")
+        text = sys.stdin.read() if args.source in (None, "-") else pathlib.Path(args.source).read_text(encoding="utf-8")
+        size = memory.write(config.memory_dir, args.profile, args.file, AuditLog(config.audit_path),
+                            action="replace", text=text, operator=True)
+        print(f"{memory.FILES[args.file]} written for {args.profile} ({size} chars)")
+        return 0
+    except (memory.MemoryError, OSError, UnicodeError, AuditError) as exc:
+        print(f"bothy: {exc}", file=sys.stderr, flush=True)
+        return EX_CONFIG
 
 
 def cmd_poll(args: argparse.Namespace, config: Config) -> int:
@@ -1035,6 +1096,13 @@ def main(argv: list[str] | None = None) -> int:
     sop.add_argument("name", nargs="?", default=None)
     sop.add_argument("source", nargs="?", default=None, help="set: a file path; omit or '-' for stdin")
     sop.set_defaults(func=cmd_sop)
+
+    notes = subparsers.add_parser("memory", help="per-profile persona and curated notes")
+    notes.add_argument("action", choices=["list", "show", "set"])
+    notes.add_argument("profile", nargs="?", default=None)
+    notes.add_argument("file", nargs="?", choices=["soul", "memory", "user"])
+    notes.add_argument("source", nargs="?", default=None, help="set: a file path; omit or '-' for stdin")
+    notes.set_defaults(func=cmd_memory)
 
     serve = subparsers.add_parser("serve", help="run the daemon in the foreground")
     serve.add_argument("--reap", action="store_true",
