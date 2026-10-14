@@ -17,6 +17,12 @@ Every release states its **Breaking Changes** heading even when it is empty.
   (`brief_read`, `brief_failed`) and never stops the run; `cairn_brief: false`
   turns it off.
 
+- **Persona and curated memory (BOTHY-38):** profiles can load operator-written
+  `SOUL.md` and fenced `MEMORY.md` / `USER.md` notes from outside the workspace.
+  Opt-in `bothy_memory` writes enforce caps, scan for secrets and invisible
+  Unicode, and audit before atomic replacement. Heartbeats skip notes by
+  default; `bothy memory list|show|set` and doctor help operators manage them.
+
 ## 0.2.0 — 2026-10-13
 
 ### Security

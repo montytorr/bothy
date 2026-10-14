@@ -38,7 +38,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import clock, codex, ids, policy
+from . import clock, codex, ids, memory, policy
 from .alert import Alerter
 from .capability import Profile, ToolRegistry, builtin_tools, render_config_toml
 from .audit import AuditError, AuditLog
@@ -52,6 +52,10 @@ from .wake import fence_untrusted
 from .trace import build_trace, post_trace, span_fields, summarize_items
 
 __all__ = ["Runner", "RunResult"]
+
+
+class _MemoryRefused(Exception):
+    """Skip worker startup, while still following the run's shared cleanup."""
 
 
 @dataclasses.dataclass
@@ -377,6 +381,7 @@ class Runner:
         profile: str | None = None,
         max_tokens: int | None = None,
         untrusted: bool = False,
+        heartbeat: bool = False,
         reply_to: dict[str, Any] | None = None,
         foreground: bool = False,
     ) -> RunResult:
@@ -514,6 +519,8 @@ class Runner:
                 turn_started((params.get("turn") or {}).get("id"))
 
         def tool_called(call: dict[str, Any]) -> None:
+            if call.get("tool") in memory.REDACTED_ARGUMENT_TOOLS:
+                call = {**call, "arguments": memory.redacted_arguments(call.get("arguments"))}
             self._record(kind="tool", action="called", status=call["status"], run_id=run_id, subject=subject,
                          span=span_fields(run_id, f"tool:{call['call_id']}", parent="turn:1",
                                           start=call["start"], end=call["end"], status=call["status"]),
@@ -570,6 +577,8 @@ class Runner:
                             arguments = nested.get("arguments", nested.get("args"))
                             if arguments is not None:
                                 break
+                if pending.tool in memory.REDACTED_ARGUMENT_TOOLS:
+                    arguments = memory.redacted_arguments(arguments)
                 summary = json.dumps(arguments, ensure_ascii=False, default=str) if arguments is not None else "Arguments not provided by Codex."
                 text += "Tool arguments:\n" + fence_untrusted(summary, limit=300) + "\n"
                 text += "Reply approve or yes to approve; anything else declines.\n"
@@ -641,6 +650,29 @@ class Runner:
             )
 
         try:
+            developer_instructions = active.developer_instructions if active else None
+            if active is not None and active.memory != "off":
+                try:
+                    kept = memory.snapshot(self.config.memory_dir, active.name, developer_instructions,
+                                           notes=not heartbeat or active.memory_on_heartbeat)
+                except memory.MemoryError as exc:
+                    result.status = "refused"
+                    result.refusal = {"gate": "soul_invalid" if isinstance(exc, memory.SoulInvalid)
+                                      else "memory_invalid", "reason": str(exc)}
+                    result.error = str(exc)
+                    self._record(kind="run", action="refused", status="refused", run_id=run_id,
+                                 subject=subject, data=result.refusal)
+                    raise _MemoryRefused from exc
+                developer_instructions = kept.instructions
+                self.audit.append(kind="run", action="memory_loaded", run_id=run_id, subject=subject,
+                                  data={"profile": active.name, "files": list(kept.files)})
+                if active.memory == "write":
+                    memory_tool = memory.dynamic_tool(self.config.memory_dir, active.name, self.audit,
+                                                      run_id=run_id)
+                    eligible = ToolRegistry([memory_tool]).select(
+                        active.tools, untrusted=untrusted, allow_from_untrusted=active.allow_from_untrusted)
+                    if eligible:
+                        registry.add(memory_tool)
             self._seed_home(home)
             self._write_worker_config(home, active)
             client.start()
@@ -653,7 +685,7 @@ class Runner:
                 approval_policy=(active.approval_policy if active and active.approval_policy
                                  else self.config.approval_policy),
                 dynamic_tools=registry.specs() or None,
-                developer_instructions=(active.developer_instructions if active else None),
+                developer_instructions=developer_instructions,
             )
             if active and active.skill_roots:
                 # Skills are prose the model reads, pointed at per run rather
@@ -712,6 +744,8 @@ class Runner:
                 spent = pricing.cost(Usage.from_app_server(outcome.usage))
             result.cost = spent
 
+        except _MemoryRefused:
+            pass
         except Exception as exc:  # noqa: BLE001 - every failure still gets bookkeeping
             result.status = "failed"
             result.error = f"{type(exc).__name__}: {exc}"

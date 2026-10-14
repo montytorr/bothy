@@ -160,6 +160,11 @@ class Config:
         return self.home / "sops"
 
     @property
+    def memory_dir(self) -> Path:
+        """Per-profile persona and notes, outside the worker's workspace."""
+        return self.home / "memory"
+
+    @property
     def audit_path(self) -> Path:
         return self.home / "audit.jsonl"
 
@@ -201,7 +206,9 @@ class Config:
         if not isinstance(self.profiles, dict):
             raise ValueError("profiles must map profile names to objects")
         for name, raw in self.profiles.items():
-            Profile.from_dict(name, raw)
+            profile = Profile.from_dict(name, raw)
+            if profile.memory != "off" and self.memory_dir.resolve().is_relative_to(self.workspace.resolve()):
+                raise ValueError(f"profile {name}: memory directory must be outside the workspace; move BOTHY_HOME")
 
     def validate_public_profiles(self, routes: list[Any] | None = None) -> None:
         """Public input must never reach an MCP server with an implicit grant."""

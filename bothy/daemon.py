@@ -300,6 +300,8 @@ class Daemon:
                         wall_clock_seconds=event.get("wall_clock_seconds"),
                         max_tokens=event.get("max_tokens"),
                         untrusted=self._untrusted_source(event),
+                        heartbeat=str(event.get("route", "")).startswith("schedule:") and
+                                  (event.get("payload") or {}).get("heartbeat") is True,
                         reply_to={key: (event.get("payload") or {})[key] for key in ("slack", "discord")
                                   if event.get("route") == key and key in (event.get("payload") or {})},
                     )

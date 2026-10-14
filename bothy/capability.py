@@ -38,6 +38,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
@@ -79,6 +80,8 @@ class Profile:
     model: str | None = None
     approval_policy: str | None = None
     developer_instructions: str | None = None
+    memory: str = "off"
+    memory_on_heartbeat: bool = False
     config: dict[str, Any] = dataclasses.field(default_factory=dict)
     # Per-profile run limits. The runner falls back to the config-wide ones.
     max_tokens: int | None = None
@@ -115,6 +118,13 @@ class Profile:
         approval" and unintentionally *enables* send. Silently dropping the gate
         would be worse. So it is refused and the author says what they meant.
         """
+        if self.memory not in ("off", "read", "write"):
+            raise ValueError(f"profile {self.name}: memory must be off, read or write")
+        if self.memory != "off" and (not isinstance(self.name, str) or
+                                    re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", self.name) is None):
+            raise ValueError(f"profile {self.name}: memory needs a name matching ^[a-z0-9][a-z0-9_-]{{0,63}}$")
+        if not isinstance(self.memory_on_heartbeat, bool):
+            raise ValueError(f"profile {self.name}: memory_on_heartbeat must be true or false")
         if not isinstance(self.allow_from_untrusted, bool):
             raise ValueError(f"profile {self.name}: allow_from_untrusted must be true or false")
         if not isinstance(self.mcp_tools, dict):
@@ -309,7 +319,7 @@ class ToolRegistry:
         future version renamed should degrade to less capability, never to a
         run that refuses to start.
         """
-        blocked = {"bothy_checklist_update", "bothy_note"} if untrusted and not allow_from_untrusted else set()
+        blocked = {"bothy_checklist_update", "bothy_note", "bothy_memory"} if untrusted and not allow_from_untrusted else set()
         return ToolRegistry([self._tools[name] for name in names
                              if name in self._tools and name not in blocked], gate=self._gate)
 
