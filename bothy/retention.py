@@ -20,12 +20,14 @@ removed.
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
+import fcntl
 import shutil
 import time
 from pathlib import Path
 from typing import Any
 
-from . import clock
+from . import clock, memory, memory_index
 from .audit import AuditLog
 from .budget import BudgetLedger
 from .config import Config
@@ -57,6 +59,8 @@ class SweepReport:
     homes_removed: list[str] = dataclasses.field(default_factory=list)
     homes_kept_live: list[str] = dataclasses.field(default_factory=list)
     reservations_expired: int = 0
+    memory_days_removed: int = 0
+    memory_index_rows_pruned: int = 0
     bytes_freed: int = 0
     errors: list[str] = dataclasses.field(default_factory=list)
 
@@ -69,6 +73,7 @@ class SweepReport:
             or self.wakes_dropped
             or self.homes_removed
             or self.reservations_expired
+            or self.memory_days_removed
             or self.errors
         )
 
@@ -84,6 +89,8 @@ class SweepReport:
             parts.append(f"removed {len(self.homes_removed)} orphaned worker home(s)")
         if self.reservations_expired:
             parts.append(f"expired {self.reservations_expired} stale reservation(s)")
+        if self.memory_days_removed:
+            parts.append(f"removed {self.memory_days_removed} daily memory file(s)")
         if self.bytes_freed:
             parts.append(f"freed {self.bytes_freed // 1024} KiB")
         if self.errors:
@@ -176,5 +183,46 @@ def sweep(config: Config, policy: RetentionPolicy | None = None) -> SweepReport:
         report.reservations_expired = len(ledger.expire_stale())
     except OSError as exc:
         report.errors.append(f"budget: {exc}")
+
+    # --- daily memory, by the date in the same timezone as the writer ---
+    cutoff = memory.local_now(config.timezone).date() - dt.timedelta(days=config.memory_retention_days)
+    profiles = set(config.profiles)
+    if config.memory_dir.is_dir():
+        profiles.update(path.name for path in config.memory_dir.iterdir() if path.is_dir())
+    for profile in sorted(profiles):
+        if memory.PROFILE_NAME.fullmatch(profile) is None:
+            continue
+        removed = []
+        try:
+            daily = memory.resolve_path(config.memory_dir, profile, "daily")
+            if not daily.is_dir():
+                continue
+            for candidate in sorted(daily.glob("*.md")):
+                try:
+                    path = memory.day_path(config.memory_dir, profile, candidate.stem)
+                except memory.MemoryError:
+                    continue
+                if dt.date.fromisoformat(path.stem) >= cutoff:
+                    continue
+                lock_path = memory.resolve_path(config.memory_dir, profile, "daily/.lock")
+                with lock_path.open("a") as lock:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                    if not path.is_file():
+                        continue
+                    size = path.stat().st_size
+                    # Fail closed if intent cannot be audited before deletion.
+                    audit.append(kind="memory", action="retention_delete", status="pending",
+                                 data={"profile": profile, "date": path.stem, "files": 1, "bytes": size})
+                    path.unlink()
+                    removed.append(f"daily/{path.name}")
+                    report.memory_days_removed += 1
+                    report.bytes_freed += size
+            if removed:
+                pruned = memory_index.prune(config.state_dir, profile, removed)
+                report.memory_index_rows_pruned += pruned
+                audit.append(kind="memory", action="retention_sweep",
+                             data={"profile": profile, "files_removed": len(removed), "index_rows_pruned": pruned})
+        except (OSError, memory.MemoryError):
+            report.errors.append("daily memory: could not sweep profile")
 
     return report

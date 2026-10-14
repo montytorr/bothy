@@ -108,6 +108,9 @@ class Config:
     cairn_project: str | None = None
     # Read the task's Cairn digest into a --ref run's prompt at start.
     cairn_brief: bool = True
+    # Daily memory uses the system's local zone unless a named zone is set.
+    timezone: str | None = None
+    memory_retention_days: int = 90
     # Drove, run as a plain process: no model turn, so none of the worker
     # settings above apply to it. A run is bound to the folder it is started in,
     # so there is deliberately no default repo: a daemon's working directory is
@@ -203,6 +206,15 @@ class Config:
         """Every profile must parse, so a bad one is a startup error and not a refused run."""
         from .capability import Profile
 
+        if type(self.memory_retention_days) is not int or self.memory_retention_days < 1:
+            raise ValueError("memory_retention_days must be an integer of at least 1")
+        if self.timezone is not None:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+            try:
+                ZoneInfo(self.timezone)
+            except (TypeError, ValueError, ZoneInfoNotFoundError):
+                raise ValueError("timezone must name a valid IANA timezone") from None
         if not isinstance(self.profiles, dict):
             raise ValueError("profiles must map profile names to objects")
         for name, raw in self.profiles.items():
@@ -295,6 +307,8 @@ class Config:
             "cairn_agent": self.cairn_agent,
             "cairn_project": self.cairn_project,
             "cairn_brief": self.cairn_brief,
+            "timezone": self.timezone,
+            "memory_retention_days": self.memory_retention_days,
             "drove": {
                 "binary": self.drove_binary,
                 "repo": self.drove_repo,

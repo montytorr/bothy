@@ -666,13 +666,17 @@ class Runner:
                 developer_instructions = kept.instructions
                 self.audit.append(kind="run", action="memory_loaded", run_id=run_id, subject=subject,
                                   data={"profile": active.name, "files": list(kept.files)})
+                memory_tools = memory.daily_tools(
+                    self.config.memory_dir, self.config.state_dir, active.name, self.audit,
+                    write_mode=active.memory == "write", timezone=self.config.timezone, run_id=run_id)
                 if active.memory == "write":
-                    memory_tool = memory.dynamic_tool(self.config.memory_dir, active.name, self.audit,
-                                                      run_id=run_id)
-                    eligible = ToolRegistry([memory_tool]).select(
-                        active.tools, untrusted=untrusted, allow_from_untrusted=active.allow_from_untrusted)
-                    if eligible:
-                        registry.add(memory_tool)
+                    memory_tools.append(memory.dynamic_tool(self.config.memory_dir, active.name, self.audit,
+                                                            run_id=run_id))
+                eligible = ToolRegistry(memory_tools).select(
+                    active.tools, untrusted=untrusted, allow_from_untrusted=active.allow_from_untrusted)
+                for tool in memory_tools:
+                    if tool.name in eligible.names():
+                        registry.add(tool)
             self._seed_home(home)
             self._write_worker_config(home, active)
             client.start()

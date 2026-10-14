@@ -8,7 +8,7 @@
 *Runs Codex under supervision. Remembers in Cairn, if you run it.*
 *Speaks up when it needs you. Closed to everything but the tailnet.*
 
-`stdlib only` · `no virtualenv` · `no build step` · `~12.4k lines` · `581 tests`
+`stdlib only` · `no virtualenv` · `no build step` · `~12.4k lines` · `616 tests`
 
 </div>
 
