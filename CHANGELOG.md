@@ -9,7 +9,20 @@ Every release states its **Breaking Changes** heading even when it is empty.
 
 ## Unreleased
 
+### Fixed
+
+- **Run replies and item summaries (BOTHY-43):** collect terminal turn items as
+  well as streamed completions, without duplicating replies. Dynamic tool calls
+  and agent messages leave metadata summaries without private text or arguments.
+  Plain run output names the stop reason, including `token_cap`, alongside replies.
+
 ### Added
+
+- **Memory operator guidance (BOTHY-43):** doctor warns non-fatally for effective
+  memory-profile token caps below 100,000. Configuration docs explain cumulative
+  usage and the measured baseline. Restore help names `PROFILE memory|user PREIMAGE`;
+  `PROFILE PREIMAGE` infers the file from a MEMORY-/USER- preimage name and refuses
+  mismatches. The runbook explains stopping foreground daemons by ctrl-c or PID.
 
 - **Scheduled memory consolidation (BOTHY-41):** `schedule add --dream`
   builds bounded, fenced prompts from new daily notes and grants the dream-only

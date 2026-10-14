@@ -374,6 +374,11 @@ are fingerprinted on the error text and suppressed until it changes.
 
 ## Stopping and starting
 
+`bothy serve` runs the daemon in the foreground. Stop a test or foreground daemon
+with ctrl-c in its terminal, or signal its own PID (for example, `kill <pid>`).
+Never use a process pattern such as `pkill -f "bothy serve"`: it also matches and
+stops the installed service.
+
 Stop one live Codex run by its Bothy run id (from `bothy status` or the audit):
 
 ```bash

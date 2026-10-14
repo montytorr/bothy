@@ -850,6 +850,24 @@ class CodexClient:
         if on_started is not None:
             on_started(outcome.turn_id)
         item_starts: dict[str, str] = {}
+        completed_items: set[str] = set()
+
+        def collect_item(raw: dict[str, Any], observed_at: str | None = None) -> None:
+            # The terminal turn also carries items. Reconcile it with streamed
+            # completions so a message is neither lost nor printed twice.
+            item = dict(raw)
+            item_id = item.get("id")
+            if item_id is not None:
+                key = str(item_id)
+                if key in completed_items:
+                    return
+                completed_items.add(key)
+            item["end"] = observed_at or clock.iso()
+            item["start"] = item_starts.pop(str(item_id), item["end"])
+            if len(outcome.items) < 200:
+                outcome.items.append(item)
+            if item.get("type") in {"agentMessage", "agent_message"} and item.get("text"):
+                outcome.messages.append(str(item["text"]))
 
         deadline = clock.monotonic() + wall_clock_seconds
         self._hold_limit = deadline + self.question_hold_seconds
@@ -933,21 +951,15 @@ class CodexClient:
                 if len(item_starts) < 200:
                     item_starts[str(item.get("id"))] = params.get("observed_at") or clock.iso()
             elif method == "item/completed":
-                item = dict(params.get("item") or {})
-                item["end"] = params.get("observed_at") or clock.iso()
-                item["start"] = item_starts.pop(str(item.get("id")), item["end"])
-                if len(outcome.items) < 200:
-                    outcome.items.append(item)
-                if item.get("type") in {"agentMessage", "agent_message"}:
-                    text_value = item.get("text")
-                    if text_value:
-                        outcome.messages.append(str(text_value))
+                collect_item(params.get("item") or {}, params.get("observed_at"))
             elif method == "error":
                 detail = params.get("error") or {}
                 outcome.error = str(detail.get("message") or detail)
                 outcome.error_code = detail.get("codexErrorInfo")
             elif method == "turn/completed":
                 finished = params.get("turn") or {}
+                for item in finished.get("items") or []:
+                    collect_item(item)
                 status = str(finished.get("status") or "completed")
                 # A turn we interrupted reports as interrupted; keep our reason.
                 outcome.status = "interrupted" if interrupted else status
